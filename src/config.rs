@@ -61,6 +61,7 @@ impl Default for Config {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SystemConfig {
+    pub language: String,
     pub timezone_offset: String,
     pub worker_threads: u8,
     pub log_ring_capacity: usize,
@@ -69,7 +70,13 @@ pub struct SystemConfig {
 
 impl Default for SystemConfig {
     fn default() -> Self {
-        Self { timezone_offset: "UTC".into(), worker_threads: 2, log_ring_capacity: 300, global_max_conns: 512 }
+        Self {
+            language: "zh".into(),
+            timezone_offset: "UTC".into(),
+            worker_threads: 2,
+            log_ring_capacity: 300,
+            global_max_conns: 512,
+        }
     }
 }
 
@@ -867,6 +874,9 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), String> {
         let s = &self.system;
+        if !matches!(s.language.as_str(), "zh" | "en") {
+            return Err(format!("system.language 仅支持 zh 或 en，当前值: {}", s.language));
+        }
         if parse_tz_offset(&s.timezone_offset).is_none() {
             return Err(format!("system.timezone_offset 非法: {}", s.timezone_offset));
         }

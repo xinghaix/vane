@@ -197,6 +197,7 @@ async fn api_auth_status(State(state): State<Arc<AppState>>, headers: HeaderMap)
         "has_ed25519_keys": !cfg.admin.authorized_ed25519_keys.is_empty(),
         "ed25519_key_ids": cfg.admin.authorized_ed25519_keys.iter().map(|k| &k.id).collect::<Vec<_>>(),
         "session_ttl_secs": cfg.admin.session_ttl_secs,
+        "language": cfg.system.language,
         "modules": cfg.modules,
     }))
     .into_response()
@@ -319,6 +320,7 @@ fn build_session_response(token: &str, ttl_secs: u64, must_change: bool, cfg: &C
         "must_change_password": must_change,
         "totp_enabled": cfg.admin.totp_enabled,
         "session_ttl_secs": cfg.admin.session_ttl_secs,
+        "language": cfg.system.language,
         "modules": cfg.modules,
     });
     let mut resp = Json(body).into_response();

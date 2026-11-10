@@ -1,4 +1,5 @@
 [system]
+language = "zh"                        # 仅支持中英文 / Only zh and en supported: "zh" | "en"
 timezone_offset = "UTC"                # 默认 UTC 或自动读取系统 /etc/TZ / Zoneinfo
 worker_threads = 2                     # 2 个 I/O 线程，单线程栈 512KB，blocking 线程池上限 2
 log_ring_capacity = 300                # 内存环形日志容量（自动过滤脱敏凭据）

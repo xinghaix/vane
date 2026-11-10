@@ -1,0 +1,152 @@
+[system]
+timezone_offset = "UTC"                # 默认 UTC 或自动读取系统 /etc/TZ / Zoneinfo
+worker_threads = 2                     # 2 个 I/O 线程，单线程栈 512KB，blocking 线程池上限 2
+log_ring_capacity = 300                # 内存环形日志容量（自动过滤脱敏凭据）
+global_max_conns = 512                 # 全机数据面最大并发连接硬上限（管理面独立保留 16 槽位）
+
+# 子功能模块总开关：除「概览看板」、「运行日志」、「系统设置」3 项常驻外，
+# 其余所有子功能均可在设置页一键关闭（彻底停止后台协程、关闭防火墙端口并在 UI 隐藏菜单）
+[modules]
+reverse_proxy = true
+port_forward = true
+ddns = true
+acme = true
+stun = false                           # 默认按需开启
+web_terminal = false                   # Web 终端默认关闭，可在设置页按需打开
+cron = false                           # 默认按需开启
+docker = true
+
+[admin]
+# 默认仅绑定局域网地址并自动启用 HTTPS（首次启动自动生成本地自签 ECDSA 证书或复用 ACME 证书）
+listen_lan = ["192.168.1.1:23456"]
+canonical_origin = "https://192.168.1.1:23456"
+secret_path = "/_vane_init_change_me"  # 首次引导时自动替换为 16 位随机安全路径
+username = "admin"                     # 全局唯一管理员（默认用户名可不修改，不做多用户管理）
+# 1) 初次部署默认密码为 "admin321"，must_change_password = true 强制登录后硬步骤改密：
+#    新密码需 >= 8 位且包含英文字母 + 数字/符号之一；未改密或仍为 "admin321" 时禁止跳过进入管理页面！
+must_change_password = true
+password_login_enabled = true
+password_hash = ""
+# 2) 可选开启 TOTP 双因素认证（RFC 6238，内置单调递增步长水位防回退重放）
+totp_enabled = false
+totp_secret = ""
+totp_recovery_hashes = []              # 核销时强制先原子写盘成功再放行会话
+# 3) 可选配置 Ed25519 公钥挑战签名登录（自动解析 OpenSSH ssh-ed25519 Wire Format 提取 32B 公钥）
+authorized_ed25519_keys = [
+  # { id = "admin_key_1", pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... admin@workstation" }
+]
+session_ttl_secs = 3600                # 登录态保活默认 1 小时 (3600s)，允许自定义范围 300 ~ 86400s (最大 24 小时)
+docker_socket = "/var/run/docker.sock"
+
+[web_terminal]
+# 仅当 [modules].web_terminal = true 时启用，默认关闭
+shell = "auto"                         # 自动选择 /bin/ash 或 /bin/sh
+default_cwd = "/root"
+idle_timeout_secs = 900                # 空闲 15 分钟自动断开并回收进程组
+max_sessions = 2
+
+[security]
+tls_handshake_timeout_secs = 5
+http_header_timeout_secs = 10
+max_login_failures = 5                 # IPv4 按 /32、IPv6 按 /64 子网聚合计数
+ban_duration_secs = 1800
+kernel_ban_offload = true              # 封禁时同步写入防火墙前置 drop 集合并清理对应 Conntrack
+
+[firewall]
+auto_manage = true                     # 启动首轮先预清扫残留链，仅对实际绑定成功的协议栈开门
+backend = "auto"                       # 自动探测 fw4 (nftables) | fw3-legacy (iptables-legacy) | fw3-nft
+wan_interfaces = ["pppoe-wan"]
+lan_interfaces = ["br-lan"]
+
+[dns_providers.cf_home]
+provider = "cloudflare"
+# 支持填写明文（启动时自动通过 ChaCha20-Poly1305 + AAD 加封为 enc:v1:... 落盘），Web API 读取时自动脱敏
+api_token = "enc:v1:dGhpcyBpcyBhbiBleGFtcGxlIGFlYWQgc2VhbGVkIHRva2Vu..."
+happy_eyeballs_delay_ms = 250          # RFC 8305 双栈连接竞速延迟
+
+# --- M3: 全栈事件驱动 DDNS（先订阅后 Dump，剔除 CGNAT v4 与 Tentative/Deprecated/Temporary v6） ---
+[[ddns]]
+name = "router_dual_stack"
+enabled = true
+provider = "cf_home"
+domain = "home.example.com"
+records = ["A", "AAAA"]
+source = { kind = "interface", name = "pppoe-wan" }
+on_missing_public_ip = "keep_existing" # 无公网地址时保留原记录并告警，不误删记录
+split_dns_lan_ips = ["192.168.1.1"]
+
+[[ddns]]
+name = "nas_direct_ipv6"
+enabled = true
+provider = "cf_home"
+domain = "nas-v6.home.example.com"
+records = ["AAAA"]
+# 提取当前有效 PD 前缀 + 固定接口后缀合成精确 /128 地址；防火墙 FORWARD 仅放行该完整 /128 地址的 5000 端口
+source = { kind = "prefix_and_iid", prefix_iface = "br-lan", iid = "::200:5eff:fe00:5301" }
+firewall_allow_tcp_ports = [5000]
+
+# --- M4: ACME 泛域名证书自动续期 ---
+[[acme]]
+domain = "*.home.example.com"
+extra_domains = ["home.example.com"]
+email = "admin@example.com"
+dns_provider = "cf_home"
+cert_dir = "/data/vane/certs"
+renew_before_days = 30
+
+# --- M1: 双栈单端口复用与流式反向代理 ---
+[[reverse_proxy]]
+name = "main_https_gateway"
+stack = "dual"                         # dual | ipv4_only | ipv6_only
+listen_port = 8443
+strict_sni = true                      # 未知 SNI 或公网 IP 直连直接中止握手
+open_wan_firewall = true
+max_concurrent_conns = 256
+
+[[reverse_proxy.rules]]
+host = "nas.home.example.com"
+upstream = "http://192.168.1.100:5000"
+websocket = true
+sanitize_forwarded_headers = true      # 严格重写 Forwarded / X-Forwarded-* 并校验 Host/:authority
+auth_gate = false
+
+# --- M2: 4x4 全矩阵双引擎端口转发 ---
+[[port_forwards]]
+name = "nas_ssh_dual_to_v4"
+enabled = true
+proto = "tcp"
+stack = "dual"
+# 提示：配置了连接限额、CIDR 过滤、Proxy Protocol 或跨栈时自动运行于用户态受限 splice 引擎；
+# 仅纯同栈且无网关层策略时可选 kernel_dnat
+engine = "userspace_splice"
+listen_port = 2222
+target = "192.168.1.100:22"
+open_wan_firewall = true
+max_concurrent_conns = 64
+allowed_cidrs = []
+
+# --- M5: STUN 映射探测与保活 ---
+[[stun]]
+name = "https_nat1_v4"
+enabled = true
+proto = "tcp"
+local_port = 8443
+stun_server = "stun.example.com:3478"
+keepalive_secs = 25
+# 含敏感 Key 的 Webhook URL 同样支持 enc:v1:... 自动信封加密落盘
+webhook_url = "enc:v1:d2ViaG9vay1zZWFsZWQtdXJsLWV4YW1wbGU=..."
+
+# --- M7: 安全计划任务（支持内置 Docker API 动作或无 Shell 结构化参数数组） ---
+[[cron]]
+name = "prune_dangling_docker_images"
+enabled = true
+schedule = "0 0 4 * * *"
+timeout_secs = 60
+action = { kind = "docker_prune_images", dangling_only = true }
+
+[[cron]]
+name = "custom_health_ping"
+enabled = false
+schedule = "0 */30 * * * *"
+timeout_secs = 15
+action = { kind = "exec", program = "/bin/ping", args = ["-c", "1", "-W", "3", "192.0.2.1"] }

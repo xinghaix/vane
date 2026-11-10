@@ -1,0 +1,8 @@
+target
+web-ui/node_modules
+web-ui/dist
+.git
+.master.key
+config.toml
+config.toml.bak
+*.tmp.*

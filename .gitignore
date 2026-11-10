@@ -1,0 +1,8 @@
+/target
+/web-ui/node_modules
+/web-ui/dist
+.master.key
+config.toml
+config.toml.bak
+*.tmp.*
+.DS_Store

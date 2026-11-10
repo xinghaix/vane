@@ -1,0 +1,67 @@
+[package]
+name = "vane"
+version = "0.1.0"
+edition = "2021"
+description = "面向资源受限路由器的高安全双栈全能网关"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/xinghaix/vane"
+homepage = "https://github.com/xinghaix/vane"
+readme = "README.md"
+keywords = ["router", "openwrt", "gateway", "reverse-proxy", "ipv6"]
+categories = ["network-programming", "web-programming::http-server", "command-line-utilities"]
+build = "build.rs"
+
+[features]
+default = ["docker", "pty", "stun", "mimalloc-alloc"]
+docker = []
+pty = []
+stun = []
+mimalloc-alloc = ["dep:mimalloc"]
+
+[dependencies]
+tokio = { version = "1.43", features = ["rt-multi-thread", "net", "io-util", "time", "process", "sync", "macros", "signal", "fs"] }
+tokio-util = { version = "0.7", default-features = false }
+
+# 全模块共享单一流式 HTTP 底座
+axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "ws", "tokio", "query"] }
+hyper = { version = "1.6", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "server-auto"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1.9"
+tower = { version = "0.5", default-features = false, features = ["util"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# 纯 Rust TLS 与密码学原语（ACME 客户端基于 ring + 内置 hyper/rustls 双栈客户端自研实现 RFC 8555，零额外 TLS 栈）
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2.2"
+rustls-native-certs = "0.8"
+webpki-roots = "0.26"          # 当固件缺失 /etc/ssl/certs 时作为可信根证书兜底，杜绝空根或跳过验证
+ring = "0.17"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+base64 = "0.22"
+
+# 底层系统调用与双栈 Socket 精细控制 (IPV6_V6ONLY, IP_PKTINFO, Netlink, splice, F_SETPIPE_SZ, openpty)
+libc = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
+
+# 静态前端嵌入与无锁原子状态替换
+rust-embed = { version = "8.5", default-features = false }
+arc-swap = "1.7"
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+[profile.dev.package.ring]
+opt-level = 3            # PBKDF2 在调试/测试构建下保持可接受的耗时
+
+[profile.release]
+opt-level = "z"          # 极限代码体积优化
+lto = "fat"              # 跨库全局死代码消除
+codegen-units = 1        # 单编译单元最大化优化
+# 保留 unwind 表确保单个子任务意外 panic 被 tokio::spawn 捕获隔离
+panic = "unwind"
+strip = "symbols"        # 剥离符号表与调试段

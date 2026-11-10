@@ -1,0 +1,40 @@
+services:
+  vane:
+    image: ghcr.io/example/vane:latest
+    container_name: vane
+    restart: unless-stopped
+    network_mode: host
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m
+    pids_limit: 64
+    mem_limit: 24m
+    memswap_limit: 24m
+    logging:
+      driver: json-file
+      options:
+        max-size: "1m"
+        max-file: "2"
+    volumes:
+      - vane_data:/data/vane
+      - type: bind
+        source: /run/xtables.lock
+        target: /run/xtables.lock
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        bind:
+          create_host_path: false
+
+volumes:
+  vane_data:
+    name: vane_data

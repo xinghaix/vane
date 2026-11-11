@@ -48,7 +48,7 @@ hickory-resolver = { version = "0.25", default-features = false, features = ["sy
 
 # 底层系统调用与双栈 Socket 精细控制 (IPV6_V6ONLY, IP_PKTINFO, Netlink, splice, F_SETPIPE_SZ, openpty)
 libc = "0.2"
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
 
 # 静态前端嵌入与无锁原子状态替换
 rust-embed = { version = "8.5", default-features = false }

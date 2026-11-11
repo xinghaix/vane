@@ -470,7 +470,11 @@ impl SessionStore {
 
     /// 校验并续期会话
     pub fn validate(&mut self, token: &str, ttl: Duration) -> Option<Session> {
-        let key = Self::token_digest(token);
+        self.validate_digest(&Self::token_digest(token),ttl,true)
+    }
+
+    pub fn validate_digest(&mut self, key: &[u8;32], ttl:Duration, touch:bool) -> Option<Session> {
+        let key=*key;
         let now = Instant::now();
         let expired = match self.sessions.get(&key) {
             Some(s) => now.duration_since(s.last_seen) > ttl || now.duration_since(s.created) > SESSION_ABSOLUTE_MAX,
@@ -481,7 +485,7 @@ impl SessionStore {
             return None;
         }
         let s = self.sessions.get_mut(&key)?;
-        s.last_seen = now;
+        if touch {s.last_seen = now;}
         Some(s.clone())
     }
 
@@ -509,13 +513,22 @@ pub struct AuthState {
     pub engine: AuthEngine,
     pub sessions: SessionStore,
     pub pending_totp_secret: Option<(Vec<u8>, Instant)>,
+    password_gate: Option<(String,SessionScope)>,
 }
 
 impl AuthState {
+    pub fn effective_scope(&mut self,admin:&crate::config::AdminConfig,scope:SessionScope)->SessionScope {
+        if admin.must_change_password{return SessionScope::MustChangePassword;}
+        if self.password_gate.as_ref().is_none_or(|(hash,_)|hash!=&admin.password_hash){
+            let gate=PasswordHash::parse(&admin.password_hash).map(|hash|AuthEngine::resolve_session_scope(false,&hash.salt,&hash.hash,hash.iters)).unwrap_or(SessionScope::MustChangePassword);
+            self.password_gate=Some((admin.password_hash.clone(),gate));
+        }
+        if self.password_gate.as_ref().is_some_and(|(_,gate)|*gate==SessionScope::MustChangePassword){SessionScope::MustChangePassword}else{scope}
+    }
     pub fn new(canonical_origin: String, totp_watermark: u64) -> Self {
         let mut engine = AuthEngine::new(canonical_origin);
         engine.restore_totp_watermark(totp_watermark);
-        Self { engine, sessions: SessionStore::new(), pending_totp_secret: None }
+        Self { engine, sessions: SessionStore::new(), pending_totp_secret: None, password_gate: None }
     }
 }
 

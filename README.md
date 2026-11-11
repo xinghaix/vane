@@ -9,16 +9,26 @@
 
 **Vane** is an all-in-one, security-first, full IPv4/IPv6 dual-stack gateway daemon purpose-built for resource-constrained embedded routers (OpenWrt / ImmortalWrt / ARM64 / x86_64 appliances).
 
-Built with **Rust + Svelte 5 (Runes)**, Vane compiles into a single static binary with pre-compressed `.br` / `.gz` web assets, consuming **< 12 MB RAM** at runtime while enforcing strict module fault isolation (`ModuleSupervisor`) and firewall safety.
+Built with **Rust + Svelte 5 (Runes)**, Vane compiles into a single static binary with pre-compressed `.br` / `.gz` web assets, with a module supervisor. Runtime memory usage and firewall behavior still require validation on target devices.
 
 ---
+
+> **Development status:** This is not production-ready. ACME now implements the real DNS-01 order protocol and DDNS sends real provider requests, but live CA/DNS and Linux/OpenWrt acceptance tests are still pending. Some Cron actions only log messages. Manual notifications now perform real delivery; background alert events are not yet connected. The feature list includes design goals, not a claim of completed acceptance testing. Do not deploy this version as a public production gateway.
+
+## Admin access
+
+- Use HTTPS on the configured LAN address (default: https://192.168.1.1:23456). Verify and trust the generated self-signed certificate through a trusted channel; do not disable TLS verification.
+- The admin certificate and key persist in the certs directory alongside the configuration. Invalid, mismatched or unwritable credentials fail startup instead of silently changing trust.
+- IPv4 and IPv6 listener failures are reported; there is no implicit loopback fallback.
+- Mutating APIs and WebSockets require a trusted HTTPS Origin. Host must match a configured listener or canonical_origin. CLI clients must also send Origin and verify TLS.
+- Client IPs come from the TCP peer, never from forwarding headers.
 
 ## Key Features
 
 1. **First-Class IPv4 + IPv6 Dual-Stack Everywhere**
    - Explicit `IPV6_V6ONLY` socket control and dual-stack listeners across Linux, OpenWrt, and macOS.
    - Automatically filters out CGNAT (`100.64.0.0/10`), RFC1918 private addresses, Link-Local (`fe80::/10`), and ULA (`fc00::/7`).
-   - Synthesizes `/128` global IPv6 addresses for LAN sub-devices (`prefix_and_iid` or `neighbor_mac` EUI-64) and atomically updates `FORWARD` firewall rules upon ISP prefix re-delegation.
+   - Uses fixed IIDs or observed NDP neighbors with a persisted suffix cache; it never guesses an EUI-64 address from a MAC. Sub-device firewall rules are reconciled after confirmed DNS updates; firewall atomicity still requires target-device verification.
 2. **Security as the Bottom Line**
    - **Default 5-Digit Admin Port (`23456`)**: Binds exclusively to LAN (`192.168.1.1:23456`) by default.
    - **Mandatory Initial Password Change Gate**: Ships with initial credentials `admin` / `admin321`. On first login, all management APIs return `403 MUST_CHANGE_INITIAL_PASSWORD` until a strong password (8–128 chars, letters + digits/symbols, not `admin321`) is set.

@@ -2,3 +2,4 @@
 pub mod auth;
 pub mod fail2ban;
 pub mod vault;
+pub mod tickets;

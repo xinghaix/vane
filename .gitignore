@@ -1,7 +1,13 @@
 /target
 /web-ui/node_modules
 /web-ui/dist
+/certs
+/acme-accounts
+/acme-challenges
 .master.key
+.neighbor_cache.json
+vane-ddns-hosts
+*.vane.bak
 config.toml
 config.toml.bak
 *.tmp.*

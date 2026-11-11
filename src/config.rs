@@ -311,11 +311,14 @@ pub struct DnsProviderConfig {
     /// 阿里云 AccessKeySecret / DNSPod SecretKey（Cloudflare 无需）
     pub secret_key: String,
     pub happy_eyeballs_delay_ms: u64,
+    /// 可选显式托管区域，减少发现权限；Cloudflare 可同时配置 zone_id。
+    pub zone_name: String,
+    pub zone_id: String,
 }
 
 impl Default for DnsProviderConfig {
     fn default() -> Self {
-        Self { provider: "cloudflare".into(), api_token: String::new(), secret_key: String::new(), happy_eyeballs_delay_ms: 250 }
+        Self { provider: "cloudflare".into(), api_token: String::new(), secret_key: String::new(), happy_eyeballs_delay_ms: 250, zone_name: String::new(), zone_id: String::new() }
     }
 }
 
@@ -825,6 +828,17 @@ impl Config {
         }
         for d in self.ddns.iter_mut() {
             f(&format!("ddns.{}.token", d.name), &mut d.token);
+            f(&format!("ddns.{}.custom_http.url", d.name), &mut d.custom_http.url);
+            f(&format!("ddns.{}.custom_http.body", d.name), &mut d.custom_http.body);
+            for (header,value) in &mut d.custom_http.headers { f(&format!("ddns.{}.custom_http.headers.{}",d.name,header),value); }
+            match &mut d.source {
+                DdnsSource::ExternalUrl{url_v4,url_v6}=>{
+                    f(&format!("ddns.{}.source.url_v4",d.name),url_v4);
+                    f(&format!("ddns.{}.source.url_v6",d.name),url_v6);
+                },
+                DdnsSource::CustomHttpExtract{url}=>f(&format!("ddns.{}.source.url",d.name),url),
+                _=>{},
+            }
         }
         for a in self.acme.iter_mut() {
             f(&format!("acme.{}.eab_hmac_key", a.domain), &mut a.eab_hmac_key);
@@ -840,10 +854,23 @@ impl Config {
                 f(&format!("stun.{}.on_change_cloudflare_redirect.api_token", s.name), &mut cf.api_token);
             }
         }
+        for c in self.cron.iter_mut() {
+            if let CronAction::HttpRequest { url, headers, body, .. } = &mut c.action {
+                f(&format!("cron.{}.action.url", c.name), url);
+                f(&format!("cron.{}.action.body", c.name), body);
+                for (h, v) in headers.iter_mut() {
+                    f(&format!("cron.{}.action.headers.{}", c.name, h), v);
+                }
+            }
+        }
         for n in self.notifications.iter_mut() {
             f(&format!("notifications.{}.url", n.name), &mut n.url);
             f(&format!("notifications.{}.token", n.name), &mut n.token);
             f(&format!("notifications.{}.secret", n.name), &mut n.secret);
+            f(&format!("notifications.{}.body_template", n.name), &mut n.body_template);
+            for (header, value) in &mut n.headers {
+                f(&format!("notifications.{}.headers.{}", n.name, header), value);
+            }
         }
     }
 
@@ -897,7 +924,7 @@ impl Config {
                 return Err("admin.listen_lan 禁止使用 0 端口".into());
             }
         }
-        if !(a.canonical_origin.starts_with("https://") || a.canonical_origin.starts_with("http://")) {
+        if crate::web::boundary::origin_authority(&a.canonical_origin).is_none() {
             return Err("admin.canonical_origin 必须以 https:// 开头".into());
         }
         if a.secret_path != "/" {
@@ -962,17 +989,29 @@ impl Config {
                 return Err(format!("dns_providers.{}.provider 不支持: {}", id, p.provider));
             }
             range("happy_eyeballs_delay_ms", p.happy_eyeballs_delay_ms, 100, 2000)?;
+            if !p.zone_name.is_empty() { validate_domain(&p.zone_name)?; }
+            if !p.zone_id.is_empty() {
+                if p.zone_name.is_empty() || p.zone_id.len() > 128 || !p.zone_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+                    return Err("dns_providers.zone_id 需要合法 ID 与对应 zone_name".into());
+                }
+            }
         }
 
         let mut names = Vec::new();
+        if self.ddns.len()>256 {return Err("DDNS 规则数超过 256 条上限".into());}
         for d in &self.ddns {
             validate_name("ddns.name", &d.name)?;
             unique(&mut names, "ddns", &d.name)?;
             validate_domain(&d.domain)?;
+            range("ddns.reconcile_interval_secs", d.reconcile_interval_secs, 30, 86400)?;
+            range("ddns.ttl", d.ttl as u64, 1, 86400)?;
             if d.provider != "custom_http" && !self.dns_providers.contains_key(&d.provider) {
                 return Err(format!("ddns.{} 引用了不存在的 DNS 服务商账号 {}", d.name, d.provider));
             }
-            if d.provider == "custom_http" && !d.custom_http.url.starts_with("http") {
+            if d.provider == "custom_http" && d.on_missing_public_ip == "delete_record" {
+                return Err("custom_http 不支持隐式删除记录，请使用 keep_existing".into());
+            }
+            if d.provider == "custom_http" && !d.custom_http.url.starts_with("http") && !d.custom_http.url.starts_with("enc:v1:") {
                 return Err(format!("ddns.{} custom_http.url 非法", d.name));
             }
             if d.records.is_empty() || !d.records.iter().all(|r| r == "A" || r == "AAAA") {
@@ -1005,7 +1044,7 @@ impl Config {
                     }
                 }
                 DdnsSource::CustomHttpExtract { url } => {
-                    if !url.starts_with("http") {
+                    if !url.starts_with("http") && !url.starts_with("enc:v1:") {
                         return Err(format!("ddns.{} custom_http_extract.url 非法", d.name));
                     }
                 }
@@ -1016,6 +1055,8 @@ impl Config {
         }
 
         let mut names = Vec::new();
+        if self.acme.len()>32 {return Err("ACME 规则数超过 32 条上限".into());}
+        if self.acme.iter().filter(|entry|entry.enabled && entry.use_for_admin).count()>1 {return Err("最多允许一条 ACME 规则更新管理证书".into());}
         for a in &self.acme {
             validate_domain(&a.domain)?;
             unique(&mut names, "acme", &a.domain)?;
@@ -1026,11 +1067,15 @@ impl Config {
                 return Err(format!("acme.{} 引用了不存在的 DNS 服务商账号 {}", a.domain, a.dns_provider));
             }
             range("acme.renew_before_days", a.renew_before_days as u64, 7, 60)?;
+            range("acme.propagation_timeout_secs",a.propagation_timeout_secs,10,900)?;
+            if a.extra_domains.len()>31 {return Err("每个 ACME 订单最多 32 个域名".into());}
+            if a.deploy_hooks.len()>16 {return Err("每个 ACME 配置最多 16 个部署钩子".into());}
+            if a.eab_kid.is_empty()!=a.eab_hmac_key.is_empty() {return Err("EAB kid 与 hmac_key 必须一起配置".into());}
             if crate::daemon::acme::resolve_directory(&a.directory_url).is_none() {
                 return Err(format!("acme.{}.directory_url 非法", a.domain));
             }
             if !a.challenge_alias_domain.is_empty() {
-                validate_domain(&a.challenge_alias_domain)?;
+                validate_domain(a.challenge_alias_domain.strip_prefix("_acme-challenge.").unwrap_or(&a.challenge_alias_domain))?;
             }
             if !a.cert_dir.starts_with('/') {
                 return Err("acme.cert_dir 必须为绝对路径".into());
@@ -1090,6 +1135,14 @@ impl Config {
                 if a.port() == 0 {
                     return Err(format!("port_forwards.{} 目标端口不能为 0", p.name));
                 }
+                crate::firewall::validate_forward_target_safety(
+                    a,
+                    &p.engine,
+                    p.open_wan_firewall,
+                    admin_port,
+                    &self.admin.listen_lan,
+                )
+                .map_err(|e| format!("port_forwards.{}: {}", p.name, e))?;
                 parsed.push(a);
             }
             if p.engine == "kernel_dnat" {
@@ -1120,6 +1173,7 @@ impl Config {
             if !p.allowed_time_window.is_empty() {
                 parse_time_window(&p.allowed_time_window)?;
             }
+            range("port_forwards.tcp_idle_timeout_secs", p.tcp_idle_timeout_secs, 5, 86_400)?;
             range("port_forwards.udp_session_timeout_secs", p.udp_session_timeout_secs, 10, 600)?;
             range("port_forwards.max_concurrent_conns", p.max_concurrent_conns as u64, 1, 4096)?;
             for kind in proto_kinds(&p.proto) {
@@ -1137,10 +1191,36 @@ impl Config {
             if !matches!(s.proto.as_str(), "udp" | "tcp") {
                 return Err(format!("stun.{}.proto 非法", s.name));
             }
-            if s.servers().is_empty() {
+            let servers = s.servers();
+            if servers.is_empty() {
                 return Err(format!("stun.{} 至少配置一个 STUN 服务器", s.name));
             }
+            for srv in &servers {
+                validate_stun_server(srv).map_err(|e| format!("stun.{}: {}", s.name, e))?;
+            }
             range("stun.keepalive_secs", s.keepalive_secs, 5, 3600)?;
+            if !s.webhook_url.is_empty()
+                && !s.webhook_url.starts_with("http://")
+                && !s.webhook_url.starts_with("https://")
+                && !s.webhook_url.starts_with("enc:v1:")
+            {
+                return Err(format!("stun.{}.webhook_url 非法", s.name));
+            }
+            if let Some(ref cf) = s.on_change_cloudflare_redirect {
+                for (field, val) in [("zone_id", &cf.zone_id), ("ruleset_id", &cf.ruleset_id), ("rule_id", &cf.rule_id)] {
+                    if val.is_empty() || val.len() > 64 || !val.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+                        return Err(format!("stun.{}.on_change_cloudflare_redirect.{} 非法", s.name, field));
+                    }
+                }
+                if cf.api_token.is_empty() {
+                    return Err(format!("stun.{}.on_change_cloudflare_redirect.api_token 不能为空", s.name));
+                }
+                validate_domain(&cf.source_host)
+                    .map_err(|e| format!("stun.{}.on_change_cloudflare_redirect.source_host: {}", s.name, e))?;
+                if !matches!(cf.status_code, 301 | 302 | 307 | 308) {
+                    return Err(format!("stun.{}.on_change_cloudflare_redirect.status_code 仅支持 301/302/307/308", s.name));
+                }
+            }
         }
 
         let mut names = Vec::new();
@@ -1161,7 +1241,7 @@ impl Config {
                     }
                 }
                 CronAction::HttpRequest { url, .. } => {
-                    if !url.starts_with("http://") && !url.starts_with("https://") {
+                    if !url.starts_with("http://") && !url.starts_with("https://") && !url.starts_with("enc:v1:") {
                         return Err(format!("cron.{}: http_request.url 非法", c.name));
                     }
                 }
@@ -1192,6 +1272,27 @@ fn proto_kinds(p: &str) -> Vec<&'static str> {
     }
 }
 
+fn validate_stun_server(s: &str) -> Result<(), String> {
+    if let Ok(sock) = s.parse::<SocketAddr>() {
+        if sock.port() == 0 || sock.ip().is_unspecified() {
+            return Err(format!("STUN 服务器地址非法: {}", s));
+        }
+        return Ok(());
+    }
+    let Some((host, port_s)) = s.rsplit_once(':') else {
+        return Err(format!("STUN 服务器必须为 host:port 格式: {}", s));
+    };
+    let port: u16 = port_s.parse().map_err(|_| format!("STUN 服务器端口非法: {}", s))?;
+    if port == 0 {
+        return Err(format!("STUN 服务器端口不能为 0: {}", s));
+    }
+    let clean_host = host.trim_matches(['[', ']']);
+    if clean_host.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    validate_domain(clean_host)
+}
+
 fn validate_rule(r: &ReverseProxyRule) -> Result<(), String> {
     validate_domain(&r.host)?;
     if !r.path_prefix.starts_with('/') {
@@ -1199,8 +1300,9 @@ fn validate_rule(r: &ReverseProxyRule) -> Result<(), String> {
     }
     match r.mode.as_str() {
         "proxy" => {
-            if !(r.upstream.starts_with("http://") || r.upstream.starts_with("https://")) {
-                return Err("upstream 必须为 http:// 或 https:// 地址".into());
+            let uri:http::Uri=r.upstream.parse().map_err(|_|"upstream URL 无效")?;
+            if !matches!(uri.scheme_str(),Some("http")|Some("https"))||uri.authority().is_none_or(|value|value.as_str().contains('@'))||r.upstream.contains('#')||uri.port_u16()==Some(0){
+                return Err("upstream 必须为有效 HTTP/HTTPS URL，不能包含用户信息、fragment 或 0 端口".into());
             }
         }
         "redirect" => {
@@ -1232,8 +1334,14 @@ fn validate_rule(r: &ReverseProxyRule) -> Result<(), String> {
     }
     for (k, v) in r.request_headers_set.iter().chain(r.response_headers_set.iter()) {
         http::HeaderName::from_bytes(k.as_bytes()).map_err(|_| format!("Header 名非法: {}", k))?;
+        if crate::net::reverse_proxy::HOP_BY_HOP_HEADERS.contains(&k.to_ascii_lowercase().as_str()) || k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("host") {return Err("自定义 Header 不能覆盖协议控制字段，Host 请使用 upstream_host_header".into());}
         http::HeaderValue::from_str(v).map_err(|_| format!("Header 值非法: {}", k))?;
     }
+    for key in r.request_headers_remove.iter().chain(r.response_headers_remove.iter()) {
+        http::HeaderName::from_bytes(key.as_bytes()).map_err(|_|"待移除 Header 名非法")?;
+    }
+    if !r.upstream_host_header.is_empty(){http::HeaderValue::from_str(&r.upstream_host_header).map_err(|_|"upstream_host_header 非法")?;}
+    http::HeaderValue::from_str(&r.static_content_type).map_err(|_|"static_content_type 非法")?;
     if r.read_timeout_secs == 0 || r.read_timeout_secs > 86_400 {
         return Err("read_timeout_secs 范围 1 ~ 86400".into());
     }

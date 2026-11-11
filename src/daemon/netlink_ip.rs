@@ -22,7 +22,7 @@ pub fn is_public_ipv4(ip: Ipv4Addr) -> bool {
         return false;
     }
     // 192.0.0.0/24, 198.18.0.0/15, 224.0.0.0/3
-    if (o[0] == 192 && o[1] == 0 && o[2] == 0) || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) || o[0] >= 224 {
+    if o[0] == 0 || (o[0] == 192 && o[1] == 0 && o[2] == 0) || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) || o[0] >= 224 {
         return false;
     }
     true
@@ -95,7 +95,29 @@ pub fn list_interface_addresses() -> BTreeMap<String, InterfaceAddresses> {
         }
         libc::freeifaddrs(ifap);
     }
+    #[cfg(target_os="linux")]
+    {
+        // getifaddrs 不提供 IFA_FLAGS，从内核只读表补充 tentative/deprecated/DADFAILED 筛选。
+        let usable = std::fs::read_to_string("/proc/net/if_inet6").map(|text| usable_ipv6_addresses(&text)).unwrap_or_default();
+        for (name, interface) in &mut map {
+            interface.ipv6.retain(|ip| usable.contains(&(name.clone(),*ip)));
+        }
+    }
     map
+}
+
+pub fn usable_ipv6_addresses(text: &str) -> std::collections::BTreeSet<(String,Ipv6Addr)> {
+    let mut result=std::collections::BTreeSet::new();
+    for line in text.lines() {
+        let columns:Vec<_>=line.split_whitespace().collect();
+        if columns.len()!=6 || columns[0].len()!=32 {continue;}
+        let Ok(flags)=u32::from_str_radix(columns[4],16) else {continue};
+        // IFA_F_DADFAILED(0x08), IFA_F_DEPRECATED(0x20), IFA_F_TENTATIVE(0x40)
+        if flags & 0x68 != 0 {continue;}
+        let Ok(address)=u128::from_str_radix(columns[0],16) else {continue};
+        result.insert((columns[5].to_string(),Ipv6Addr::from(address)));
+    }
+    result
 }
 
 /// 从文本响应中提取第一个合法 IPv4 或 IPv6 地址
@@ -118,6 +140,15 @@ pub fn extract_ip_from_text(text: &str, want_v6: bool) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_deprecated_tentative_and_failed_ipv6_addresses() {
+        let text="26064700000000000000000000001111 02 40 00 80 eth0\n26064700000000000000000000002222 02 40 00 a0 eth0\n26064700000000000000000000003333 02 40 00 40 eth0\n26064700000000000000000000004444 02 40 00 08 eth0";
+        let addresses=usable_ipv6_addresses(text);
+        assert_eq!(addresses.len(),1);
+        assert!(addresses.contains(&("eth0".into(),"2606:4700::1111".parse().unwrap())));
+        assert!(!is_public_ipv4("0.1.2.3".parse().unwrap()));
+    }
 
     #[test]
     fn filters_cgnat_and_synthesizes_subdevice_v6() {

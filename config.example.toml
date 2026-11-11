@@ -47,6 +47,15 @@ idle_timeout_secs = 900                # 空闲 15 分钟自动断开并回收�
 max_sessions = 2
 
 [security]
+[monitor]
+interfaces = ["pppoe-wan", "br-lan"]
+thermal_path = ""
+temp_alert_celsius = 85
+mem_low_mb = 32
+alert_cooldown_secs = 1800
+sample_interval_secs = 2
+top_processes = 10
+
 tls_handshake_timeout_secs = 5
 http_header_timeout_secs = 10
 max_login_failures = 5                 # IPv4 按 /32、IPv6 按 /64 子网聚合计数
@@ -63,9 +72,11 @@ lan_interfaces = ["br-lan"]
 provider = "cloudflare"
 # 支持填写明文（启动时自动通过 ChaCha20-Poly1305 + AAD 加封为 enc:v1:... 落盘），Web API 读取时自动脱敏
 api_token = "enc:v1:dGhpcyBpcyBhbiBleGFtcGxlIGFlYWQgc2VhbGVkIHRva2Vu..."
-happy_eyeballs_delay_ms = 250          # RFC 8305 双栈连接竞速延迟
+happy_eyeballs_delay_ms = 250          # 双栈连接竞速延迟
+zone_name = "example.com"             # 可选；显式指定区域可减少发现权限
+zone_id = ""                          # Cloudflare 可填写区域 ID；其他服务商留空
 
-# --- M3: 全栈事件驱动 DDNS（先订阅后 Dump，剔除 CGNAT v4 与 Tentative/Deprecated/Temporary v6） ---
+# --- M3: 双栈 DDNS（Linux 订阅 RTNETLINK；剔除 CGNAT v4 与 Tentative/Deprecated/DADFAILED v6） ---
 [[ddns]]
 name = "router_dual_stack"
 enabled = true
@@ -74,7 +85,8 @@ domain = "home.example.com"
 records = ["A", "AAAA"]
 source = { kind = "interface", name = "pppoe-wan" }
 on_missing_public_ip = "keep_existing" # 无公网地址时保留原记录并告警，不误删记录
-split_dns_lan_ips = ["192.168.1.1"]
+split_dns_lan_ips = ["192.168.1.1"]    # 生成配置目录内 split-dns.hosts；需接入 dnsmasq addn-hosts
+reconcile_interval_secs = 900         # 30..86400；Linux 地址变更可提前唤醒
 
 [[ddns]]
 name = "nas_direct_ipv6"
@@ -138,6 +150,14 @@ keepalive_secs = 25
 webhook_url = "enc:v1:d2ViaG9vay1zZWFsZWQtdXJsLWV4YW1wbGU=..."
 
 # --- M7: 安全计划任务（支持内置 Docker API 动作或无 Shell 结构化参数数组） ---
+[[alerts]]
+name = "system_health"
+enabled = true
+cpu_threshold_pct = 90.0
+mem_threshold_pct = 90.0
+temp_threshold_celsius = 85.0
+channels = ["ntfy_home"]
+
 [[cron]]
 name = "prune_dangling_docker_images"
 enabled = true

@@ -33,13 +33,16 @@ pub fn set_module_health(reg: &HealthRegistry, name: &str, health: ModuleHealth)
     }
 }
 
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+impl<T> Drop for AbortOnDrop<T> { fn drop(&mut self) { self.0.abort(); } }
+
 /// 在独立舱壁中监督运行一个可取消的异步模块任务
 pub async fn supervise_module<F, Fut>(
     module_name: &'static str,
     mut shutdown_rx: watch::Receiver<bool>,
     health_tx: watch::Sender<ModuleHealth>,
     registry: Option<HealthRegistry>,
-    mut task_factory: F,
+    task_factory: F,
 ) where
     F: FnMut(watch::Receiver<bool>) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(), String>> + Send + 'static,
@@ -48,6 +51,7 @@ pub async fn supervise_module<F, Fut>(
     const MAX_FAILURES_IN_WINDOW: usize = 5;
     const CIRCUIT_HALF_OPEN_COOLDOWN: Duration = Duration::from_secs(300);
 
+    let task_factory = Arc::new(std::sync::Mutex::new(task_factory));
     let mut failure_timestamps: VecDeque<Instant> = VecDeque::with_capacity(MAX_FAILURES_IN_WINDOW + 1);
     let update = |h: ModuleHealth| {
         let _ = health_tx.send(h.clone());
@@ -57,25 +61,34 @@ pub async fn supervise_module<F, Fut>(
     };
 
     loop {
-        if *shutdown_rx.borrow() {
+        if shutdown_rx.has_changed().is_err() || *shutdown_rx.borrow() {
             update(ModuleHealth::Disabled);
             break;
         }
         update(ModuleHealth::Running);
 
         let child_shutdown = shutdown_rx.clone();
-        let fut = std::panic::AssertUnwindSafe(std::iter::once_with(|| task_factory(child_shutdown)).next().unwrap());
-        let mut handle = tokio::spawn(async move { fut.await });
+        let factory = task_factory.clone();
+        // 工厂调用本身也在子任务中；同步 panic 不得杀死监督器。
+        let mut handle = AbortOnDrop(tokio::spawn(async move {
+            let future = { factory.lock().unwrap_or_else(|error|error.into_inner())(child_shutdown) };
+            future.await
+        }));
 
         let outcome = tokio::select! {
-            res = &mut handle => Some(res),
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
-                    handle.abort();
-                    let _ = handle.await;
+            res = &mut handle.0 => Some(res),
+            event = shutdown_rx.changed() => {
+                if event.is_err() || *shutdown_rx.borrow() {
+                    // 先给子模块撤销防火墙、回收进程的机会，再强制取消。
+                    if tokio::time::timeout(Duration::from_secs(2), &mut handle.0).await.is_err() {
+                        handle.0.abort();
+                        let _ = (&mut handle.0).await;
+                    }
                     update(ModuleHealth::Disabled);
                     break;
                 }
+                handle.0.abort();
+                let _ = (&mut handle.0).await;
                 None
             }
         };
@@ -84,7 +97,7 @@ pub async fn supervise_module<F, Fut>(
         let err_msg = match join_res {
             Ok(Ok(())) => {
                 failure_timestamps.clear();
-                if *shutdown_rx.borrow() {
+                if shutdown_rx.has_changed().is_err() || *shutdown_rx.borrow() {
                     update(ModuleHealth::Disabled);
                     break;
                 }
@@ -120,7 +133,7 @@ pub async fn supervise_module<F, Fut>(
                     continue;
                 }
                 _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                    if shutdown_rx.has_changed().is_err() || *shutdown_rx.borrow() {
                         update(ModuleHealth::Disabled);
                         break;
                     }
@@ -136,7 +149,7 @@ pub async fn supervise_module<F, Fut>(
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
                 _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                    if shutdown_rx.has_changed().is_err() || *shutdown_rx.borrow() {
                         update(ModuleHealth::Disabled);
                         break;
                     }
@@ -150,6 +163,37 @@ pub async fn supervise_module<F, Fut>(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn synchronous_factory_panic_is_isolated() {
+        let (stop_tx,stop_rx)=watch::channel(false);
+        let (health_tx,mut health_rx)=watch::channel(ModuleHealth::Disabled);
+        let task=tokio::spawn(supervise_module("test",stop_rx,health_tx,None,move |_| {
+            panic!("同步工厂失败");
+            #[allow(unreachable_code)]
+            std::future::ready(Ok(()))
+        }));
+        tokio::time::timeout(Duration::from_secs(1),async {
+            loop {health_rx.changed().await.unwrap();if matches!(*health_rx.borrow(),ModuleHealth::Degraded{..}){break;}}
+        }).await.unwrap();
+        stop_tx.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_shutdown_sender_stops_without_respawning() {
+        let (stop_tx,stop_rx)=watch::channel(false);
+        let (health_tx,_)=watch::channel(ModuleHealth::Disabled);
+        let started=Arc::new(tokio::sync::Notify::new());
+        let notice=started.clone();
+        let task=tokio::spawn(supervise_module("test",stop_rx,health_tx,None,move |mut rx| {
+            let notice=notice.clone();
+            async move {notice.notify_one();let _=rx.changed().await;Ok(())}
+        }));
+        started.notified().await;
+        drop(stop_tx);
+        tokio::time::timeout(Duration::from_secs(1),task).await.unwrap().unwrap();
+    }
 
     #[tokio::test]
     async fn supervisor_isolates_panic_and_recovers() {

@@ -1,6 +1,8 @@
 <script>
   import { I18N } from './lib/i18n.js';
+  import { localizeError } from './lib/helpers.js';
   import Icons from './components/Icons.svelte';
+  import ToastStack from './components/ToastStack.svelte';
   import AuthGate from './components/AuthGate.svelte';
   import DashboardView from './components/DashboardView.svelte';
   import NetworkRulesView from './components/NetworkRulesView.svelte';
@@ -8,12 +10,15 @@
   import OpsViews from './components/OpsViews.svelte';
   import SettingsView from './components/SettingsView.svelte';
 
-  let lang = $state(localStorage.getItem('vane_lang') === 'en' ? 'en' : 'zh');
+  const storedLang = localStorage.getItem('vane_lang');
+  let hasExplicitLang = storedLang === 'zh' || storedLang === 'en';
+  let lang = $state(hasExplicitLang ? (storedLang === 'en' ? 'en' : 'zh') : 'zh');
   let t = $derived(I18N[lang] || I18N.zh);
 
   let loading = $state(true);
   let authenticated = $state(false);
   let mustChangePassword = $state(false);
+  let authConnError = $state('');
   let username = $state('admin');
   let passwordLoginEnabled = $state(true);
   let totpEnabled = $state(false);
@@ -21,10 +26,11 @@
   let ed25519KeyIds = $state([]);
   let sessionTtlSecs = $state(3600);
 
-  let themeMode = $state(localStorage.getItem('vane_theme_mode') || 'dark'); // dark | light | auto
+  let themeMode = $state(localStorage.getItem('vane_theme_mode') || 'dark');
   let activeTab = $state('dashboard');
   let mobileMoreOpen = $state(false);
-  let toast = $state('');
+  let toasts = $state([]);
+  let nextToastId = 1;
 
   let modules = $state({
     reverse_proxy: true,
@@ -42,28 +48,69 @@
   let logs = $state([]);
   let logLevelFilter = $state('');
   let containers = $state([]);
+  let restartRequiredFields = $state([]);
 
   // Web 终端按需异步加载分包（关闭时 0 字节下载）
   let TerminalComp = $state(null);
   let terminalInitialTarget = $state('host');
 
-  let navItems = $derived(
-    [
-      { id: 'dashboard', label: t.nav.dashboard, always: true },
-      { id: 'reverse_proxy', label: t.nav.reverse_proxy, enabled: modules.reverse_proxy },
-      { id: 'port_forward', label: t.nav.port_forward, enabled: modules.port_forward },
-      { id: 'ddns', label: t.nav.ddns, enabled: modules.ddns },
-      { id: 'acme', label: t.nav.acme, enabled: modules.acme },
-      { id: 'stun', label: t.nav.stun, enabled: modules.stun },
-      { id: 'docker', label: t.nav.docker, enabled: modules.docker },
-      { id: 'web_terminal', label: t.nav.web_terminal, enabled: modules.web_terminal },
-      { id: 'cron', label: t.nav.cron, enabled: modules.cron },
-      { id: 'logs', label: t.nav.logs, always: true },
-      { id: 'settings', label: t.nav.settings, always: true },
-    ].filter((item) => item.always || item.enabled)
-  );
+  let navGroups = $derived.by(() => {
+    const groups = [
+      {
+        label: t.navGroups.overview,
+        items: [{ id: 'dashboard', label: t.nav.dashboard, always: true }],
+      },
+      {
+        label: t.navGroups.traffic,
+        items: [
+          {
+            id: 'reverse_proxy',
+            label: t.nav.reverse_proxy,
+            enabled: modules.reverse_proxy,
+            count: settingsJson?.reverse_proxy?.length,
+          },
+          {
+            id: 'port_forward',
+            label: t.nav.port_forward,
+            enabled: modules.port_forward,
+            count: settingsJson?.port_forwards?.length,
+          },
+        ],
+      },
+      {
+        label: t.navGroups.domain,
+        items: [
+          { id: 'ddns', label: t.nav.ddns, enabled: modules.ddns, count: settingsJson?.ddns?.length },
+          { id: 'acme', label: t.nav.acme, enabled: modules.acme, count: settingsJson?.acme?.length },
+          { id: 'stun', label: t.nav.stun, enabled: modules.stun, count: settingsJson?.stun?.length },
+        ],
+      },
+      {
+        label: t.navGroups.ops,
+        items: [
+          {
+            id: 'docker',
+            label: t.nav.docker,
+            enabled: modules.docker,
+            count: containers.length || undefined,
+          },
+          { id: 'web_terminal', label: t.nav.web_terminal, enabled: modules.web_terminal },
+          { id: 'cron', label: t.nav.cron, enabled: modules.cron, count: settingsJson?.cron?.length },
+          { id: 'logs', label: t.nav.logs, always: true },
+        ],
+      },
+      {
+        label: t.navGroups.system,
+        items: [{ id: 'settings', label: t.nav.settings, always: true }],
+      },
+    ];
+    return groups
+      .map((g) => ({ ...g, items: g.items.filter((item) => item.always || item.enabled) }))
+      .filter((g) => g.items.length > 0);
+  });
 
-  // 手机端底部主导航固定展示核心 4 项 + “更多”全量抽屉，确保任何子页在手机上均可一键直达
+  let navItems = $derived(navGroups.flatMap((g) => g.items));
+
   let mobilePrimaryItems = $derived.by(() => {
     const picked = [navItems[0]];
     for (const candidate of ['reverse_proxy', 'port_forward', 'ddns', 'docker', 'logs']) {
@@ -82,6 +129,8 @@
     const apply = () => {
       const resolved = themeMode === 'auto' ? (mq.matches ? 'light' : 'dark') : themeMode;
       document.documentElement.setAttribute('data-theme', resolved);
+      const meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute('content', resolved === 'light' ? '#f1f5f9' : '#080a0f');
     };
     apply();
     mq.addEventListener('change', apply);
@@ -90,10 +139,8 @@
 
   $effect(() => {
     document.documentElement.setAttribute('lang', lang === 'en' ? 'en' : 'zh-CN');
-    localStorage.setItem('vane_lang', lang);
   });
 
-  // 当打开 web_terminal 视图时才异步拉取终端分包
   $effect(() => {
     if (activeTab === 'web_terminal' && modules.web_terminal && !TerminalComp) {
       import('./components/TerminalView.svelte').then((m) => {
@@ -104,6 +151,8 @@
 
   function toggleLang() {
     lang = lang === 'zh' ? 'en' : 'zh';
+    hasExplicitLang = true;
+    localStorage.setItem('vane_lang', lang);
   }
 
   function cycleTheme() {
@@ -116,11 +165,32 @@
     return t.themeDark;
   }
 
-  function showToast(msg) {
-    toast = msg;
-    setTimeout(() => {
-      if (toast === msg) toast = '';
-    }, 3600);
+  function themeIcon() {
+    if (themeMode === 'light') return 'sun';
+    if (themeMode === 'auto') return 'monitor';
+    return 'moon';
+  }
+
+  function dismissToast(id) {
+    toasts = toasts.filter((x) => x.id !== id);
+  }
+
+  function showToast(msg, type = 'info') {
+    const id = nextToastId++;
+    const duration = type === 'error' || type === 'warn' ? 6000 : 3500;
+    toasts = [...toasts.slice(-3), { id, message: String(msg), type }];
+    setTimeout(() => dismissToast(id), duration);
+  }
+
+  function moduleStatusDot(id) {
+    if (id === 'dashboard') {
+      if ((dashboard?.bans?.length || 0) > 0) return 'warn';
+      return '';
+    }
+    const st = dashboard?.module_health?.[id]?.state;
+    if (st === 'circuit_open') return 'danger';
+    if (st === 'degraded') return 'warn';
+    return '';
   }
 
   async function apiFetch(path, options = {}) {
@@ -131,16 +201,16 @@
     const data = await res.json().catch(() => ({}));
     if (res.status === 403 && data.error === 'MUST_CHANGE_INITIAL_PASSWORD') {
       mustChangePassword = true;
-      throw new Error(data.message || 'Must change initial password');
+      throw new Error(localizeError(data.message || 'Must change initial password', lang, data.error));
     }
     if (res.status === 401 && !path.startsWith('/api/auth/')) {
       authenticated = false;
       dashboard = null;
       settingsJson = null;
-      throw new Error(lang === 'en' ? 'Session expired' : '会话已过期，请重新登录');
+      throw new Error(t.errors.UNAUTHORIZED);
     }
     if (!res.ok) {
-      throw new Error(data.message || data.error || `HTTP ${res.status}`);
+      throw new Error(localizeError(data.message || data.error || `HTTP ${res.status}`, lang, data.error));
     }
     return data;
   }
@@ -154,7 +224,7 @@
     if ('has_ed25519_keys' in st) hasEd25519Keys = Boolean(st.has_ed25519_keys);
     if (Array.isArray(st.ed25519_key_ids)) ed25519KeyIds = st.ed25519_key_ids;
     sessionTtlSecs = st.session_ttl_secs || 3600;
-    if (st.language && !localStorage.getItem('vane_lang')) {
+    if (st.language && !hasExplicitLang) {
       lang = st.language === 'en' ? 'en' : 'zh';
     }
     if (st.modules) modules = st.modules;
@@ -162,22 +232,25 @@
 
   async function checkAuthStatus() {
     loading = true;
+    authConnError = '';
     try {
       const st = await apiFetch('/api/auth/status');
       applyAuthStatus(st);
       if (authenticated && !mustChangePassword) {
         await refreshActiveView();
       }
-    } catch {
+    } catch (err) {
       authenticated = false;
+      authConnError = err?.message || 'Connection failed';
     } finally {
       loading = false;
     }
   }
 
   async function handleAuthenticated(st, toastMsg = '') {
+    authConnError = '';
     applyAuthStatus(st);
-    if (toastMsg) showToast(toastMsg);
+    if (toastMsg) showToast(toastMsg, 'success');
     if (authenticated && !mustChangePassword) {
       await refreshActiveView();
     }
@@ -191,6 +264,7 @@
     settingsJson = null;
     containers = [];
     logs = [];
+    await checkAuthStatus();
   }
 
   async function refreshActiveView(silent = false) {
@@ -198,13 +272,15 @@
     try {
       if (['dashboard', 'ddns', 'acme', 'stun', 'cron'].includes(activeTab)) {
         dashboard = await apiFetch('/api/dashboard');
+      } else if (!dashboard) {
+        dashboard = await apiFetch('/api/dashboard').catch(() => dashboard);
       }
       if (activeTab === 'logs') {
         const q = logLevelFilter ? `?level=${encodeURIComponent(logLevelFilter)}` : '';
         const r = await apiFetch(`/api/logs${q}`);
         logs = r.entries || [];
       }
-      if (['settings', 'reverse_proxy', 'port_forward', 'ddns', 'acme', 'stun', 'cron', 'web_terminal'].includes(activeTab)) {
+      if (['dashboard', 'settings', 'reverse_proxy', 'port_forward', 'ddns', 'acme', 'stun', 'cron', 'web_terminal'].includes(activeTab)) {
         if (!silent || !settingsJson) {
           settingsJson = await apiFetch('/api/settings');
           if (settingsJson?.modules) modules = settingsJson.modules;
@@ -215,7 +291,7 @@
         containers = r.containers || [];
       }
     } catch (err) {
-      if (!silent) showToast(err.message);
+      if (!silent) showToast(err.message, 'error');
     }
   }
 
@@ -237,41 +313,67 @@
       if (!modules[activeTab] && !['dashboard', 'logs', 'settings'].includes(activeTab)) {
         activeTab = 'settings';
       }
-      showToast(`${t.nav[key] || key}: ${modules[key] ? t.enabled : t.disabled}`);
+      showToast(`${t.nav[key] || key}: ${modules[key] ? t.enabled : t.disabled}`, 'success');
       await refreshActiveView();
     } catch (err) {
-      showToast(err.message);
+      showToast(err.message, 'error');
     }
   }
 
-  async function saveFullSettings(nextObj) {
+  async function saveFullSettings(nextObj, renames = []) {
     try {
-      nextObj.system.language = lang;
-      const saved = await apiFetch('/api/settings', {
+      const payload = renames?.length ? { ...nextObj, _renames: renames } : nextObj;
+      const res = await fetch('/api/settings', {
         method: 'PUT',
-        body: JSON.stringify(nextObj),
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
       });
-      settingsJson = saved;
-      if (saved?.modules) modules = saved.modules;
-      if (saved?.admin?.session_ttl_secs) sessionTtlSecs = saved.admin.session_ttl_secs;
-      showToast(t.settingsSaved);
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 403 && data.error === 'MUST_CHANGE_INITIAL_PASSWORD') {
+        mustChangePassword = true;
+        throw new Error(localizeError(data.message, lang, data.error));
+      }
+      if (res.status === 401) {
+        authenticated = false;
+        throw new Error(t.errors.UNAUTHORIZED);
+      }
+      if (!res.ok) {
+        throw new Error(localizeError(data.message || data.error || `HTTP ${res.status}`, lang, data.error));
+      }
+      const restartHdr = res.headers.get('x-vane-restart-required');
+      if (restartHdr) {
+        restartRequiredFields = restartHdr.split(',').map((s) => s.trim()).filter(Boolean);
+        showToast(t.restartBannerTitle, 'warn');
+      } else {
+        showToast(t.settingsSaved, 'success');
+      }
+      settingsJson = data;
+      if (data?.modules) modules = data.modules;
+      if (data?.admin?.session_ttl_secs) sessionTtlSecs = data.admin.session_ttl_secs;
       await refreshActiveView(true);
       return true;
     } catch (err) {
-      showToast(err.message);
+      showToast(err.message, 'error');
       return false;
     }
   }
 
   async function triggerLockdown(enable) {
     try {
-      await apiFetch('/api/firewall/lockdown', {
+      const r = await apiFetch('/api/firewall/lockdown', {
         method: 'POST',
         body: JSON.stringify({ enable }),
       });
-      await refreshActiveView();
+      if (dashboard?.firewall) {
+        dashboard = {
+          ...dashboard,
+          firewall: { ...dashboard.firewall, lockdown: Boolean(r.lockdown) },
+        };
+      }
+      showToast(r.lockdown ? t.lockdownOn : t.lockdownOff, r.lockdown ? 'warn' : 'success');
+      dashboard = await apiFetch('/api/dashboard').catch(() => dashboard);
     } catch (err) {
-      showToast(err.message);
+      showToast(err.message, 'error');
     }
   }
 
@@ -283,13 +385,14 @@
   checkAuthStatus();
 </script>
 
-{#if toast}
-  <div class="toast-banner">{toast}</div>
-{/if}
+<ToastStack {toasts} onDismiss={dismissToast} />
 
 {#if loading}
   <div class="auth-shell">
-    <div class="card mono" style="font-size:14px;">Loading Vane Gateway...</div>
+    <div class="card" style="display:flex;align-items:center;gap:12px;">
+      <img src="/icon.svg" alt="Vane" class="brand-icon" />
+      <span class="mono" style="font-size:14px;">Loading Vane Gateway...</span>
+    </div>
   </div>
 {:else if !authenticated || mustChangePassword}
   <AuthGate
@@ -303,39 +406,60 @@
     {totpEnabled}
     {hasEd25519Keys}
     {ed25519KeyIds}
+    connError={authConnError}
+    onRetryStatus={checkAuthStatus}
     {apiFetch}
     onAuthenticated={handleAuthenticated}
     onLogout={logout}
   />
 {:else}
   <div class="layout">
-    <!-- 桌面端左侧导航栏 -->
+    <!-- 桌面端左侧分组导航栏 -->
     <aside class="sidebar">
       <div class="brand">
-        <div class="brand-logo">V</div>
+        <img src="/icon.svg" alt="Vane" class="brand-icon" />
         <div>
-          <div style="font-size:16px;font-weight:700;">Vane</div>
+          <div style="font-size:16px;font-weight:700;letter-spacing:-0.01em;">Vane</div>
           <div class="mono" style="font-size:11px;color:var(--text-secondary);">IPv4 + IPv6 Dual-Stack</div>
         </div>
       </div>
 
-      {#each navItems as item}
-        <button type="button" class="nav-btn {activeTab === item.id ? 'active' : ''}" onclick={() => switchTab(item.id)}>
-          <Icons name={item.id} size={17} />
-          <span>{item.label}</span>
-        </button>
+      {#each navGroups as group}
+        <div class="nav-group-label">{group.label}</div>
+        {#each group.items as item}
+          {@const dot = moduleStatusDot(item.id)}
+          <button
+            type="button"
+            class="nav-btn {activeTab === item.id ? 'active' : ''}"
+            onclick={() => switchTab(item.id)}
+          >
+            <Icons name={item.id} size={17} />
+            <span>{item.label}</span>
+            <span class="nav-meta">
+              {#if dot}<span class="status-dot {dot}"></span>{/if}
+              {#if typeof item.count === 'number'}
+                <span class="nav-count num">{item.count}</span>
+              {/if}
+            </span>
+          </button>
+        {/each}
       {/each}
 
-      <div style="margin-top:auto;padding-top:14px;border-top:1px solid var(--border-subtle);display:grid;gap:6px;">
+      <div style="margin-top:auto;padding-top:12px;border-top:1px solid var(--border-subtle);display:grid;gap:6px;">
         <div style="display:flex;gap:6px;">
           <button type="button" class="btn btn-sm" style="flex:1;" onclick={toggleLang}>
-            {lang === 'zh' ? 'EN' : '中文'}
+            <Icons name="ddns" size={14} />
+            <span>{lang === 'zh' ? 'EN' : '中文'}</span>
           </button>
           <button type="button" class="btn btn-sm" style="flex:1;" onclick={cycleTheme}>
-            {themeLabel()}
+            <Icons name={themeIcon()} size={14} />
+            <span>{themeLabel()}</span>
           </button>
         </div>
-        <button type="button" class="btn btn-sm" onclick={logout}>{t.logout}</button>
+        <button type="button" class="btn btn-sm" onclick={logout}>
+          <Icons name="lock" size={14} />
+          <span>{t.logout}</span>
+        </button>
       </div>
     </aside>
 
@@ -343,11 +467,11 @@
     <main class="main-area">
       <header class="topbar">
         <div>
-          <h1 style="font-size:21px;font-weight:700;">
+          <h1 style="font-size:21px;font-weight:700;letter-spacing:-0.01em;">
             {navItems.find((n) => n.id === activeTab)?.label || t.nav.dashboard}
           </h1>
           <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">
-            Admin: <span class="mono">{username}</span> · Session TTL: <span class="num">{Math.round(sessionTtlSecs / 60)}m</span>
+            {t.adminLabel}: <span class="mono">{username}</span> · {t.sessionTtl}: <span class="num">{Math.round(sessionTtlSecs / 60)}m</span>
           </div>
         </div>
         <div class="btn-group">
@@ -357,15 +481,36 @@
               class="btn btn-sm {dashboard.firewall.lockdown ? 'btn-primary' : 'btn-danger'}"
               onclick={() => triggerLockdown(!dashboard.firewall.lockdown)}
             >
-              {dashboard.firewall.lockdown ? t.lockdownOn : t.lockdownOff}
+              <Icons name="shield" size={14} />
+              <span>{dashboard.firewall.lockdown ? t.lockdownOn : t.lockdownOff}</span>
             </button>
           {/if}
-          <button type="button" class="btn btn-sm" onclick={() => refreshActiveView()}>{t.refresh}</button>
+          <button type="button" class="btn btn-sm" onclick={() => refreshActiveView()}>
+            <Icons name="refresh" size={14} />
+            <span>{t.refresh}</span>
+          </button>
         </div>
       </header>
 
+      {#if restartRequiredFields.length > 0}
+        <div class="banner banner-warn">
+          <div style="display:flex;gap:10px;align-items:flex-start;">
+            <Icons name="alert" size={18} />
+            <div>
+              <div style="font-weight:700;">{t.restartBannerTitle}</div>
+              <div style="font-size:12px;color:var(--text-secondary);">
+                {t.restartBannerDesc} <code class="mono">{restartRequiredFields.join(', ')}</code>
+              </div>
+            </div>
+          </div>
+          <button type="button" class="btn btn-xs" onclick={() => restartRequiredFields = []}>
+            <Icons name="x" size={13} />
+          </button>
+        </div>
+      {/if}
+
       {#if activeTab === 'dashboard'}
-        <DashboardView {t} {lang} {dashboard} onRefresh={refreshActiveView} {apiFetch} {showToast} />
+        <DashboardView {t} {lang} {dashboard} {settingsJson} onRefresh={refreshActiveView} {apiFetch} {showToast} />
       {:else if activeTab === 'reverse_proxy' || activeTab === 'port_forward'}
         <NetworkRulesView
           mode={activeTab}
@@ -454,8 +599,8 @@
       <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) mobileMoreOpen = false; }}>
         <div class="drawer-panel">
           <div class="drawer-header">
-            <span class="card-title">Vane Navigation</span>
-            <button type="button" class="btn btn-sm" onclick={() => mobileMoreOpen = false}>{t.cancel}</button>
+            <span class="card-title">{t.navGroups.overview} / {t.more}</span>
+            <button type="button" class="btn btn-sm" onclick={() => mobileMoreOpen = false}>{t.close}</button>
           </div>
           <div class="drawer-body">
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px;">

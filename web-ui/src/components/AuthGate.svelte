@@ -1,4 +1,6 @@
 <script>
+  import Icons from './Icons.svelte';
+
   let {
     t,
     lang,
@@ -10,6 +12,8 @@
     totpEnabled = false,
     hasEd25519Keys = false,
     ed25519KeyIds = [],
+    connError = '',
+    onRetryStatus,
     apiFetch,
     onAuthenticated,
     onLogout,
@@ -18,6 +22,7 @@
   let loginMode = $state('password');
   let loginUser = $state('admin');
   let loginPass = $state('');
+  let showLoginPass = $state(false);
   let loginTotp = $state('');
   let loginError = $state('');
   let busy = $state(false);
@@ -80,7 +85,6 @@
   }
 
   async function signEd25519InBrowser(seed32, messageBytes) {
-    // RFC 8410 Ed25519 PKCS#8 v1 ASN.1 前缀 (16 bytes) + 32-byte raw seed
     const pkcs8Prefix = new Uint8Array([
       0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
       0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
@@ -88,11 +92,16 @@
     const pkcs8 = new Uint8Array(48);
     pkcs8.set(pkcs8Prefix, 0);
     pkcs8.set(seed32, 16);
-    const key = await crypto.subtle.importKey('pkcs8', pkcs8, { name: 'Ed25519' }, false, ['sign']);
-    const sig = await crypto.subtle.sign({ name: 'Ed25519' }, key, messageBytes);
-    pkcs8.fill(0);
-    seed32.fill(0);
-    return bytesToB64(sig);
+    try {
+      const key = await crypto.subtle.importKey('pkcs8', pkcs8, { name: 'Ed25519' }, false, ['sign']);
+      const sig = await crypto.subtle.sign({ name: 'Ed25519' }, key, messageBytes);
+      return bytesToB64(sig);
+    } catch {
+      throw new Error(t.webCryptoUnsupported);
+    } finally {
+      pkcs8.fill(0);
+      seed32.fill(0);
+    }
   }
 
   function buildChallengePayload(nonceBytes, keyId, origin) {
@@ -214,7 +223,7 @@
     <div class="auth-card">
       <div class="brand" style="border:none;margin-bottom:14px;padding:0;justify-content:space-between;">
         <div style="display:flex;align-items:center;gap:12px;">
-          <div class="brand-logo">V</div>
+          <img src="/icon.svg" alt="Vane" class="brand-icon" />
           <div>
             <div style="font-size:18px;font-weight:700;">Vane Gateway</div>
             <div style="font-size:12px;color:var(--text-secondary);">{t.subtitle}</div>
@@ -222,6 +231,19 @@
         </div>
         <button type="button" class="btn btn-sm" onclick={toggleLang}>{lang === 'zh' ? 'EN' : '中文'}</button>
       </div>
+
+      {#if connError}
+        <div class="banner banner-danger" style="margin-bottom:14px;">
+          <div style="flex:1;min-width:0;">
+            <div style="font-weight:700;">{t.connErrorTitle}</div>
+            <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">{connError}</div>
+            <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">{t.connErrorDesc}</div>
+          </div>
+          {#if onRetryStatus}
+            <button type="button" class="btn btn-xs" onclick={onRetryStatus}>{t.refresh}</button>
+          {/if}
+        </div>
+      {/if}
 
       {#if passwordLoginEnabled && hasEd25519Keys}
         <div class="pill-tabs" style="width:100%;margin-bottom:16px;display:grid;grid-template-columns:1fr 1fr;">
@@ -236,7 +258,8 @@
 
       {#if loginError}
         <div class="badge badge-danger" style="width:100%;padding:10px 12px;border-radius:10px;margin-bottom:14px;white-space:normal;">
-          {loginError}
+          <Icons name="alert" size={15} />
+          <span>{loginError}</span>
         </div>
       {/if}
 
@@ -248,7 +271,25 @@
           </div>
           <div class="field">
             <label for="login-pass">{t.password}</label>
-            <input id="login-pass" type="password" bind:value={loginPass} autocomplete="current-password" required />
+            <div style="position:relative;display:flex;align-items:center;">
+              <input
+                id="login-pass"
+                type={showLoginPass ? 'text' : 'password'}
+                style="padding-right:42px;"
+                bind:value={loginPass}
+                autocomplete="current-password"
+                required
+              />
+              <button
+                type="button"
+                class="btn btn-ghost btn-xs"
+                style="position:absolute;right:6px;min-height:28px;padding:0 6px;"
+                onclick={() => showLoginPass = !showLoginPass}
+                aria-label="Toggle password visibility"
+              >
+                <Icons name={showLoginPass ? 'eye_off' : 'eye'} size={15} />
+              </button>
+            </div>
           </div>
           {#if totpEnabled}
             <div class="field">
@@ -257,14 +298,19 @@
             </div>
           {/if}
           <button type="submit" class="btn btn-primary" style="width:100%;margin-top:6px;" disabled={busy}>
-            {t.loginBtn}
+            <Icons name="lock" size={15} />
+            <span>{t.loginBtn}</span>
           </button>
         </form>
       {:else}
         <form onsubmit={submitEd25519Login}>
           <div class="field">
             <label for="key-id-sel">{t.keyIdLabel}</label>
-            <select id="key-id-sel" bind:value={selectedKeyId}>
+            <select
+              id="key-id-sel"
+              bind:value={selectedKeyId}
+              onchange={() => { challengeNonceB64 = ''; challengeOrigin = ''; }}
+            >
               {#each ed25519KeyIds as kid}
                 <option value={kid}>{kid}</option>
               {/each}
@@ -290,7 +336,8 @@
             <input id="ed-sig" type="text" class="mono" bind:value={manualSigB64} placeholder="Base64 Ed25519 signature" />
           </div>
           <button type="submit" class="btn btn-primary" style="width:100%;" disabled={busy}>
-            {t.verifyKeyBtn}
+            <Icons name="key" size={15} />
+            <span>{t.verifyKeyBtn}</span>
           </button>
         </form>
       {/if}

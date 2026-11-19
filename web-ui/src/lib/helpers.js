@@ -1,3 +1,5 @@
+import { I18N } from './i18n.js';
+
 export const UNCHANGED_SENTINEL = '__UNCHANGED__';
 
 export function isMaskedSecret(val) {
@@ -24,6 +26,38 @@ export function resolveSecretInput(originalVal, newDraft, clearRequested = false
     return originalVal.configured ? UNCHANGED_SENTINEL : '';
   }
   if (typeof originalVal === 'string') return originalVal;
+  return '';
+}
+
+export function localizeError(rawMsg, lang = 'zh', code = '') {
+  const dict = (I18N[lang] || I18N.zh).errors || {};
+  if (code && dict[code]) return dict[code];
+  const msg = String(rawMsg || '').trim();
+  if (dict[msg]) return dict[msg];
+  return msg || (lang === 'en' ? 'Operation failed' : '操作失败');
+}
+
+export function domainMatchesCert(host, acmeRules = [], certStatuses = []) {
+  if (!host) return false;
+  const h = host.toLowerCase();
+  const matches = (pattern) => {
+    const p = String(pattern || '').toLowerCase();
+    if (!p) return false;
+    if (p === h) return true;
+    if (p.startsWith('*.')) {
+      const suffix = p.slice(2);
+      const dot = h.indexOf('.');
+      return dot > 0 && h.slice(dot + 1) === suffix;
+    }
+    return false;
+  };
+  const activeCerts = (certStatuses || []).filter((c) => c.status === 'active');
+  for (const c of activeCerts) {
+    if (matches(c.domain) || (c.extra_domains || []).some(matches)) return 'active';
+  }
+  for (const a of acmeRules || []) {
+    if (a.enabled && (matches(a.domain) || (a.extra_domains || []).some(matches))) return 'configured';
+  }
   return '';
 }
 
@@ -70,6 +104,14 @@ export function splitCsv(str) {
   if (!str) return [];
   return String(str)
     .split(/[\n,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+export function splitLines(str) {
+  if (!str) return [];
+  return String(str)
+    .split('\n')
     .map((s) => s.trim())
     .filter(Boolean);
 }

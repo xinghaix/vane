@@ -1,6 +1,6 @@
 //! 基于 Hyper 的双栈 HTTP/1.1、HTTP/2 流式反代，连接和升级任务随监听器回收。
 use crate::{config::{cidr_contains,parse_cidr,ReverseProxyConfig,ReverseProxyRule},firewall::{FirewallManager,FirewallRule},net::{dual_stack::{bind_dual_stack_tcp,StackMode},listener::ConnectionQuota,tls_resolver::{CertTable,DynamicCertResolver}}};
-use super::{proxy_body::{StreamBody,Driver},proxy_io::TimedIo};
+use super::{proxy_body::{StreamBody,Driver},proxy_io::TimedIo,update_rule_status,RuleRuntimeStatus,RuleStatusMap};
 use arc_swap::ArcSwap;
 use axum::body::Body;
 use http::{HeaderMap,HeaderValue,Method,Request,Response,StatusCode,Uri,Version,header};
@@ -131,18 +131,52 @@ pub async fn run_reverse_proxy_listener(cfg:ReverseProxyConfig,table:Arc<ArcSwap
 pub async fn run_reverse_proxy_authorized(cfg:ReverseProxyConfig,table:Arc<ArcSwap<CertTable>>,global:ConnectionQuota,firewall:Arc<FirewallManager>,stun:Arc<ArcSwap<BTreeMap<String,String>>>,shutdown:watch::Receiver<bool>,auth:Arc<dyn ProxyAuthorization>)->Result<(),String>{
     run_reverse_proxy_with_options(cfg,table,global,firewall,stun,shutdown,auth,ProxyTimeouts::default()).await
 }
-pub async fn run_reverse_proxy_with_options(cfg:ReverseProxyConfig,table:Arc<ArcSwap<CertTable>>,global:ConnectionQuota,firewall:Arc<FirewallManager>,stun:Arc<ArcSwap<BTreeMap<String,String>>>,mut shutdown:watch::Receiver<bool>,auth:Arc<dyn ProxyAuthorization>,timeouts:ProxyTimeouts)->Result<(),String>{
-    if !cfg.enabled{return firewall.remove_rule("reverse_proxy",&cfg.name).await;}
+pub async fn run_reverse_proxy_with_options(cfg:ReverseProxyConfig,table:Arc<ArcSwap<CertTable>>,global:ConnectionQuota,firewall:Arc<FirewallManager>,stun:Arc<ArcSwap<BTreeMap<String,String>>>,shutdown:watch::Receiver<bool>,auth:Arc<dyn ProxyAuthorization>,timeouts:ProxyTimeouts)->Result<(),String>{
+    run_reverse_proxy_with_status(cfg,table,global,firewall,stun,shutdown,auth,timeouts,None).await
+}
+pub async fn run_reverse_proxy_with_status(cfg:ReverseProxyConfig,table:Arc<ArcSwap<CertTable>>,global:ConnectionQuota,firewall:Arc<FirewallManager>,stun:Arc<ArcSwap<BTreeMap<String,String>>>,mut shutdown:watch::Receiver<bool>,auth:Arc<dyn ProxyAuthorization>,timeouts:ProxyTimeouts,status_map:Option<RuleStatusMap>)->Result<(),String>{
+    let mut rt = RuleRuntimeStatus {
+        name: cfg.name.clone(),
+        enabled: cfg.enabled,
+        listen_port: cfg.listen_port,
+        stack: cfg.stack.clone(),
+        proto: "tcp".into(),
+        ..Default::default()
+    };
+    if !cfg.enabled{
+        rt.status = "disabled".into();
+        update_rule_status(&status_map, rt);
+        return firewall.remove_rule("reverse_proxy",&cfg.name).await;
+    }
     if cfg.rules.iter().any(|rule|rule.enabled && rule.upstream_tls_mode=="insecure_skip_verify"){crate::logger::log(crate::logger::Level::Warn,"reverse_proxy","此监听器包含显式跳过上游证书校验的规则");}
-    let bound=bind_dual_stack_tcp(cfg.listen_port,StackMode::parse(&cfg.stack)).map_err(|e| format!("反代监听端口 {} 绑定失败: {}", cfg.listen_port, e))?;
+    let bound=match bind_dual_stack_tcp(cfg.listen_port,StackMode::parse(&cfg.stack)) {
+        Ok(b) => b,
+        Err(e) => {
+            let msg = format!("反代监听端口 {} 绑定失败: {}", cfg.listen_port, e);
+            rt.status = "failed".into();
+            rt.last_error = msg.clone();
+            update_rule_status(&status_map, rt);
+            return Err(msg);
+        }
+    };
     if cfg.open_wan_firewall {
         if let Err(error)=firewall.upsert_rule(FirewallRule::WanInput{owner_module:"reverse_proxy".into(),rule_name:cfg.name.clone(),proto:"tcp".into(),port:cfg.listen_port,ipv4:bound.has_v4(),ipv6:bound.has_v6()}).await {
-            let _=firewall.remove_rule("reverse_proxy",&cfg.name).await;return Err(error);
+            let _=firewall.remove_rule("reverse_proxy",&cfg.name).await;
+            rt.status = "failed".into();
+            rt.last_error = error.clone();
+            update_rule_status(&status_map, rt);
+            return Err(error);
         }
     }
     let mut tls=rustls::ServerConfig::builder().with_no_client_auth().with_cert_resolver(Arc::new(DynamicCertResolver::new(table,cfg.strict_sni)));
     tls.alpn_protocols=vec![b"h2".to_vec(),b"http/1.1".to_vec()];let acceptor=TlsAcceptor::from(Arc::new(tls));
     let quota=ConnectionQuota::new(cfg.max_concurrent_conns);let rules=Arc::new(cfg.rules.clone());let cancel=CancellationToken::new();let _cancel=CancelOnDrop(cancel.clone());
+    rt.bound_v4 = bound.has_v4();
+    rt.bound_v6 = bound.has_v6();
+    rt.status = "running".into();
+    rt.last_error.clear();
+    rt.quota = Some(quota.clone());
+    update_rule_status(&status_map, rt.clone());
     let mut listeners=tokio::task::JoinSet::new();
     for listener in [bound.v4,bound.v6].into_iter().flatten(){
         listeners.spawn(accept_loop(listener,cfg.listen_port,acceptor.clone(),rules.clone(),global.clone(),quota.clone(),stun.clone(),auth.clone(),cancel.clone(),timeouts));
@@ -150,7 +184,16 @@ pub async fn run_reverse_proxy_with_options(cfg:ReverseProxyConfig,table:Arc<Arc
     let result=if *shutdown.borrow(){Ok(())}else{tokio::select!{_=shutdown.changed()=>Ok(()),result=listeners.join_next()=>match result{Some(Ok(result))=>result,_=>Err("反代监听任务异常结束".into())}}};
     cancel.cancel();while listeners.join_next().await.is_some(){}
     let cleanup=firewall.remove_rule("reverse_proxy",&cfg.name).await;
-    result.and(cleanup)
+    let final_res = result.and(cleanup);
+    rt.bound_v4 = false;
+    rt.bound_v6 = false;
+    rt.quota = None;
+    match &final_res {
+        Ok(()) => { rt.status = "disabled".into(); }
+        Err(e) => { rt.status = "failed".into(); rt.last_error = e.clone(); }
+    }
+    update_rule_status(&status_map, rt);
+    final_res
 }
 
 async fn accept_loop(listener:TcpListener,port:u16,acceptor:TlsAcceptor,rules:Arc<Vec<ReverseProxyRule>>,global:ConnectionQuota,quota:ConnectionQuota,stun:Arc<ArcSwap<BTreeMap<String,String>>>,auth:Arc<dyn ProxyAuthorization>,cancel:CancellationToken,timeouts:ProxyTimeouts)->Result<(),String>{

@@ -94,19 +94,44 @@ impl RingLogger {
     }
 
     pub fn query(&self, min_level: Option<Level>, module: Option<&str>, limit: usize, after_seq: u64) -> Vec<LogEntry> {
+        self.query_filtered(min_level, module, None, limit, after_seq)
+    }
+
+    pub fn query_filtered(
+        &self,
+        min_level: Option<Level>,
+        module: Option<&str>,
+        keyword: Option<&str>,
+        limit: usize,
+        after_seq: u64,
+    ) -> Vec<LogEntry> {
         let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out: Vec<LogEntry> = g
-            .buf
-            .iter()
-            .rev()
-            .filter(|e| e.seq > after_seq)
-            .filter(|e| min_level.map_or(true, |l| e.level >= l))
-            .filter(|e| module.map_or(true, |m| e.module == m))
-            .take(limit.max(1))
-            .cloned()
-            .collect();
-        out.reverse();
-        out
+        let kw_lower = keyword.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
+        let limit = limit.clamp(1, 1000);
+        let matches = |e: &&LogEntry| -> bool {
+            e.seq > after_seq
+                && min_level.map_or(true, |l| e.level >= l)
+                && module.map_or(true, |m| e.module == m)
+                && kw_lower.as_ref().map_or(true, |kw| {
+                    e.module.to_ascii_lowercase().contains(kw) || e.message.to_ascii_lowercase().contains(kw)
+                })
+        };
+        if after_seq > 0 {
+            g.buf.iter().filter(matches).take(limit).cloned().collect()
+        } else {
+            let mut out: Vec<LogEntry> = g.buf.iter().rev().filter(matches).take(limit).cloned().collect();
+            out.reverse();
+            out
+        }
+    }
+
+    pub fn modules(&self) -> Vec<String> {
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut set = std::collections::BTreeSet::new();
+        for e in &g.buf {
+            set.insert(e.module.clone());
+        }
+        set.into_iter().collect()
     }
 
     pub fn clear(&self) {

@@ -20,14 +20,18 @@ use crate::logger::Level;
 use crate::monitor::alerts::{evaluate_and_notify_alerts, AlertState};
 use crate::monitor::procfs::MonitorSampler;
 use crate::net::listener::ConnectionQuota;
-use crate::net::port_forward::run_port_forward_rule;
-use crate::net::reverse_proxy::{run_reverse_proxy_with_options, ProxyTimeouts};
+use crate::net::new_rule_status_map;
+use crate::net::port_forward::run_port_forward_rule_with_status;
+use crate::net::reverse_proxy::{run_reverse_proxy_with_status, ProxyTimeouts};
 use crate::net::stun::{new_stun_runtime, run_stun_rule};
 use crate::net::tls_resolver::{certified_key_from_pem, load_or_create_admin_cert, CertTable};
 use crate::security::auth::{AuthState, HashGate, PasswordHash, DEFAULT_INITIAL_PASSWORD};
 use crate::security::fail2ban::Fail2Ban;
 use crate::security::vault::Vault;
-use crate::supervisor::{new_health_registry, set_module_health, supervise_module, ModuleHealth};
+use crate::supervisor::{
+    clear_module_tasks_health, new_health_registry, new_task_health_map, set_module_health, supervise_module,
+    update_task_health, ModuleHealth, TaskHealthMap,
+};
 use crate::web::ws_pty::PtyManager;
 use crate::web::{boundary, build_router, AppState};
 use arc_swap::ArcSwap;
@@ -350,6 +354,8 @@ async fn run_gateway(config_path: PathBuf, listen_override: Option<String>) -> R
         admin_cert,
         stun_addrs: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
         stun_status: new_stun_runtime(),
+        reverse_proxy_status: new_rule_status_map(),
+        port_forward_status: new_rule_status_map(),
         cron_status: CronRuntime::new(),
         monitor_sampler: MonitorSampler::new(),
         alert_state: AlertState::default(),
@@ -444,15 +450,34 @@ async fn run_gateway(config_path: PathBuf, listen_override: Option<String>) -> R
     Ok(())
 }
 
-fn spawn_circuit_alert_watcher(
+fn spawn_rule_health_watcher(
     module_name: &'static str,
+    rule_key: String,
+    module_enabled: bool,
     mut health_rx: watch::Receiver<ModuleHealth>,
+    task_health: TaskHealthMap,
     state: Arc<AppState>,
 ) -> tokio::task::JoinHandle<()> {
+    update_task_health(
+        &task_health,
+        &state.health_registry,
+        module_enabled,
+        module_name,
+        &rule_key,
+        Some(health_rx.borrow().clone()),
+    );
     tokio::spawn(async move {
         let mut notified_open = false;
         while health_rx.changed().await.is_ok() {
             let cur = health_rx.borrow().clone();
+            update_task_health(
+                &task_health,
+                &state.health_registry,
+                module_enabled,
+                module_name,
+                &rule_key,
+                Some(cur.clone()),
+            );
             match cur {
                 ModuleHealth::CircuitOpen { reason, .. } if !notified_open => {
                     notified_open = true;
@@ -461,7 +486,7 @@ fn spawn_circuit_alert_watcher(
                         &cfg,
                         &state.vault,
                         "module_circuit_open",
-                        &format!("Vane 子模块熔断告警: {}", module_name),
+                        &format!("Vane 子模块熔断告警: {} ({})", module_name, rule_key),
                         &reason,
                         "critical",
                     )
@@ -532,7 +557,77 @@ async fn reconcile_stale_firewall_and_runtime(state: &AppState, cfg: &Config) {
     next_stun_addrs.retain(|name, _| cfg.modules.stun && cfg.stun.iter().any(|s| s.enabled && &s.name == name));
     state.stun_addrs.store(Arc::new(next_stun_addrs));
 
+    if let Ok(mut rps) = state.reverse_proxy_status.write() {
+        rps.retain(|name, _| cfg.reverse_proxy.iter().any(|r| &r.name == name));
+        for rp in &cfg.reverse_proxy {
+            if !cfg.modules.reverse_proxy || !rp.enabled {
+                rps.insert(
+                    rp.name.clone(),
+                    crate::net::RuleRuntimeStatus {
+                        name: rp.name.clone(),
+                        enabled: rp.enabled,
+                        listen_port: rp.listen_port,
+                        stack: rp.stack.clone(),
+                        proto: "tcp".into(),
+                        status: "disabled".into(),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+
+    if let Ok(mut pfs) = state.port_forward_status.write() {
+        pfs.retain(|name, _| cfg.port_forwards.iter().any(|p| &p.name == name));
+        for pf in &cfg.port_forwards {
+            if !cfg.modules.port_forward || !pf.enabled {
+                pfs.insert(
+                    pf.name.clone(),
+                    crate::net::RuleRuntimeStatus {
+                        name: pf.name.clone(),
+                        enabled: pf.enabled,
+                        listen_port: pf.listen_port,
+                        stack: pf.stack.clone(),
+                        proto: pf.proto.clone(),
+                        status: "disabled".into(),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
+
     state.cron_status.retain_configured(&cfg.cron);
+}
+
+#[derive(Default)]
+struct ModuleRunner {
+    fingerprint: Option<String>,
+    stops: Vec<watch::Sender<bool>>,
+    tasks: tokio::task::JoinSet<()>,
+}
+
+impl ModuleRunner {
+    fn begin_stop(&mut self) {
+        for stop in self.stops.drain(..) {
+            let _ = stop.send(true);
+        }
+    }
+
+    async fn finish_stop(&mut self) {
+        if self.tasks.is_empty() {
+            return;
+        }
+        if tokio::time::timeout(Duration::from_secs(3), async {
+            while self.tasks.join_next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
+            self.tasks.abort_all();
+            while self.tasks.join_next().await.is_some() {}
+        }
+    }
 }
 
 async fn orchestrate_modules(
@@ -540,26 +635,103 @@ async fn orchestrate_modules(
     network_rx: watch::Receiver<u64>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let mut active_stops: Vec<watch::Sender<bool>> = Vec::new();
-    let mut active_tasks = tokio::task::JoinSet::new();
+    let task_health = new_task_health_map();
+    let mut ddns_runner = ModuleRunner::default();
+    let mut acme_runner = ModuleRunner::default();
+    let mut rp_runner = ModuleRunner::default();
+    let mut pf_runner = ModuleRunner::default();
+    let mut stun_runner = ModuleRunner::default();
+    let mut cron_runner = ModuleRunner::default();
+    let mut last_acme_preload_fp = String::new();
+
     loop {
-        for stop in active_stops.drain(..) {
-            let _ = stop.send(true);
-        }
-        if tokio::time::timeout(Duration::from_secs(3), async {
-            while active_tasks.join_next().await.is_some() {}
-        })
-        .await
-        .is_err()
-        {
-            active_tasks.abort_all();
-            while active_tasks.join_next().await.is_some() {}
-        }
         if *shutdown_rx.borrow() {
             break;
         }
         let cfg: Arc<Config> = state.config.load_full();
         let reg = &state.health_registry;
+
+        let fp_ddns = serde_json::to_string(&(
+            cfg.modules.ddns,
+            &cfg.ddns,
+            &cfg.dns_providers,
+            &cfg.firewall.wan_interfaces,
+            &cfg.firewall.lan_interfaces,
+            cfg.firewall.auto_manage,
+        ))
+        .unwrap_or_default();
+        let fp_acme_preload = serde_json::to_string(&(&cfg.acme, &cfg.admin.canonical_origin)).unwrap_or_default();
+        let fp_acme = serde_json::to_string(&(
+            cfg.modules.acme,
+            &cfg.acme,
+            &cfg.dns_providers,
+            &cfg.admin.canonical_origin,
+        ))
+        .unwrap_or_default();
+        let fp_rp = serde_json::to_string(&(
+            cfg.modules.reverse_proxy,
+            &cfg.reverse_proxy,
+            cfg.security.tls_handshake_timeout_secs,
+            cfg.security.http_header_timeout_secs,
+            &cfg.firewall.wan_interfaces,
+            cfg.firewall.auto_manage,
+        ))
+        .unwrap_or_default();
+        let fp_pf = serde_json::to_string(&(
+            cfg.modules.port_forward,
+            &cfg.port_forwards,
+            cfg.timezone_offset_secs(),
+            &cfg.firewall.wan_interfaces,
+            &cfg.firewall.lan_interfaces,
+            cfg.firewall.auto_manage,
+        ))
+        .unwrap_or_default();
+        let fp_stun = serde_json::to_string(&(
+            cfg.modules.stun,
+            &cfg.stun,
+            cfg.reverse_proxy
+                .iter()
+                .map(|r| (&r.name, r.listen_port))
+                .collect::<Vec<_>>(),
+            cfg.port_forwards
+                .iter()
+                .map(|p| (&p.name, p.listen_port))
+                .collect::<Vec<_>>(),
+        ))
+        .unwrap_or_default();
+        let fp_cron = serde_json::to_string(&(
+            cfg.modules.cron,
+            &cfg.cron,
+            cfg.timezone_offset_secs(),
+            &cfg.admin.docker_socket,
+            &cfg.docker,
+        ))
+        .unwrap_or_default();
+
+        let ch_ddns = ddns_runner.fingerprint.as_ref() != Some(&fp_ddns);
+        let ch_acme = acme_runner.fingerprint.as_ref() != Some(&fp_acme);
+        let ch_rp = rp_runner.fingerprint.as_ref() != Some(&fp_rp);
+        let ch_pf = pf_runner.fingerprint.as_ref() != Some(&fp_pf);
+        let ch_stun = stun_runner.fingerprint.as_ref() != Some(&fp_stun);
+        let ch_cron = cron_runner.fingerprint.as_ref() != Some(&fp_cron);
+
+        if ch_ddns { ddns_runner.begin_stop(); }
+        if ch_acme { acme_runner.begin_stop(); }
+        if ch_rp { rp_runner.begin_stop(); }
+        if ch_pf { pf_runner.begin_stop(); }
+        if ch_stun { stun_runner.begin_stop(); }
+        if ch_cron { cron_runner.begin_stop(); }
+
+        if ch_ddns { ddns_runner.finish_stop().await; }
+        if ch_acme { acme_runner.finish_stop().await; }
+        if ch_rp { rp_runner.finish_stop().await; }
+        if ch_pf { pf_runner.finish_stop().await; }
+        if ch_stun { stun_runner.finish_stop().await; }
+        if ch_cron { cron_runner.finish_stop().await; }
+
+        if *shutdown_rx.borrow() {
+            break;
+        }
 
         reconcile_stale_firewall_and_runtime(&state, &cfg).await;
 
@@ -573,236 +745,254 @@ async fn orchestrate_modules(
         }
 
         // 1. DDNS
-        if cfg.modules.ddns {
-            set_module_health(reg, "ddns", ModuleHealth::Running);
-            for entry in cfg.ddns.iter().filter(|entry| entry.enabled).cloned() {
-                let (stop_tx, stop_rx) = watch::channel(false);
-                active_stops.push(stop_tx);
-                let st = state.clone();
-                let snapshot = cfg.clone();
-                let changes = network_rx.clone();
-                let (htx, hrx) = watch::channel(ModuleHealth::Running);
-                let _ = spawn_circuit_alert_watcher("ddns", hrx, state.clone());
-                active_tasks.spawn(supervise_module("ddns", stop_rx, htx, Some(reg.clone()), move |mut rx| {
-                    let st = st.clone();
-                    let entry = entry.clone();
-                    let snapshot = snapshot.clone();
-                    let mut changes = changes.clone();
-                    async move {
-                        let mut watch_network = true;
-                        loop {
-                            if *rx.borrow() {
-                                break;
+        if ch_ddns {
+            ddns_runner.fingerprint = Some(fp_ddns);
+            clear_module_tasks_health(&task_health, reg, "ddns", cfg.modules.ddns);
+            if cfg.modules.ddns {
+                for entry in cfg.ddns.iter().filter(|entry| entry.enabled).cloned() {
+                    let (stop_tx, stop_rx) = watch::channel(false);
+                    ddns_runner.stops.push(stop_tx);
+                    let st = state.clone();
+                    let snapshot = cfg.clone();
+                    let changes = network_rx.clone();
+                    let (htx, hrx) = watch::channel(ModuleHealth::Running);
+                    let _ = spawn_rule_health_watcher("ddns", entry.name.clone(), true, hrx, task_health.clone(), state.clone());
+                    ddns_runner.tasks.spawn(supervise_module("ddns", stop_rx, htx, None, move |mut rx| {
+                        let st = st.clone();
+                        let entry = entry.clone();
+                        let snapshot = snapshot.clone();
+                        let mut changes = changes.clone();
+                        async move {
+                            let mut watch_network = true;
+                            loop {
+                                if *rx.borrow() {
+                                    break;
+                                }
+                                tokio::select! {
+                                    _ = rx.changed() => break,
+                                    result = sync_ddns_entry(&entry, &snapshot, &st.vault, &st.firewall, &st.ddns_status) => {
+                                        if let Err(error) = result { logger::log(Level::Warn, "ddns", &error); }
+                                    },
+                                }
+                                tokio::select! {
+                                    _ = tokio::time::sleep(Duration::from_secs(entry.reconcile_interval_secs)) => {},
+                                    _ = rx.changed() => break,
+                                    event = changes.changed(), if watch_network => {
+                                        if event.is_err() { watch_network = false; } else {
+                                            tokio::select! { _ = rx.changed() => break, _ = tokio::time::sleep(Duration::from_secs(2)) => {} }
+                                            changes.borrow_and_update();
+                                        }
+                                    },
+                                }
                             }
-                            tokio::select! {
-                                _ = rx.changed() => break,
-                                result = sync_ddns_entry(&entry, &snapshot, &st.vault, &st.firewall, &st.ddns_status) => {
-                                    if let Err(error) = result { logger::log(Level::Warn, "ddns", &error); }
-                                },
-                            }
-                            tokio::select! {
-                                _ = tokio::time::sleep(Duration::from_secs(entry.reconcile_interval_secs)) => {},
-                                _ = rx.changed() => break,
-                                event = changes.changed(), if watch_network => {
-                                    if event.is_err() { watch_network = false; } else {
-                                        tokio::select! { _ = rx.changed() => break, _ = tokio::time::sleep(Duration::from_secs(2)) => {} }
-                                        changes.borrow_and_update();
-                                    }
-                                },
-                            }
+                            Ok(())
                         }
-                        Ok(())
-                    }
-                }));
+                    }));
+                }
             }
-        } else {
-            set_module_health(reg, "ddns", ModuleHealth::Disabled);
         }
 
-        // 2. ACME：先从磁盘预加载已有合法证书到反代与管理面（即使自动续期关闭仍保持现有 TLS 生效）
-        for entry in cfg.acme.iter().filter(|entry| entry.enabled) {
-            preload_cached_cert(entry, &cfg, &state.cert_table, &state.cert_status, &state.admin_cert).await;
-        }
-        if cfg.modules.acme {
-            set_module_health(reg, "acme", ModuleHealth::Running);
-            for entry in cfg.acme.iter().filter(|entry| entry.enabled).cloned() {
-                let (stop_tx, stop_rx) = watch::channel(false);
-                active_stops.push(stop_tx);
-                let st = state.clone();
-                let snapshot = cfg.clone();
-                let (htx, hrx) = watch::channel(ModuleHealth::Running);
-                let _ = spawn_circuit_alert_watcher("acme", hrx, state.clone());
-                active_tasks.spawn(supervise_module("acme", stop_rx, htx, Some(reg.clone()), move |mut rx| {
-                    let st = st.clone();
-                    let entry = entry.clone();
-                    let snapshot = snapshot.clone();
-                    async move {
-                        loop {
-                            if *rx.borrow() {
-                                break;
-                            }
-                            let healthy = tokio::select! {
-                                _ = rx.changed() => break,
-                                result = issue_or_renew_cert(&entry, &snapshot, &st.vault, &st.cert_table, &st.cert_status, &st.admin_cert, false) => {
-                                    match result {
-                                        Ok(status) => status.status == "active",
-                                        Err(error) => { logger::log(Level::Warn, "acme", &format!("{}: {}", entry.domain, error)); false },
-                                    }
-                                },
-                            };
-                            tokio::select! { _ = rx.changed() => break, _ = tokio::time::sleep(Duration::from_secs(if healthy { 3600 } else { 300 })) => {} }
-                        }
-                        Ok(())
-                    }
-                }));
+        // 2. ACME：先从磁盘预加载已有合法证书到反代与管理面
+        if last_acme_preload_fp != fp_acme_preload {
+            last_acme_preload_fp = fp_acme_preload;
+            for entry in cfg.acme.iter().filter(|entry| entry.enabled) {
+                preload_cached_cert(entry, &cfg, &state.cert_table, &state.cert_status, &state.admin_cert).await;
             }
-        } else {
-            set_module_health(reg, "acme", ModuleHealth::Disabled);
+        }
+        if ch_acme {
+            acme_runner.fingerprint = Some(fp_acme);
+            clear_module_tasks_health(&task_health, reg, "acme", cfg.modules.acme);
+            if cfg.modules.acme {
+                for entry in cfg.acme.iter().filter(|entry| entry.enabled).cloned() {
+                    let (stop_tx, stop_rx) = watch::channel(false);
+                    acme_runner.stops.push(stop_tx);
+                    let st = state.clone();
+                    let snapshot = cfg.clone();
+                    let (htx, hrx) = watch::channel(ModuleHealth::Running);
+                    let _ = spawn_rule_health_watcher("acme", entry.domain.clone(), true, hrx, task_health.clone(), state.clone());
+                    acme_runner.tasks.spawn(supervise_module("acme", stop_rx, htx, None, move |mut rx| {
+                        let st = st.clone();
+                        let entry = entry.clone();
+                        let snapshot = snapshot.clone();
+                        async move {
+                            loop {
+                                if *rx.borrow() {
+                                    break;
+                                }
+                                let healthy = tokio::select! {
+                                    _ = rx.changed() => break,
+                                    result = issue_or_renew_cert(&entry, &snapshot, &st.vault, &st.cert_table, &st.cert_status, &st.admin_cert, false) => {
+                                        match result {
+                                            Ok(status) => status.status == "active",
+                                            Err(error) => { logger::log(Level::Warn, "acme", &format!("{}: {}", entry.domain, error)); false },
+                                        }
+                                    },
+                                };
+                                tokio::select! { _ = rx.changed() => break, _ = tokio::time::sleep(Duration::from_secs(if healthy { 3600 } else { 300 })) => {} }
+                            }
+                            Ok(())
+                        }
+                    }));
+                }
+            }
         }
 
         // 3. Reverse Proxy
-        if cfg.modules.reverse_proxy {
-            set_module_health(reg, "reverse_proxy", ModuleHealth::Running);
-            let timeouts = ProxyTimeouts {
-                tls_handshake: Duration::from_secs(cfg.security.tls_handshake_timeout_secs),
-                http_header: Duration::from_secs(cfg.security.http_header_timeout_secs),
-            };
-            for rp in cfg.reverse_proxy.iter().filter(|r| r.enabled).cloned() {
-                let (stop_tx, stop_rx) = watch::channel(false);
-                active_stops.push(stop_tx);
-                let st = state.clone();
-                let (htx, hrx) = watch::channel(ModuleHealth::Running);
-                let _ = spawn_circuit_alert_watcher("reverse_proxy", hrx, state.clone());
-                active_tasks.spawn(supervise_module(
-                    "reverse_proxy",
-                    stop_rx,
-                    htx,
-                    Some(reg.clone()),
-                    move |rx| {
-                        let rp = rp.clone();
-                        let st = st.clone();
-                        async move {
-                            run_reverse_proxy_with_options(
-                                rp,
-                                st.cert_table.clone(),
-                                st.global_quota.clone(),
-                                st.firewall.clone(),
-                                st.stun_addrs.clone(),
-                                rx,
-                                st.clone(),
-                                timeouts,
-                            )
-                            .await
-                        }
-                    },
-                ));
+        if ch_rp {
+            rp_runner.fingerprint = Some(fp_rp);
+            clear_module_tasks_health(&task_health, reg, "reverse_proxy", cfg.modules.reverse_proxy);
+            if cfg.modules.reverse_proxy {
+                let timeouts = ProxyTimeouts {
+                    tls_handshake: Duration::from_secs(cfg.security.tls_handshake_timeout_secs),
+                    http_header: Duration::from_secs(cfg.security.http_header_timeout_secs),
+                };
+                for rp in cfg.reverse_proxy.iter().filter(|r| r.enabled).cloned() {
+                    let (stop_tx, stop_rx) = watch::channel(false);
+                    rp_runner.stops.push(stop_tx);
+                    let st = state.clone();
+                    let (htx, hrx) = watch::channel(ModuleHealth::Running);
+                    let _ = spawn_rule_health_watcher("reverse_proxy", rp.name.clone(), true, hrx, task_health.clone(), state.clone());
+                    rp_runner.tasks.spawn(supervise_module(
+                        "reverse_proxy",
+                        stop_rx,
+                        htx,
+                        None,
+                        move |rx| {
+                            let rp = rp.clone();
+                            let st = st.clone();
+                            async move {
+                                run_reverse_proxy_with_status(
+                                    rp,
+                                    st.cert_table.clone(),
+                                    st.global_quota.clone(),
+                                    st.firewall.clone(),
+                                    st.stun_addrs.clone(),
+                                    rx,
+                                    st.clone(),
+                                    timeouts,
+                                    Some(st.reverse_proxy_status.clone()),
+                                )
+                                .await
+                            }
+                        },
+                    ));
+                }
             }
-        } else {
-            set_module_health(reg, "reverse_proxy", ModuleHealth::Disabled);
         }
 
         // 4. Port Forwards
-        if cfg.modules.port_forward {
-            set_module_health(reg, "port_forward", ModuleHealth::Running);
-            let tz = cfg.timezone_offset_secs();
-            for pf in cfg.port_forwards.iter().filter(|p| p.enabled).cloned() {
-                let (stop_tx, stop_rx) = watch::channel(false);
-                active_stops.push(stop_tx);
-                let st = state.clone();
-                let (htx, hrx) = watch::channel(ModuleHealth::Running);
-                let _ = spawn_circuit_alert_watcher("port_forward", hrx, state.clone());
-                active_tasks.spawn(supervise_module(
-                    "port_forward",
-                    stop_rx,
-                    htx,
-                    Some(reg.clone()),
-                    move |rx| {
-                        let pf = pf.clone();
+        if ch_pf {
+            pf_runner.fingerprint = Some(fp_pf);
+            clear_module_tasks_health(&task_health, reg, "port_forward", cfg.modules.port_forward);
+            if cfg.modules.port_forward {
+                let tz = cfg.timezone_offset_secs();
+                for pf in cfg.port_forwards.iter().filter(|p| p.enabled).cloned() {
+                    let (stop_tx, stop_rx) = watch::channel(false);
+                    pf_runner.stops.push(stop_tx);
+                    let st = state.clone();
+                    let (htx, hrx) = watch::channel(ModuleHealth::Running);
+                    let _ = spawn_rule_health_watcher("port_forward", pf.name.clone(), true, hrx, task_health.clone(), state.clone());
+                    pf_runner.tasks.spawn(supervise_module(
+                        "port_forward",
+                        stop_rx,
+                        htx,
+                        None,
+                        move |rx| {
+                            let pf = pf.clone();
+                            let st = st.clone();
+                            async move {
+                                run_port_forward_rule_with_status(
+                                    pf,
+                                    tz,
+                                    st.global_quota.clone(),
+                                    st.firewall.clone(),
+                                    rx,
+                                    Some(st.port_forward_status.clone()),
+                                )
+                                .await
+                            }
+                        },
+                    ));
+                }
+            }
+        }
+
+        // 5. STUN
+        if ch_stun {
+            stun_runner.fingerprint = Some(fp_stun);
+            clear_module_tasks_health(&task_health, reg, "stun", cfg.modules.stun);
+            if cfg.modules.stun {
+                for stun_entry in cfg.stun.iter().filter(|s| s.enabled).cloned() {
+                    let (stop_tx, stop_rx) = watch::channel(false);
+                    stun_runner.stops.push(stop_tx);
+                    let st = state.clone();
+                    let snapshot = cfg.clone();
+                    let (htx, hrx) = watch::channel(ModuleHealth::Running);
+                    let _ = spawn_rule_health_watcher("stun", stun_entry.name.clone(), true, hrx, task_health.clone(), state.clone());
+                    stun_runner.tasks.spawn(supervise_module("stun", stop_rx, htx, None, move |rx| {
+                        let entry = stun_entry.clone();
+                        let snapshot = snapshot.clone();
                         let st = st.clone();
                         async move {
-                            run_port_forward_rule(pf, tz, st.global_quota.clone(), st.firewall.clone(), rx).await
+                            run_stun_rule(
+                                entry,
+                                snapshot,
+                                st.vault.clone(),
+                                st.stun_addrs.clone(),
+                                st.stun_status.clone(),
+                                rx,
+                            )
+                            .await
                         }
-                    },
-                ));
+                    }));
+                }
             }
-        } else {
-            set_module_health(reg, "port_forward", ModuleHealth::Disabled);
         }
 
-        // 5. STUN（每条规则独立持有 SO_REUSEPORT 持久会话与 Cloudflare Redirect / Webhook 联动）
-        if cfg.modules.stun {
-            set_module_health(reg, "stun", ModuleHealth::Running);
-            for stun_entry in cfg.stun.iter().filter(|s| s.enabled).cloned() {
+        // 6. Cron
+        if ch_cron {
+            cron_runner.fingerprint = Some(fp_cron);
+            clear_module_tasks_health(&task_health, reg, "cron", cfg.modules.cron);
+            if cfg.modules.cron {
                 let (stop_tx, stop_rx) = watch::channel(false);
-                active_stops.push(stop_tx);
-                let st = state.clone();
-                let snapshot = cfg.clone();
+                cron_runner.stops.push(stop_tx);
+                let jobs = cfg.cron.clone();
+                let tz = cfg.timezone_offset_secs();
+                let cron_ctx = state.build_cron_context(cfg.clone());
                 let (htx, hrx) = watch::channel(ModuleHealth::Running);
-                let _ = spawn_circuit_alert_watcher("stun", hrx, state.clone());
-                active_tasks.spawn(supervise_module("stun", stop_rx, htx, Some(reg.clone()), move |rx| {
-                    let entry = stun_entry.clone();
-                    let snapshot = snapshot.clone();
-                    let st = st.clone();
+                let _ = spawn_rule_health_watcher("cron", "scheduler".into(), true, hrx, task_health.clone(), state.clone());
+                cron_runner.tasks.spawn(supervise_module("cron", stop_rx, htx, None, move |mut rx| {
+                    let jobs = jobs.clone();
+                    let cron_ctx = cron_ctx.clone();
                     async move {
-                        run_stun_rule(
-                            entry,
-                            snapshot,
-                            st.vault.clone(),
-                            st.stun_addrs.clone(),
-                            st.stun_status.clone(),
-                            rx,
-                        )
-                        .await
-                    }
-                }));
-            }
-        } else {
-            set_module_health(reg, "stun", ModuleHealth::Disabled);
-        }
-
-        // 6. Cron（不漏秒、不重入、支持全 5 类真实动作与失败告警）
-        if cfg.modules.cron {
-            set_module_health(reg, "cron", ModuleHealth::Running);
-            let (stop_tx, stop_rx) = watch::channel(false);
-            active_stops.push(stop_tx);
-            let jobs = cfg.cron.clone();
-            let tz = cfg.timezone_offset_secs();
-            let cron_ctx = state.build_cron_context(cfg.clone());
-            let (htx, hrx) = watch::channel(ModuleHealth::Running);
-            let _ = spawn_circuit_alert_watcher("cron", hrx, state.clone());
-            active_tasks.spawn(supervise_module("cron", stop_rx, htx, Some(reg.clone()), move |mut rx| {
-                let jobs = jobs.clone();
-                let cron_ctx = cron_ctx.clone();
-                async move {
-                    let mut last_tick: Option<u64> = None;
-                    loop {
-                        if *rx.borrow() {
-                            break;
-                        }
-                        let now = logger::unix_now();
-                        for sec in due_seconds_window(&mut last_tick, now) {
-                            for j in jobs.iter().filter(|j| j.enabled) {
-                                if let Ok(sched) = CronSchedule::parse(&j.schedule) {
-                                    if sched.matches(sec, tz) {
-                                        let job_c = j.clone();
-                                        let ctx_c = cron_ctx.clone();
-                                        tokio::spawn(async move {
-                                            let _ = execute_cron_job_with_ctx(&job_c, Some(&ctx_c)).await;
-                                        });
+                        let mut last_tick: Option<u64> = None;
+                        loop {
+                            if *rx.borrow() {
+                                break;
+                            }
+                            let now = logger::unix_now();
+                            for sec in due_seconds_window(&mut last_tick, now) {
+                                for j in jobs.iter().filter(|j| j.enabled) {
+                                    if let Ok(sched) = CronSchedule::parse(&j.schedule) {
+                                        if sched.matches(sec, tz) {
+                                            let job_c = j.clone();
+                                            let ctx_c = cron_ctx.clone();
+                                            tokio::spawn(async move {
+                                                let _ = execute_cron_job_with_ctx(&job_c, Some(&ctx_c)).await;
+                                            });
+                                        }
                                     }
                                 }
                             }
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                                _ = rx.changed() => break,
+                            }
                         }
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(500)) => {}
-                            _ = rx.changed() => break,
-                        }
+                        Ok(())
                     }
-                    Ok(())
-                }
-            }));
-        } else {
-            set_module_health(reg, "cron", ModuleHealth::Disabled);
+                }));
+            }
         }
 
         // 7. Web Terminal & Docker 状态标记
@@ -829,21 +1019,23 @@ async fn orchestrate_modules(
             _ = state.reload_notify.notified() => {},
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    for stop in active_stops.drain(..) {
-                        let _ = stop.send(true);
-                    }
-                    if tokio::time::timeout(Duration::from_secs(3), async {
-                        while active_tasks.join_next().await.is_some() {}
-                    })
-                    .await
-                    .is_err()
-                    {
-                        active_tasks.abort_all();
-                        while active_tasks.join_next().await.is_some() {}
-                    }
                     break;
                 }
             }
         }
     }
+
+    ddns_runner.begin_stop();
+    acme_runner.begin_stop();
+    rp_runner.begin_stop();
+    pf_runner.begin_stop();
+    stun_runner.begin_stop();
+    cron_runner.begin_stop();
+
+    ddns_runner.finish_stop().await;
+    acme_runner.finish_stop().await;
+    rp_runner.finish_stop().await;
+    pf_runner.finish_stop().await;
+    stun_runner.finish_stop().await;
+    cron_runner.finish_stop().await;
 }

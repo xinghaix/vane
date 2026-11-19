@@ -18,6 +18,7 @@ pub enum ModuleHealth {
 }
 
 pub type HealthRegistry = Arc<RwLock<BTreeMap<String, ModuleHealth>>>;
+pub type TaskHealthMap = Arc<RwLock<BTreeMap<String, BTreeMap<String, ModuleHealth>>>>;
 
 pub fn new_health_registry() -> HealthRegistry {
     let mut map = BTreeMap::new();
@@ -27,10 +28,87 @@ pub fn new_health_registry() -> HealthRegistry {
     Arc::new(RwLock::new(map))
 }
 
+pub fn new_task_health_map() -> TaskHealthMap {
+    Arc::new(RwLock::new(BTreeMap::new()))
+}
+
 pub fn set_module_health(reg: &HealthRegistry, name: &str, health: ModuleHealth) {
     if let Ok(mut guard) = reg.write() {
         guard.insert(name.to_string(), health);
     }
+}
+
+pub fn aggregate_health_entries<'a>(entries: impl Iterator<Item = &'a ModuleHealth>) -> ModuleHealth {
+    let mut worst_open: Option<(u64, String)> = None;
+    let mut worst_degraded: Option<(u32, String)> = None;
+    let mut any_running = false;
+    for h in entries {
+        match h {
+            ModuleHealth::CircuitOpen { reason, retry_in_secs } => {
+                if worst_open.as_ref().is_none_or(|(s, _)| *retry_in_secs >= *s) {
+                    worst_open = Some((*retry_in_secs, reason.clone()));
+                }
+            }
+            ModuleHealth::Degraded { recent_failures, last_error } => {
+                if worst_degraded.as_ref().is_none_or(|(c, _)| *recent_failures >= *c) {
+                    worst_degraded = Some((*recent_failures, last_error.clone()));
+                }
+            }
+            ModuleHealth::Running => any_running = true,
+            ModuleHealth::Disabled => {}
+        }
+    }
+    if let Some((retry_in_secs, reason)) = worst_open {
+        ModuleHealth::CircuitOpen { reason, retry_in_secs }
+    } else if let Some((recent_failures, last_error)) = worst_degraded {
+        ModuleHealth::Degraded { recent_failures, last_error }
+    } else if any_running {
+        ModuleHealth::Running
+    } else {
+        ModuleHealth::Disabled
+    }
+}
+
+pub fn update_task_health(
+    tasks: &TaskHealthMap,
+    reg: &HealthRegistry,
+    module_enabled: bool,
+    module: &str,
+    task_key: &str,
+    health: Option<ModuleHealth>,
+) {
+    let aggregated = if let Ok(mut map) = tasks.write() {
+        let entry = map.entry(module.to_string()).or_default();
+        match health {
+            Some(h) => {
+                entry.insert(task_key.to_string(), h);
+            }
+            None => {
+                entry.remove(task_key);
+            }
+        }
+        if !module_enabled {
+            ModuleHealth::Disabled
+        } else if entry.is_empty() {
+            ModuleHealth::Running
+        } else {
+            aggregate_health_entries(entry.values())
+        }
+    } else {
+        return;
+    };
+    set_module_health(reg, module, aggregated);
+}
+
+pub fn clear_module_tasks_health(tasks: &TaskHealthMap, reg: &HealthRegistry, module: &str, enabled: bool) {
+    if let Ok(mut map) = tasks.write() {
+        map.remove(module);
+    }
+    set_module_health(
+        reg,
+        module,
+        if enabled { ModuleHealth::Running } else { ModuleHealth::Disabled },
+    );
 }
 
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
@@ -221,5 +299,40 @@ mod tests {
         assert_eq!(*health_rx.borrow(), ModuleHealth::Running);
         let _ = stop_tx.send(true);
         let _ = sup.await;
+    }
+
+    #[test]
+    fn task_health_aggregation_preserves_worst_state_across_sibling_rules() {
+        let reg = new_health_registry();
+        let tasks = new_task_health_map();
+        update_task_health(&tasks, &reg, true, "reverse_proxy", "rule_a", Some(ModuleHealth::Running));
+        update_task_health(
+            &tasks,
+            &reg,
+            true,
+            "reverse_proxy",
+            "rule_b",
+            Some(ModuleHealth::Degraded { recent_failures: 2, last_error: "bind failed".into() }),
+        );
+        // Healthy rule_a stays Running, must NOT overwrite rule_b's Degraded!
+        update_task_health(&tasks, &reg, true, "reverse_proxy", "rule_a", Some(ModuleHealth::Running));
+        assert!(matches!(
+            reg.read().unwrap().get("reverse_proxy").unwrap(),
+            ModuleHealth::Degraded { recent_failures: 2, .. }
+        ));
+        update_task_health(
+            &tasks,
+            &reg,
+            true,
+            "reverse_proxy",
+            "rule_b",
+            Some(ModuleHealth::CircuitOpen { reason: "5 fails".into(), retry_in_secs: 300 }),
+        );
+        assert!(matches!(
+            reg.read().unwrap().get("reverse_proxy").unwrap(),
+            ModuleHealth::CircuitOpen { retry_in_secs: 300, .. }
+        ));
+        clear_module_tasks_health(&tasks, &reg, "reverse_proxy", false);
+        assert_eq!(*reg.read().unwrap().get("reverse_proxy").unwrap(), ModuleHealth::Disabled);
     }
 }

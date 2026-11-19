@@ -6,7 +6,7 @@ use crate::logger;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
@@ -70,9 +70,9 @@ struct SamplerPrev {
 }
 
 /// 按需监控采样状态：仅在面板请求到来时更新前后两帧增量，无人查看时 0 后台定时器开销。
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct MonitorSampler {
-    prev: Mutex<Option<SamplerPrev>>,
+    prev: Arc<Mutex<Option<SamplerPrev>>>,
 }
 
 impl MonitorSampler {

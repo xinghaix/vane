@@ -13,6 +13,15 @@ pub struct ConnectionQuota {
     inner: Arc<ArcSwap<QuotaInner>>,
 }
 
+impl std::fmt::Debug for ConnectionQuota {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionQuota")
+            .field("active", &self.active_connections())
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
 impl ConnectionQuota {
     pub fn new(max_conns: usize) -> Self {
         let cap = max_conns.clamp(1, 8192);

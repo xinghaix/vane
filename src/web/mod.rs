@@ -17,6 +17,7 @@ use crate::monitor::alerts::{evaluate_and_notify_alerts, AlertState};
 use crate::monitor::procfs::MonitorSampler;
 use crate::net::dual_stack::BanKey;
 use crate::net::listener::ConnectionQuota;
+use crate::net::{snapshot_rule_statuses, RuleStatusMap};
 use crate::net::stun::{probe_and_sync_stun_entry, StunRuntime};
 use crate::net::tls_resolver::CertTable;
 use crate::security::auth::{
@@ -71,6 +72,8 @@ pub struct AppState {
     pub admin_cert: Arc<ArcSwap<rustls::sign::CertifiedKey>>,
     pub stun_addrs: Arc<ArcSwap<BTreeMap<String, String>>>,
     pub stun_status: StunRuntime,
+    pub reverse_proxy_status: RuleStatusMap,
+    pub port_forward_status: RuleStatusMap,
     pub cron_status: Arc<CronRuntime>,
     pub monitor_sampler: MonitorSampler,
     pub alert_state: AlertState,
@@ -257,6 +260,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/ed25519/keys/{id}", delete(api_delete_ed25519_key))
         .route("/api/auth/ca-cert", get(api_export_admin_cert))
         .route("/api/dashboard", get(api_dashboard))
+        .route("/api/system/network-info", get(api_system_network_info))
         .route("/api/logs", get(api_get_logs).delete(api_clear_logs))
         .route("/api/settings", get(api_get_settings).put(api_put_settings))
         .route("/api/modules", put(api_put_modules))
@@ -1081,7 +1085,12 @@ async fn api_dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         return resp;
     }
     let cfg = state.config.load_full();
-    let sys = state.monitor_sampler.sample(&cfg.monitor);
+    let sampler = state.monitor_sampler.clone();
+    let mcfg = cfg.monitor.clone();
+    let sys = match tokio::task::spawn_blocking(move || sampler.sample(&mcfg)).await {
+        Ok(s) => s,
+        Err(_) => state.monitor_sampler.sample(&cfg.monitor),
+    };
 
     // 若配置了启用中的通知渠道，异步执行低内存 / 高温告警阈值评估与冷却投递
     if cfg.notifications.iter().any(|n| n.enabled) {
@@ -1110,6 +1119,8 @@ async fn api_dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         .read()
         .map(|g| g.values().cloned().collect::<Vec<_>>())
         .unwrap_or_default();
+    let rp_list = snapshot_rule_statuses(&state.reverse_proxy_status);
+    let pf_list = snapshot_rule_statuses(&state.port_forward_status);
     let cron_list = state.cron_status.snapshot();
     let fw_rules = state.firewall.list_rules();
     let bans = state.fail2ban.list_active_bans();
@@ -1129,8 +1140,128 @@ async fn api_dashboard(State(state): State<Arc<AppState>>, headers: HeaderMap) -
         "certs": certs,
         "stun": stun_list,
         "stun_public_addrs": stun_addrs,
+        "reverse_proxy_status": rp_list,
+        "port_forward_status": pf_list,
         "cron": cron_list,
         "bans": bans,
+    }))
+    .into_response()
+}
+
+#[derive(serde::Serialize)]
+struct NeighborInfo {
+    iface: String,
+    ip: String,
+    mac: String,
+    state: String,
+}
+
+async fn discover_neighbors() -> Vec<NeighborInfo> {
+    #[cfg(target_os = "linux")]
+    {
+        use tokio::io::AsyncReadExt;
+        async fn run_ip(args: &[&str]) -> Option<Vec<u8>> {
+            let mut child = tokio::process::Command::new("ip")
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .ok()?;
+            let stdout = child.stdout.take()?;
+            let mut buf = Vec::new();
+            let ok = tokio::time::timeout(Duration::from_secs(2), async {
+                stdout.take(256 * 1024).read_to_end(&mut buf).await.ok()?;
+                let st = child.wait().await.ok()?;
+                st.success().then_some(())
+            })
+            .await;
+            match ok {
+                Ok(Some(())) => Some(buf),
+                _ => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    None
+                }
+            }
+        }
+        let mut out = Vec::new();
+        if let Some(bytes) = run_ip(&["-j", "-6", "neigh", "show"]).await {
+            if let Ok(serde_json::Value::Array(items)) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                for e in items {
+                    let dst = e.get("dst").and_then(|v| v.as_str()).unwrap_or("");
+                    let lladdr = e.get("lladdr").and_then(|v| v.as_str()).unwrap_or("");
+                    let dev = e.get("dev").and_then(|v| v.as_str()).unwrap_or("");
+                    let st = e.get("state").map(|v| v.to_string()).unwrap_or_default();
+                    let upper = st.to_ascii_uppercase();
+                    if upper.contains("FAILED") || upper.contains("INCOMPLETE") || lladdr.is_empty() {
+                        continue;
+                    }
+                    if let Ok(ip) = dst.parse::<std::net::Ipv6Addr>() {
+                        if !ip.is_unicast_link_local() && !ip.is_loopback() {
+                            out.push(NeighborInfo { iface: dev.into(), ip: ip.to_string(), mac: lladdr.into(), state: st });
+                        }
+                    }
+                }
+                return out;
+            }
+        }
+        if let Some(bytes) = run_ip(&["-6", "neigh", "show"]).await {
+            let text = String::from_utf8_lossy(&bytes);
+            for line in text.lines() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                let Some(ip_s) = parts.first() else { continue };
+                let Ok(ip) = ip_s.parse::<std::net::Ipv6Addr>() else { continue };
+                if ip.is_unicast_link_local() || ip.is_loopback() { continue; }
+                let upper = line.to_ascii_uppercase();
+                if upper.contains("FAILED") || upper.contains("INCOMPLETE") { continue; }
+                let dev = parts.windows(2).find(|w| w[0] == "dev").map(|w| w[1]).unwrap_or("");
+                let mac = parts.windows(2).find(|w| w[0] == "lladdr").map(|w| w[1]).unwrap_or("");
+                if !mac.is_empty() {
+                    out.push(NeighborInfo { iface: dev.into(), ip: ip.to_string(), mac: mac.into(), state: parts.last().copied().unwrap_or("").into() });
+                }
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
+async fn api_system_network_info(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(resp) = require_full_admin(&state, &headers) {
+        return resp;
+    }
+    let ifaces = tokio::task::spawn_blocking(|| {
+        crate::daemon::netlink_ip::list_interface_addresses()
+            .into_iter()
+            .map(|(iface, entry)| {
+                serde_json::json!({
+                    "iface": iface,
+                    "ipv4": entry.ipv4.into_iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+                    "ipv6": entry.ipv6.into_iter().map(|ip| ip.to_string()).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    let neighbors = discover_neighbors().await;
+    let split_dns_path = state
+        .config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("split-dns.hosts")
+        .to_string_lossy()
+        .into_owned();
+    Json(serde_json::json!({
+        "interfaces": ifaces,
+        "neighbors": neighbors,
+        "split_dns_path": split_dns_path,
     }))
     .into_response()
 }
@@ -1143,10 +1274,24 @@ async fn api_get_logs(
     if let Err(resp) = require_full_admin(&state, &headers) {
         return resp;
     }
+    let cfg = state.config.load();
     let min_level = q.get("level").and_then(|s| Level::parse(s));
     let module = q.get("module").map(|s| s.as_str()).filter(|s| !s.is_empty());
-    let entries = logger::global().query(min_level, module, 500, 0);
-    Json(serde_json::json!({ "entries": entries })).into_response()
+    let kw = q.get("q").map(|s| s.as_str()).filter(|s| !s.is_empty());
+    let limit = q
+        .get("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(cfg.system.log_ring_capacity)
+        .clamp(1, 1000);
+    let after_seq = q.get("after_seq").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let entries = logger::global().query_filtered(min_level, module, kw, limit, after_seq);
+    let modules = logger::global().modules();
+    Json(serde_json::json!({
+        "entries": entries,
+        "modules": modules,
+        "capacity": cfg.system.log_ring_capacity,
+    }))
+    .into_response()
 }
 
 async fn api_clear_logs(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1223,12 +1368,37 @@ async fn api_put_settings(
     if let Err(e) = save_config(&state.config_path, &next_cfg) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response();
     }
+    let mut restart_fields: Vec<&'static str> = Vec::new();
+    if next_cfg.admin.listen_lan != current_cfg.admin.listen_lan {
+        restart_fields.push("admin.listen_lan");
+    }
+    if next_cfg.admin.canonical_origin != current_cfg.admin.canonical_origin {
+        restart_fields.push("admin.canonical_origin");
+    }
+    if next_cfg.admin.tls_cert_path != current_cfg.admin.tls_cert_path
+        || next_cfg.admin.tls_key_path != current_cfg.admin.tls_key_path
+    {
+        restart_fields.push("admin.tls_cert_path");
+    }
+    if next_cfg.system.worker_threads != current_cfg.system.worker_threads {
+        restart_fields.push("system.worker_threads");
+    }
+    if next_cfg.firewall.backend != current_cfg.firewall.backend {
+        restart_fields.push("firewall.backend");
+    }
+
     state.apply_runtime_settings(&next_cfg).await;
     state.config.store(Arc::new(next_cfg.clone()));
     state.reload_notify.notify_one();
     logger::log(Level::Info, "config", "配置已在 Web 设置页更新并热生效");
 
     let mut resp = Json(state.vault.masked_config_json(&next_cfg)).into_response();
+    if !restart_fields.is_empty() {
+        if let Ok(hv) = header::HeaderValue::from_str(&restart_fields.join(",")) {
+            resp.headers_mut()
+                .insert(header::HeaderName::from_static("x-vane-restart-required"), hv);
+        }
+    }
     if let Some(sp) = boundary::active_secret_path(&next_cfg) {
         if let Some(entry_hv) = boundary::build_entry_set_cookie(state.vault.mac_key(), sp) {
             resp.headers_mut().append(header::SET_COOKIE, entry_hv);
@@ -1323,11 +1493,22 @@ async fn api_ddns_sync(
                 || st.ipv4.error.is_some()
                 || st.ipv6.error.is_some()
                 || st.firewall_error.is_some();
-            (
-                if has_err { StatusCode::BAD_GATEWAY } else { StatusCode::OK },
-                Json(st),
-            )
-                .into_response()
+            if has_err {
+                let mut val = serde_json::to_value(&st).unwrap_or_default();
+                let msgs: Vec<&str> = [
+                    st.ipv4.error.as_deref(),
+                    st.ipv6.error.as_deref(),
+                    st.firewall_error.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                let summary = if msgs.is_empty() { st.status.clone() } else { msgs.join("; ") };
+                val["message"] = serde_json::json!(summary);
+                (StatusCode::BAD_GATEWAY, Json(val)).into_response()
+            } else {
+                (StatusCode::OK, Json(st)).into_response()
+            }
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
     }
@@ -1356,11 +1537,15 @@ async fn api_acme_issue(
     )
     .await
     {
-        Ok(st) => (
-            if st.status == "active" { StatusCode::OK } else { StatusCode::BAD_GATEWAY },
-            Json(st),
-        )
-            .into_response(),
+        Ok(st) => {
+            if st.status == "active" {
+                (StatusCode::OK, Json(st)).into_response()
+            } else {
+                let mut val = serde_json::to_value(&st).unwrap_or_default();
+                val["message"] = serde_json::json!(st.last_error.clone().unwrap_or_else(|| st.status.clone()));
+                (StatusCode::BAD_GATEWAY, Json(val)).into_response()
+            }
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
     }
 }
@@ -2036,6 +2221,8 @@ mod tests {
             admin_cert: Arc::new(ArcSwap::from(crate::net::tls_resolver::generate_self_signed_cert(&[]).unwrap().2)),
             stun_addrs: Arc::new(ArcSwap::from_pointee(BTreeMap::new())),
             stun_status: crate::net::stun::new_stun_runtime(),
+            reverse_proxy_status: crate::net::new_rule_status_map(),
+            port_forward_status: crate::net::new_rule_status_map(),
             cron_status: CronRuntime::new(),
             monitor_sampler: MonitorSampler::new(),
             alert_state: AlertState::default(),
@@ -2560,6 +2747,7 @@ mod tests {
             .unwrap();
         assert_eq!(put3.status(), StatusCode::OK);
         let bad_reauth = app
+            .clone()
             .oneshot(
                 trusted_request()
                     .method("POST")
@@ -2572,6 +2760,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bad_reauth.status(), StatusCode::FORBIDDEN);
+
+        // 验证 /api/system/network-info 与 /api/logs 增强参数与 /api/dashboard 运行态字段
+        let net_info = app
+            .clone()
+            .oneshot(trusted_request().uri("/api/system/network-info").header(header::COOKIE, &new_cookie).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(net_info.status(), StatusCode::OK);
+        let net_json: serde_json::Value = serde_json::from_slice(&to_bytes(net_info.into_body(), 65536).await.unwrap()).unwrap();
+        assert!(net_json["interfaces"].is_array());
+        assert!(net_json["neighbors"].is_array());
+        assert!(net_json["split_dns_path"].as_str().unwrap().ends_with("split-dns.hosts"));
+
+        let logs_res = app
+            .clone()
+            .oneshot(trusted_request().uri("/api/logs?limit=10").header(header::COOKIE, &new_cookie).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(logs_res.status(), StatusCode::OK);
+        let logs_json: serde_json::Value = serde_json::from_slice(&to_bytes(logs_res.into_body(), 65536).await.unwrap()).unwrap();
+        assert!(logs_json["entries"].is_array());
+        assert!(logs_json["modules"].is_array());
+        assert!(logs_json["capacity"].as_u64().unwrap() >= 50);
+
+        let dash2 = app
+            .clone()
+            .oneshot(trusted_request().uri("/api/dashboard").header(header::COOKIE, &new_cookie).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(dash2.status(), StatusCode::OK);
+        let dash_json: serde_json::Value = serde_json::from_slice(&to_bytes(dash2.into_body(), 131_072).await.unwrap()).unwrap();
+        assert!(dash_json["reverse_proxy_status"].is_array());
+        assert!(dash_json["port_forward_status"].is_array());
+
+        // 修改重启生效字段时必须返回 X-Vane-Restart-Required 响应头
+        let mut cfg_restart = cfg_pty;
+        cfg_restart["system"]["worker_threads"] = serde_json::json!(4);
+        let put_restart = app
+            .oneshot(
+                trusted_request()
+                    .method("PUT")
+                    .uri("/api/settings")
+                    .header(header::COOKIE, &new_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(cfg_restart.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put_restart.status(), StatusCode::OK);
+        let restart_hdr = put_restart
+            .headers()
+            .get("x-vane-restart-required")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(restart_hdr.contains("system.worker_threads"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

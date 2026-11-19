@@ -8,6 +8,7 @@ use crate::net::dual_stack::{
     bind_dual_stack_tcp_on, bind_dual_stack_udp_on, connect_tcp_with_options, connect_udp_with_options, StackMode,
 };
 use crate::net::listener::ConnectionQuota;
+use crate::net::{update_rule_status, RuleRuntimeStatus, RuleStatusMap};
 use tokio::sync::OwnedSemaphorePermit;
 
 struct DualPermit {
@@ -281,9 +282,30 @@ pub async fn run_port_forward_rule(
     tz_offset_secs: i64,
     global_quota: ConnectionQuota,
     firewall: Arc<FirewallManager>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), String> {
+    run_port_forward_rule_with_status(cfg, tz_offset_secs, global_quota, firewall, shutdown_rx, None).await
+}
+
+pub async fn run_port_forward_rule_with_status(
+    cfg: PortForwardConfig,
+    tz_offset_secs: i64,
+    global_quota: ConnectionQuota,
+    firewall: Arc<FirewallManager>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    status_map: Option<RuleStatusMap>,
+) -> Result<(), String> {
+    let mut rt = RuleRuntimeStatus {
+        name: cfg.name.clone(),
+        enabled: cfg.enabled,
+        listen_port: cfg.listen_port,
+        stack: cfg.stack.clone(),
+        proto: cfg.proto.clone(),
+        ..Default::default()
+    };
     if !cfg.enabled {
+        rt.status = "disabled".into();
+        update_rule_status(&status_map, rt);
         return cleanup_rule_firewall(&firewall, &cfg.name).await;
     }
 
@@ -293,9 +315,14 @@ pub async fn run_port_forward_rule(
         .filter_map(|t| t.parse().ok())
         .collect();
     if targets.is_empty() {
-        return Err(format!("端口转发 {} 无有效目标地址", cfg.name));
+        let msg = format!("端口转发 {} 无有效目标地址", cfg.name);
+        rt.status = "failed".into();
+        rt.last_error = msg.clone();
+        update_rule_status(&status_map, rt);
+        return Err(msg);
     }
 
+    let mut expired = false;
     loop {
         if *shutdown_rx.borrow() {
             break;
@@ -303,11 +330,21 @@ pub async fn run_port_forward_rule(
         let now = logger::unix_now();
         if !is_rule_active_now(&cfg, now, tz_offset_secs) {
             let _ = cleanup_rule_firewall(&firewall, &cfg.name).await;
+            rt.bound_v4 = false;
+            rt.bound_v6 = false;
+            rt.quota = None;
             if cfg.expire_at_unix > 0 && now >= cfg.expire_at_unix {
                 // 一次性临时租约已到期，保持关闭直到配置重载或网关退出
+                expired = true;
+                rt.status = "expired".into();
+                rt.last_error.clear();
+                update_rule_status(&status_map, rt.clone());
                 let _ = shutdown_rx.changed().await;
                 break;
             }
+            rt.status = "waiting_window".into();
+            rt.last_error.clear();
+            update_rule_status(&status_map, rt.clone());
             let wait = next_transition_delay(&cfg, now, tz_offset_secs).unwrap_or(Duration::from_secs(15));
             tokio::select! {
                 _ = tokio::time::sleep(wait) => continue,
@@ -322,13 +359,29 @@ pub async fn run_port_forward_rule(
             global_quota.clone(),
             firewall.clone(),
             &mut shutdown_rx,
+            &status_map,
         )
         .await;
         let cleanup = cleanup_rule_firewall(&firewall, &cfg.name).await;
-        res?;
+        if let Err(e) = res {
+            rt.bound_v4 = false;
+            rt.bound_v6 = false;
+            rt.quota = None;
+            rt.status = "failed".into();
+            rt.last_error = e.clone();
+            update_rule_status(&status_map, rt);
+            return Err(e);
+        }
         cleanup?;
     }
 
+    rt.bound_v4 = false;
+    rt.bound_v6 = false;
+    rt.quota = None;
+    if !expired {
+        rt.status = "disabled".into();
+    }
+    update_rule_status(&status_map, rt);
     cleanup_rule_firewall(&firewall, &cfg.name).await
 }
 
@@ -339,7 +392,16 @@ async fn run_active_window(
     global_quota: ConnectionQuota,
     firewall: Arc<FirewallManager>,
     shutdown_rx: &mut watch::Receiver<bool>,
+    status_map: &Option<RuleStatusMap>,
 ) -> Result<(), String> {
+    let mut rt = RuleRuntimeStatus {
+        name: cfg.name.clone(),
+        enabled: cfg.enabled,
+        listen_port: cfg.listen_port,
+        stack: cfg.stack.clone(),
+        proto: cfg.proto.clone(),
+        ..Default::default()
+    };
     if cfg.engine == "kernel_dnat" {
         for proto in ["tcp", "udp"] {
             if cfg.proto == proto || cfg.proto == "tcp_udp" {
@@ -354,6 +416,10 @@ async fn run_active_window(
                     .await?;
             }
         }
+        rt.bound_v4 = cfg.stack != "ipv6_only";
+        rt.bound_v6 = cfg.stack == "ipv6_only";
+        rt.status = "running".into();
+        update_rule_status(status_map, rt);
         return wait_until_inactive_or_shutdown(cfg, tz_offset_secs, shutdown_rx).await;
     }
 
@@ -395,9 +461,13 @@ async fn run_active_window(
         });
     }
 
+    let mut bound_v4 = false;
+    let mut bound_v6 = false;
     if cfg.proto == "tcp" || cfg.proto == "tcp_udp" {
         let bound = bind_dual_stack_tcp_on(cfg.listen_port, mode, &cfg.bind_interface)
             .map_err(|e| format!("转发规则 {} 绑定 TCP {} 失败: {}", cfg.name, cfg.listen_port, e))?;
+        bound_v4 |= bound.has_v4();
+        bound_v6 |= bound.has_v6();
         if cfg.open_wan_firewall {
             firewall
                 .upsert_rule(FirewallRule::WanInput {
@@ -426,6 +496,8 @@ async fn run_active_window(
     if cfg.proto == "udp" || cfg.proto == "tcp_udp" {
         let bound = bind_dual_stack_udp_on(cfg.listen_port, mode, &cfg.bind_interface, true)
             .map_err(|e| format!("转发规则 {} 绑定 UDP {} 失败: {}", cfg.name, cfg.listen_port, e))?;
+        bound_v4 |= bound.v4.is_some();
+        bound_v6 |= bound.v6.is_some();
         if cfg.open_wan_firewall {
             firewall
                 .upsert_rule(FirewallRule::WanInput {
@@ -450,6 +522,12 @@ async fn run_active_window(
             ));
         }
     }
+
+    rt.bound_v4 = bound_v4;
+    rt.bound_v6 = bound_v6;
+    rt.status = "running".into();
+    rt.quota = Some(rule_quota.clone());
+    update_rule_status(status_map, rt);
 
     logger::log(
         Level::Info,

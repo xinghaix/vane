@@ -3,12 +3,37 @@
   import { localizeError } from './lib/helpers.js';
   import Icons from './components/Icons.svelte';
   import ToastStack from './components/ToastStack.svelte';
+  import ConfirmModal from './components/ConfirmModal.svelte';
   import AuthGate from './components/AuthGate.svelte';
   import DashboardView from './components/DashboardView.svelte';
   import NetworkRulesView from './components/NetworkRulesView.svelte';
   import DomainCertStunView from './components/DomainCertStunView.svelte';
   import OpsViews from './components/OpsViews.svelte';
   import SettingsView from './components/SettingsView.svelte';
+
+  const VALID_TABS = new Set([
+    'dashboard',
+    'reverse_proxy',
+    'port_forward',
+    'ddns',
+    'acme',
+    'stun',
+    'docker',
+    'web_terminal',
+    'cron',
+    'logs',
+    'settings',
+  ]);
+
+  function parseHash() {
+    const raw = (location.hash || '').replace(/^#\/?/, '');
+    if (!raw) return { tab: 'dashboard', sub: 'general' };
+    const [tabPart, subPart] = raw.split('/');
+    return {
+      tab: VALID_TABS.has(tabPart) ? tabPart : 'dashboard',
+      sub: ['general', 'security', 'notifications', 'backup'].includes(subPart) ? subPart : 'general',
+    };
+  }
 
   const storedLang = localStorage.getItem('vane_lang');
   let hasExplicitLang = storedLang === 'zh' || storedLang === 'en';
@@ -26,11 +51,24 @@
   let ed25519KeyIds = $state([]);
   let sessionTtlSecs = $state(3600);
 
+  const initHash = parseHash();
   let themeMode = $state(localStorage.getItem('vane_theme_mode') || 'dark');
-  let activeTab = $state('dashboard');
+  let activeTab = $state(initHash.tab);
+  let settingsSubTab = $state(initHash.sub);
   let mobileMoreOpen = $state(false);
   let toasts = $state([]);
   let nextToastId = 1;
+
+  // 全局确认框状态
+  let confirmState = $state({
+    open: false,
+    title: '',
+    message: '',
+    confirmLabel: '',
+    danger: true,
+    busy: false,
+    onConfirm: null,
+  });
 
   let modules = $state({
     reverse_proxy: true,
@@ -45,14 +83,20 @@
 
   let dashboard = $state(null);
   let settingsJson = $state(null);
+  let networkInfo = $state(null);
   let logs = $state([]);
+  let logModules = $state([]);
+  let logCapacity = $state(300);
   let logLevelFilter = $state('');
+  let logModuleFilter = $state('');
   let containers = $state([]);
+  let dockerError = $state('');
   let restartRequiredFields = $state([]);
 
   // Web 终端按需异步加载分包（关闭时 0 字节下载）
   let TerminalComp = $state(null);
   let terminalInitialTarget = $state('host');
+  let terminalTargetNonce = $state(0);
 
   let navGroups = $derived.by(() => {
     const groups = [
@@ -149,6 +193,22 @@
     }
   });
 
+  function syncUrlHash(tab, sub = settingsSubTab) {
+    const nextHash = tab === 'settings' && sub !== 'general' ? `#settings/${sub}` : `#${tab}`;
+    if (location.hash !== nextHash) {
+      history.replaceState(null, '', nextHash);
+    }
+  }
+
+  function handleHashChange() {
+    const { tab, sub } = parseHash();
+    if (tab !== activeTab || sub !== settingsSubTab) {
+      activeTab = tab;
+      settingsSubTab = sub;
+      refreshActiveView(true);
+    }
+  }
+
   function toggleLang() {
     lang = lang === 'zh' ? 'en' : 'zh';
     hasExplicitLang = true;
@@ -180,6 +240,32 @@
     const duration = type === 'error' || type === 'warn' ? 6000 : 3500;
     toasts = [...toasts.slice(-3), { id, message: String(msg), type }];
     setTimeout(() => dismissToast(id), duration);
+  }
+
+  function askConfirm({ title, message, confirmLabel = '', danger = true, onConfirm }) {
+    confirmState = {
+      open: true,
+      title,
+      message,
+      confirmLabel: confirmLabel || t.confirmAction,
+      danger,
+      busy: false,
+      onConfirm,
+    };
+  }
+
+  async function runConfirmedAction() {
+    if (!confirmState.onConfirm) {
+      confirmState.open = false;
+      return;
+    }
+    confirmState.busy = true;
+    try {
+      await confirmState.onConfirm();
+      confirmState.open = false;
+    } finally {
+      confirmState.busy = false;
+    }
   }
 
   function moduleStatusDot(id) {
@@ -237,6 +323,9 @@
       const st = await apiFetch('/api/auth/status');
       applyAuthStatus(st);
       if (authenticated && !mustChangePassword) {
+        if (!modules[activeTab] && !['dashboard', 'logs', 'settings'].includes(activeTab)) {
+          activeTab = 'dashboard';
+        }
         await refreshActiveView();
       }
     } catch (err) {
@@ -247,11 +336,21 @@
     }
   }
 
+  async function refreshAuthStatusOnly() {
+    try {
+      const st = await apiFetch('/api/auth/status');
+      applyAuthStatus(st);
+    } catch {
+      // ignore
+    }
+  }
+
   async function handleAuthenticated(st, toastMsg = '') {
     authConnError = '';
     applyAuthStatus(st);
     if (toastMsg) showToast(toastMsg, 'success');
     if (authenticated && !mustChangePassword) {
+      syncUrlHash(activeTab, settingsSubTab);
       await refreshActiveView();
     }
   }
@@ -262,42 +361,72 @@
     mustChangePassword = false;
     dashboard = null;
     settingsJson = null;
+    networkInfo = null;
     containers = [];
     logs = [];
     await checkAuthStatus();
   }
 
+  async function ensureNetworkInfo(force = false) {
+    if (!force && networkInfo) return;
+    try {
+      networkInfo = await apiFetch('/api/system/network-info');
+    } catch {
+      // ignore on restricted environments
+    }
+  }
+
   async function refreshActiveView(silent = false) {
     if (!authenticated || mustChangePassword) return;
     try {
-      if (['dashboard', 'ddns', 'acme', 'stun', 'cron'].includes(activeTab)) {
+      if (['dashboard', 'reverse_proxy', 'port_forward', 'ddns', 'acme', 'stun', 'cron'].includes(activeTab)) {
         dashboard = await apiFetch('/api/dashboard');
       } else if (!dashboard) {
         dashboard = await apiFetch('/api/dashboard').catch(() => dashboard);
       }
+
       if (activeTab === 'logs') {
-        const q = logLevelFilter ? `?level=${encodeURIComponent(logLevelFilter)}` : '';
-        const r = await apiFetch(`/api/logs${q}`);
+        const params = new URLSearchParams();
+        if (logLevelFilter) params.set('level', logLevelFilter);
+        if (logModuleFilter) params.set('module', logModuleFilter);
+        const qs = params.toString();
+        const r = await apiFetch(`/api/logs${qs ? `?${qs}` : ''}`);
         logs = r.entries || [];
+        logModules = r.modules || [];
+        if (r.capacity) logCapacity = r.capacity;
       }
+
       if (['dashboard', 'settings', 'reverse_proxy', 'port_forward', 'ddns', 'acme', 'stun', 'cron', 'web_terminal'].includes(activeTab)) {
         if (!silent || !settingsJson) {
           settingsJson = await apiFetch('/api/settings');
           if (settingsJson?.modules) modules = settingsJson.modules;
         }
       }
-      if ((activeTab === 'docker' || activeTab === 'web_terminal') && modules.docker) {
-        const r = await apiFetch('/api/docker/containers').catch(() => ({ containers: [] }));
-        containers = r.containers || [];
+
+      if (['reverse_proxy', 'port_forward', 'ddns', 'acme', 'settings'].includes(activeTab)) {
+        await ensureNetworkInfo(!silent);
+      }
+
+      if ((activeTab === 'docker' || activeTab === 'web_terminal' || activeTab === 'cron') && modules.docker) {
+        try {
+          const r = await apiFetch('/api/docker/containers');
+          containers = r.containers || [];
+          dockerError = '';
+        } catch (err) {
+          containers = [];
+          dockerError = err.message;
+        }
       }
     } catch (err) {
       if (!silent) showToast(err.message, 'error');
     }
   }
 
-  async function switchTab(id) {
+  async function switchTab(id, sub = 'general') {
     activeTab = id;
+    if (id === 'settings') settingsSubTab = sub;
     mobileMoreOpen = false;
+    syncUrlHash(id, settingsSubTab);
     await refreshActiveView();
   }
 
@@ -312,6 +441,7 @@
       if (settingsJson) settingsJson.modules = r.modules;
       if (!modules[activeTab] && !['dashboard', 'logs', 'settings'].includes(activeTab)) {
         activeTab = 'settings';
+        syncUrlHash(activeTab, settingsSubTab);
       }
       showToast(`${t.nav[key] || key}: ${modules[key] ? t.enabled : t.disabled}`, 'success');
       await refreshActiveView();
@@ -358,34 +488,61 @@
     }
   }
 
-  async function triggerLockdown(enable) {
-    try {
-      const r = await apiFetch('/api/firewall/lockdown', {
-        method: 'POST',
-        body: JSON.stringify({ enable }),
-      });
-      if (dashboard?.firewall) {
-        dashboard = {
-          ...dashboard,
-          firewall: { ...dashboard.firewall, lockdown: Boolean(r.lockdown) },
-        };
-      }
-      showToast(r.lockdown ? t.lockdownOn : t.lockdownOff, r.lockdown ? 'warn' : 'success');
-      dashboard = await apiFetch('/api/dashboard').catch(() => dashboard);
-    } catch (err) {
-      showToast(err.message, 'error');
-    }
+  function requestLockdownToggle(enable) {
+    askConfirm({
+      title: enable ? t.lockdownOnConfirmTitle : t.lockdownOffConfirmTitle,
+      message: enable ? t.lockdownOnConfirmDesc : t.lockdownOffConfirmDesc,
+      confirmLabel: enable ? t.lockdownOff : t.lockdownOn,
+      danger: enable,
+      onConfirm: async () => {
+        try {
+          const r = await apiFetch('/api/firewall/lockdown', {
+            method: 'POST',
+            body: JSON.stringify({ enable }),
+          });
+          if (dashboard?.firewall) {
+            dashboard = {
+              ...dashboard,
+              firewall: { ...dashboard.firewall, lockdown: Boolean(r.lockdown) },
+            };
+          }
+          showToast(r.lockdown ? t.lockdownOn : t.lockdownOff, r.lockdown ? 'warn' : 'success');
+          dashboard = await apiFetch('/api/dashboard').catch(() => dashboard);
+        } catch (err) {
+          showToast(err.message, 'error');
+        }
+      },
+    });
   }
 
   function openContainerShell(containerName) {
     terminalInitialTarget = `container:${containerName}`;
+    terminalTargetNonce += 1;
     switchTab('web_terminal');
   }
 
   checkAuthStatus();
 </script>
 
+<svelte:window
+  onhashchange={handleHashChange}
+  onkeydown={(e) => {
+    if (e.key === 'Escape' && mobileMoreOpen) mobileMoreOpen = false;
+  }}
+/>
+
 <ToastStack {toasts} onDismiss={dismissToast} />
+<ConfirmModal
+  open={confirmState.open}
+  title={confirmState.title}
+  message={confirmState.message}
+  confirmLabel={confirmState.confirmLabel}
+  cancelLabel={t.cancel}
+  danger={confirmState.danger}
+  busy={confirmState.busy}
+  onConfirm={runConfirmedAction}
+  onCancel={() => { confirmState.open = false; }}
+/>
 
 {#if loading}
   <div class="auth-shell">
@@ -475,20 +632,20 @@
           </div>
         </div>
         <div class="btn-group">
+          <button type="button" class="btn btn-sm" onclick={() => refreshActiveView()}>
+            <Icons name="refresh" size={14} />
+            <span>{t.refresh}</span>
+          </button>
           {#if dashboard?.firewall}
             <button
               type="button"
               class="btn btn-sm {dashboard.firewall.lockdown ? 'btn-primary' : 'btn-danger'}"
-              onclick={() => triggerLockdown(!dashboard.firewall.lockdown)}
+              onclick={() => requestLockdownToggle(!dashboard.firewall.lockdown)}
             >
               <Icons name="shield" size={14} />
               <span>{dashboard.firewall.lockdown ? t.lockdownOn : t.lockdownOff}</span>
             </button>
           {/if}
-          <button type="button" class="btn btn-sm" onclick={() => refreshActiveView()}>
-            <Icons name="refresh" size={14} />
-            <span>{t.refresh}</span>
-          </button>
         </div>
       </header>
 
@@ -517,7 +674,10 @@
           {t}
           {lang}
           {settingsJson}
+          {dashboard}
+          {networkInfo}
           onSaveSettings={saveFullSettings}
+          {askConfirm}
           {apiFetch}
           {showToast}
           onRefresh={refreshActiveView}
@@ -529,7 +689,9 @@
           {lang}
           {settingsJson}
           {dashboard}
+          {networkInfo}
           onSaveSettings={saveFullSettings}
+          {askConfirm}
           {apiFetch}
           {showToast}
           onRefresh={refreshActiveView}
@@ -542,12 +704,21 @@
           {settingsJson}
           {dashboard}
           {containers}
+          {dockerError}
           {logs}
+          {logModules}
+          {logCapacity}
           {logLevelFilter}
-          onChangeLogLevel={async (lvl) => { logLevelFilter = lvl; await refreshActiveView(); }}
+          {logModuleFilter}
+          onChangeLogFilter={async (lvl, mod) => {
+            logLevelFilter = lvl;
+            logModuleFilter = mod;
+            await refreshActiveView();
+          }}
           webTerminalEnabled={modules.web_terminal}
           onOpenContainerTerminal={openContainerShell}
           onSaveSettings={saveFullSettings}
+          {askConfirm}
           {apiFetch}
           {showToast}
           onRefresh={refreshActiveView}
@@ -558,6 +729,7 @@
             {t}
             {lang}
             initialTarget={terminalInitialTarget}
+            targetNonce={terminalTargetNonce}
             {containers}
             requireReauth={Boolean(settingsJson?.web_terminal?.require_reauth)}
             {apiFetch}
@@ -572,8 +744,16 @@
           {lang}
           {modules}
           {settingsJson}
+          {networkInfo}
+          subTab={settingsSubTab}
+          onSubTabChange={(sub) => {
+            settingsSubTab = sub;
+            syncUrlHash('settings', sub);
+          }}
           onToggleModule={toggleModule}
           onSaveSettings={saveFullSettings}
+          onAuthRefresh={refreshAuthStatusOnly}
+          {askConfirm}
           {apiFetch}
           {showToast}
           onRefresh={refreshActiveView}

@@ -1,18 +1,38 @@
 <script>
+  import Icons from './Icons.svelte';
+  import SecretField from './SecretField.svelte';
   import {
     splitCsv,
     joinCsv,
+    kvObjectToText,
+    textToKvObject,
     deepClone,
     copyText,
     formatUnixTime,
-    isSecretConfigured,
     secretMaskedHint,
     resolveSecretInput,
   } from '../lib/helpers.js';
 
-  let { mode = 'ddns', t, lang, settingsJson, dashboard, onSaveSettings, apiFetch, showToast, onRefresh } = $props();
+  let {
+    mode = 'ddns',
+    t,
+    lang,
+    settingsJson,
+    dashboard,
+    networkInfo = null,
+    onSaveSettings,
+    askConfirm,
+    apiFetch,
+    showToast,
+    onRefresh,
+  } = $props();
 
   let busyKey = $state('');
+  let saving = $state(false);
+  let searchQuery = $state('');
+
+  let ifaceNames = $derived((networkInfo?.interfaces || []).map((i) => i.iface));
+  let neighborEntries = $derived(networkInfo?.neighbors || []);
 
   // ---------------- DNS Provider Drawer ----------------
   let provDrawerOpen = $state(false);
@@ -20,7 +40,9 @@
   let provDraftId = $state('');
   let provDraft = $state(null);
   let provTokenInput = $state('');
+  let provTokenClear = $state(false);
   let provSecretInput = $state('');
+  let provSecretClear = $state(false);
 
   function openProviderDrawer(id = '') {
     provEditId = id;
@@ -29,34 +51,63 @@
       ? deepClone(settingsJson.dns_providers[id])
       : { provider: 'cloudflare', api_token: '', secret_key: '', happy_eyeballs_delay_ms: 250, zone_name: '', zone_id: '' };
     provTokenInput = '';
+    provTokenClear = false;
     provSecretInput = '';
+    provSecretClear = false;
     provDrawerOpen = true;
   }
 
   async function saveProvider(e) {
     e.preventDefault();
+    if (saving) return;
     const cleanId = provDraftId.trim();
     if (!cleanId) return;
-    const orig = provEditId ? settingsJson.dns_providers[provEditId] : null;
-    provDraft.api_token = resolveSecretInput(orig?.api_token, provTokenInput);
-    provDraft.secret_key = resolveSecretInput(orig?.secret_key, provSecretInput);
-    provDraft.happy_eyeballs_delay_ms = Number(provDraft.happy_eyeballs_delay_ms || 250);
+    saving = true;
+    try {
+      const orig = provEditId ? settingsJson.dns_providers[provEditId] : null;
+      provDraft.api_token = resolveSecretInput(orig?.api_token, provTokenInput, provTokenClear);
+      provDraft.secret_key = resolveSecretInput(orig?.secret_key, provSecretInput, provSecretClear);
+      provDraft.happy_eyeballs_delay_ms = Number(provDraft.happy_eyeballs_delay_ms || 250);
 
-    const next = deepClone(settingsJson);
-    if (provEditId && provEditId !== cleanId) delete next.dns_providers[provEditId];
-    next.dns_providers[cleanId] = provDraft;
-    if (await onSaveSettings(next)) provDrawerOpen = false;
+      const next = deepClone(settingsJson);
+      const renames = [];
+      if (provEditId && provEditId !== cleanId) {
+        delete next.dns_providers[provEditId];
+        renames.push({ from: `dns_providers.${provEditId}`, to: `dns_providers.${cleanId}` });
+      }
+      next.dns_providers[cleanId] = provDraft;
+      if (await onSaveSettings(next, renames)) provDrawerOpen = false;
+    } finally {
+      saving = false;
+    }
   }
 
-  async function deleteProvider(id) {
-    const next = deepClone(settingsJson);
-    delete next.dns_providers[id];
-    await onSaveSettings(next);
+  function deleteProvider(id) {
+    const usedByDdns = (settingsJson?.ddns || []).filter((d) => d.provider === id).map((d) => d.name);
+    const usedByAcme = (settingsJson?.acme || []).filter((a) => a.dns_provider === id).map((a) => a.domain);
+    const refs = [...usedByDdns, ...usedByAcme];
+    const refWarning = refs.length
+      ? lang === 'en'
+        ? ` (Referenced by: ${refs.join(', ')})`
+        : `（注意：正被 ${refs.join(', ')} 引用！）`
+      : '';
+    askConfirm({
+      title: t.common.confirmDeleteTitle,
+      message: `${id}${refWarning}`,
+      confirmLabel: t.delete,
+      danger: true,
+      onConfirm: async () => {
+        const next = deepClone(settingsJson);
+        delete next.dns_providers[id];
+        await onSaveSettings(next);
+      },
+    });
   }
 
   // ---------------- DDNS Rule Drawer ----------------
   let ddnsDrawerOpen = $state(false);
   let ddnsEditIdx = $state(-1);
+  let ddnsOrigName = $state('');
   let ddnsDraft = $state(null);
   let ddnsSourceKind = $state('interface');
   let ddnsRecA = $state(true);
@@ -65,11 +116,18 @@
   let ddnsTcpPortsCsv = $state('');
   let ddnsUdpPortsCsv = $state('');
   let ddnsTokenInput = $state('');
+  let ddnsTokenClear = $state(false);
   let ddnsHttpUrlInput = $state('');
+  let ddnsHttpUrlClear = $state(false);
   let ddnsHttpBodyInput = $state('');
+  let ddnsHttpBodyClear = $state(false);
+  let ddnsHttpHeadersTxt = $state('');
   let ddnsSrcUrlV4Input = $state('');
+  let ddnsSrcUrlV4Clear = $state(false);
   let ddnsSrcUrlV6Input = $state('');
+  let ddnsSrcUrlV6Clear = $state(false);
   let ddnsSrcExtractUrlInput = $state('');
+  let ddnsSrcExtractUrlClear = $state(false);
 
   function defaultDdns(preset = 'wan') {
     const firstProv = Object.keys(settingsJson?.dns_providers || {})[0] || 'custom_http';
@@ -88,7 +146,7 @@
       split_dns_lan_ips: [],
       firewall_allow_tcp_ports: [],
       firewall_allow_udp_ports: [],
-      custom_http: { method: 'GET', url: 'https://example.com/update?ip={{ip}}', headers: {}, body: '', success_keyword: '' },
+      custom_http: { method: 'GET', url: '', headers: {}, body: '', success_keyword: '' },
       token: '',
       reconcile_interval_secs: 600,
     };
@@ -96,7 +154,7 @@
       d.name = 'nas_ipv6';
       d.domain = 'nas6.example.com';
       d.records = ['AAAA'];
-      d.source = { kind: 'prefix_and_iid', prefix_iface: 'pppoe-wan', iid: '::10' };
+      d.source = { kind: 'prefix_and_iid', prefix_iface: 'br-lan', iid: '::10' };
       d.firewall_allow_tcp_ports = [5001];
     }
     return d;
@@ -105,6 +163,7 @@
   function openDdnsDrawer(idx = -1, preset = 'wan') {
     ddnsEditIdx = idx;
     const d = idx >= 0 ? deepClone(settingsJson.ddns[idx]) : defaultDdns(preset);
+    ddnsOrigName = idx >= 0 ? d.name : '';
     ddnsDraft = d;
     ddnsSourceKind = d.source?.kind || 'interface';
     ddnsRecA = d.records?.includes('A') ?? true;
@@ -113,67 +172,106 @@
     ddnsTcpPortsCsv = joinCsv(d.firewall_allow_tcp_ports);
     ddnsUdpPortsCsv = joinCsv(d.firewall_allow_udp_ports);
     ddnsTokenInput = '';
+    ddnsTokenClear = false;
     ddnsHttpUrlInput = '';
+    ddnsHttpUrlClear = false;
     ddnsHttpBodyInput = '';
+    ddnsHttpBodyClear = false;
+    ddnsHttpHeadersTxt = kvObjectToText(d.custom_http?.headers);
     ddnsSrcUrlV4Input = '';
+    ddnsSrcUrlV4Clear = false;
     ddnsSrcUrlV6Input = '';
+    ddnsSrcUrlV6Clear = false;
     ddnsSrcExtractUrlInput = '';
+    ddnsSrcExtractUrlClear = false;
     ddnsDrawerOpen = true;
   }
 
   function onDdnsSourceKindChange() {
     if (ddnsSourceKind === 'interface') ddnsDraft.source = { kind: 'interface', name: 'pppoe-wan', preferred_subnet: '', index: 0 };
-    else if (ddnsSourceKind === 'prefix_and_iid') ddnsDraft.source = { kind: 'prefix_and_iid', prefix_iface: 'pppoe-wan', iid: '::10' };
-    else if (ddnsSourceKind === 'neighbor_mac') ddnsDraft.source = { kind: 'neighbor_mac', prefix_iface: 'pppoe-wan', mac: '00:11:32:aa:bb:cc' };
+    else if (ddnsSourceKind === 'prefix_and_iid') ddnsDraft.source = { kind: 'prefix_and_iid', prefix_iface: 'br-lan', iid: '::10' };
+    else if (ddnsSourceKind === 'neighbor_mac') ddnsDraft.source = { kind: 'neighbor_mac', prefix_iface: 'br-lan', mac: '00:11:32:aa:bb:cc' };
     else if (ddnsSourceKind === 'external_url') ddnsDraft.source = { kind: 'external_url', url_v4: '', url_v6: '' };
     else ddnsDraft.source = { kind: 'custom_http_extract', url: '' };
   }
 
   async function saveDdns(e) {
     e.preventDefault();
-    const orig = ddnsEditIdx >= 0 ? settingsJson.ddns[ddnsEditIdx] : null;
-    const recs = [];
-    if (ddnsRecA) recs.push('A');
-    if (ddnsRecAAAA) recs.push('AAAA');
-    ddnsDraft.records = recs;
-    ddnsDraft.split_dns_lan_ips = splitCsv(ddnsSplitCsv);
-    ddnsDraft.firewall_allow_tcp_ports = splitCsv(ddnsTcpPortsCsv).map(Number).filter(Boolean);
-    ddnsDraft.firewall_allow_udp_ports = splitCsv(ddnsUdpPortsCsv).map(Number).filter(Boolean);
-    ddnsDraft.ttl = Number(ddnsDraft.ttl || 300);
-    ddnsDraft.reconcile_interval_secs = Number(ddnsDraft.reconcile_interval_secs || 600);
-    ddnsDraft.token = resolveSecretInput(orig?.token, ddnsTokenInput);
-    ddnsDraft.custom_http.url = resolveSecretInput(orig?.custom_http?.url, ddnsHttpUrlInput);
-    ddnsDraft.custom_http.body = resolveSecretInput(orig?.custom_http?.body, ddnsHttpBodyInput);
+    if (saving) return;
+    saving = true;
+    try {
+      const orig = ddnsEditIdx >= 0 ? settingsJson.ddns[ddnsEditIdx] : null;
+      const recs = [];
+      if (ddnsRecA) recs.push('A');
+      if (ddnsRecAAAA) recs.push('AAAA');
+      ddnsDraft.records = recs;
+      ddnsDraft.split_dns_lan_ips = splitCsv(ddnsSplitCsv);
+      ddnsDraft.firewall_allow_tcp_ports = splitCsv(ddnsTcpPortsCsv).map(Number).filter((n) => n > 0);
+      ddnsDraft.firewall_allow_udp_ports = splitCsv(ddnsUdpPortsCsv).map(Number).filter((n) => n > 0);
+      ddnsDraft.ttl = Number(ddnsDraft.ttl || 300);
+      ddnsDraft.reconcile_interval_secs = Number(ddnsDraft.reconcile_interval_secs || 600);
+      if (ddnsDraft.source.kind === 'interface') {
+        ddnsDraft.source.index = Number(ddnsDraft.source.index || 0);
+      }
+      ddnsDraft.token = resolveSecretInput(orig?.token, ddnsTokenInput, ddnsTokenClear);
+      ddnsDraft.custom_http.url = resolveSecretInput(orig?.custom_http?.url, ddnsHttpUrlInput, ddnsHttpUrlClear);
+      ddnsDraft.custom_http.body = resolveSecretInput(orig?.custom_http?.body, ddnsHttpBodyInput, ddnsHttpBodyClear);
+      ddnsDraft.custom_http.headers = textToKvObject(ddnsHttpHeadersTxt, orig?.custom_http?.headers || {});
 
-    if (ddnsDraft.source.kind === 'external_url') {
-      const origSrc = orig?.source?.kind === 'external_url' ? orig.source : null;
-      ddnsDraft.source.url_v4 = resolveSecretInput(origSrc?.url_v4, ddnsSrcUrlV4Input);
-      ddnsDraft.source.url_v6 = resolveSecretInput(origSrc?.url_v6, ddnsSrcUrlV6Input);
-    } else if (ddnsDraft.source.kind === 'custom_http_extract') {
-      const origSrc = orig?.source?.kind === 'custom_http_extract' ? orig.source : null;
-      ddnsDraft.source.url = resolveSecretInput(origSrc?.url, ddnsSrcExtractUrlInput);
+      if (ddnsDraft.source.kind === 'external_url') {
+        const origSrc = orig?.source?.kind === 'external_url' ? orig.source : null;
+        ddnsDraft.source.url_v4 = resolveSecretInput(origSrc?.url_v4, ddnsSrcUrlV4Input, ddnsSrcUrlV4Clear);
+        ddnsDraft.source.url_v6 = resolveSecretInput(origSrc?.url_v6, ddnsSrcUrlV6Input, ddnsSrcUrlV6Clear);
+      } else if (ddnsDraft.source.kind === 'custom_http_extract') {
+        const origSrc = orig?.source?.kind === 'custom_http_extract' ? orig.source : null;
+        ddnsDraft.source.url = resolveSecretInput(origSrc?.url, ddnsSrcExtractUrlInput, ddnsSrcExtractUrlClear);
+      }
+
+      const next = deepClone(settingsJson);
+      const renames = [];
+      if (ddnsEditIdx >= 0) {
+        if (ddnsOrigName && ddnsOrigName !== ddnsDraft.name) {
+          renames.push({ from: `ddns.${ddnsOrigName}`, to: `ddns.${ddnsDraft.name}` });
+        }
+        next.ddns[ddnsEditIdx] = ddnsDraft;
+      } else {
+        next.ddns.push(ddnsDraft);
+      }
+      if (await onSaveSettings(next, renames)) ddnsDrawerOpen = false;
+    } finally {
+      saving = false;
     }
-
-    const next = deepClone(settingsJson);
-    if (ddnsEditIdx >= 0) next.ddns[ddnsEditIdx] = ddnsDraft;
-    else next.ddns.push(ddnsDraft);
-    if (await onSaveSettings(next)) ddnsDrawerOpen = false;
   }
 
-  async function deleteDdns(idx) {
+  async function toggleDdnsEnabled(idx) {
     const next = deepClone(settingsJson);
-    next.ddns.splice(idx, 1);
+    next.ddns[idx].enabled = !next.ddns[idx].enabled;
     await onSaveSettings(next);
+  }
+
+  function deleteDdns(idx) {
+    const d = settingsJson.ddns[idx];
+    askConfirm({
+      title: t.common.confirmDeleteTitle,
+      message: `${d.name} (${d.domain})`,
+      confirmLabel: t.delete,
+      danger: true,
+      onConfirm: async () => {
+        const next = deepClone(settingsJson);
+        next.ddns.splice(idx, 1);
+        await onSaveSettings(next);
+      },
+    });
   }
 
   async function triggerDdnsSync(name) {
     busyKey = `ddns:${name}`;
     try {
       const st = await apiFetch(`/api/ddns/${encodeURIComponent(name)}/sync`, { method: 'POST' });
-      showToast(`${name}: ${st.status}`);
+      showToast(`${name}: ${st.status}`, st.status === 'synced' ? 'success' : 'warn');
       await onRefresh();
     } catch (err) {
-      showToast(err.message);
+      showToast(err.message, 'error');
       await onRefresh();
     } finally {
       busyKey = '';
@@ -181,12 +279,17 @@
   }
 
   // ---------------- ACME Drawer ----------------
+  const PRESET_CA = new Set(['letsencrypt', 'letsencrypt_staging', 'zerossl', 'buypass', 'google']);
   let acmeDrawerOpen = $state(false);
   let acmeEditIdx = $state(-1);
+  let acmeOrigDomain = $state('');
   let acmeDraft = $state(null);
+  let acmeCaChoice = $state('letsencrypt');
   let acmeExtraCsv = $state('');
   let acmeEabKeyInput = $state('');
+  let acmeEabKeyClear = $state(false);
   let acmeCopyDir = $state('');
+  let acmeHookEdits = $state([]); // [{ kind: 'webhook', origIdx, urlOrig, urlInput, urlClear, include_private_key }]
 
   function openAcmeDrawer(idx = -1) {
     acmeEditIdx = idx;
@@ -209,48 +312,113 @@
           deploy_hooks: [],
           use_for_admin: false,
         };
+    acmeOrigDomain = idx >= 0 ? a.domain : '';
     acmeDraft = a;
+    acmeCaChoice = PRESET_CA.has(a.directory_url) ? a.directory_url : 'custom';
     acmeExtraCsv = joinCsv(a.extra_domains);
     acmeEabKeyInput = '';
+    acmeEabKeyClear = false;
     const copyHook = (a.deploy_hooks || []).find((h) => h.kind === 'copy_to_dir');
     acmeCopyDir = copyHook ? copyHook.dir : '';
+    acmeHookEdits = (a.deploy_hooks || [])
+      .map((h, i) => ({ h, i }))
+      .filter(({ h }) => h.kind === 'webhook')
+      .map(({ h, i }) => ({
+        origIdx: i,
+        urlOrig: h.url,
+        urlInput: '',
+        urlClear: false,
+        include_private_key: Boolean(h.include_private_key),
+      }));
     acmeDrawerOpen = true;
+  }
+
+  function addAcmeWebhook() {
+    acmeHookEdits = [
+      ...acmeHookEdits,
+      { origIdx: -1, urlOrig: '', urlInput: '', urlClear: false, include_private_key: false },
+    ];
+  }
+
+  function removeAcmeWebhook(idx) {
+    acmeHookEdits = acmeHookEdits.filter((_, i) => i !== idx);
   }
 
   async function saveAcme(e) {
     e.preventDefault();
-    const orig = acmeEditIdx >= 0 ? settingsJson.acme[acmeEditIdx] : null;
-    acmeDraft.extra_domains = splitCsv(acmeExtraCsv);
-    acmeDraft.renew_before_days = Number(acmeDraft.renew_before_days || 30);
-    acmeDraft.propagation_timeout_secs = Number(acmeDraft.propagation_timeout_secs || 180);
-    acmeDraft.eab_hmac_key = resolveSecretInput(orig?.eab_hmac_key, acmeEabKeyInput);
-    const keepWebhooks = (acmeDraft.deploy_hooks || []).filter((h) => h.kind === 'webhook');
-    if (acmeCopyDir.trim()) {
-      acmeDraft.deploy_hooks = [{ kind: 'copy_to_dir', dir: acmeCopyDir.trim() }, ...keepWebhooks];
-    } else {
-      acmeDraft.deploy_hooks = keepWebhooks;
-    }
+    if (saving) return;
+    saving = true;
+    try {
+      const orig = acmeEditIdx >= 0 ? settingsJson.acme[acmeEditIdx] : null;
+      acmeDraft.extra_domains = splitCsv(acmeExtraCsv);
+      acmeDraft.renew_before_days = Number(acmeDraft.renew_before_days || 30);
+      acmeDraft.propagation_timeout_secs = Number(acmeDraft.propagation_timeout_secs || 180);
+      acmeDraft.eab_hmac_key = resolveSecretInput(orig?.eab_hmac_key, acmeEabKeyInput, acmeEabKeyClear);
 
-    const next = deepClone(settingsJson);
-    if (acmeEditIdx >= 0) next.acme[acmeEditIdx] = acmeDraft;
-    else next.acme.push(acmeDraft);
-    if (await onSaveSettings(next)) acmeDrawerOpen = false;
+      const renames = [];
+      if (acmeEditIdx >= 0 && acmeOrigDomain && acmeOrigDomain !== acmeDraft.domain) {
+        renames.push({ from: `acme.${acmeOrigDomain}`, to: `acme.${acmeDraft.domain}` });
+      }
+      const oldDomainPrefix = `acme.${acmeOrigDomain || acmeDraft.domain}`;
+      const newDomainPrefix = `acme.${acmeDraft.domain}`;
+
+      // 构建 deploy_hooks 并追踪 webhook 下标，防止新增/删除 copy_to_dir 移位丢失密文
+      const builtHooks = acmeHookEdits.map((wh, newIdx) => {
+        if (wh.origIdx >= 0 && wh.origIdx !== newIdx && acmeEditIdx >= 0) {
+          renames.push({
+            from: `${oldDomainPrefix}.deploy_hooks.${wh.origIdx}.url`,
+            to: `${newDomainPrefix}.deploy_hooks.${newIdx}.url`,
+          });
+        }
+        return {
+          kind: 'webhook',
+          url: resolveSecretInput(wh.urlOrig, wh.urlInput, wh.urlClear),
+          include_private_key: wh.include_private_key,
+        };
+      });
+      if (acmeCopyDir.trim()) {
+        builtHooks.push({ kind: 'copy_to_dir', dir: acmeCopyDir.trim() });
+      }
+      acmeDraft.deploy_hooks = builtHooks;
+
+      const next = deepClone(settingsJson);
+      if (acmeEditIdx >= 0) next.acme[acmeEditIdx] = acmeDraft;
+      else next.acme.push(acmeDraft);
+      if (await onSaveSettings(next, renames)) acmeDrawerOpen = false;
+    } finally {
+      saving = false;
+    }
   }
 
-  async function deleteAcme(idx) {
+  async function toggleAcmeEnabled(idx) {
     const next = deepClone(settingsJson);
-    next.acme.splice(idx, 1);
+    next.acme[idx].enabled = !next.acme[idx].enabled;
     await onSaveSettings(next);
+  }
+
+  function deleteAcme(idx) {
+    const a = settingsJson.acme[idx];
+    askConfirm({
+      title: t.common.confirmDeleteTitle,
+      message: a.domain,
+      confirmLabel: t.delete,
+      danger: true,
+      onConfirm: async () => {
+        const next = deepClone(settingsJson);
+        next.acme.splice(idx, 1);
+        await onSaveSettings(next);
+      },
+    });
   }
 
   async function triggerAcmeIssue(domain) {
     busyKey = `acme:${domain}`;
     try {
       const st = await apiFetch(`/api/acme/${encodeURIComponent(domain)}/issue`, { method: 'POST' });
-      showToast(`${domain}: ${st.status}`);
+      showToast(`${domain}: ${st.status}`, st.status === 'active' ? 'success' : 'warn');
       await onRefresh();
     } catch (err) {
-      showToast(err.message);
+      showToast(err.message, 'error');
       await onRefresh();
     } finally {
       busyKey = '';
@@ -260,12 +428,15 @@
   // ---------------- STUN Drawer ----------------
   let stunDrawerOpen = $state(false);
   let stunEditIdx = $state(-1);
+  let stunOrigName = $state('');
   let stunDraft = $state(null);
   let stunServersCsv = $state('');
   let stunWebhookInput = $state('');
+  let stunWebhookClear = $state(false);
   let stunCfEnabled = $state(false);
   let stunCfDraft = $state(null);
   let stunCfTokenInput = $state('');
+  let stunCfTokenClear = $state(false);
 
   function openStunDrawer(idx = -1) {
     stunEditIdx = idx;
@@ -283,10 +454,12 @@
           bind_rule: '',
           on_change_cloudflare_redirect: null,
         };
+    stunOrigName = idx >= 0 ? s.name : '';
     stunDraft = s;
     const allSrvs = s.stun_servers?.length ? s.stun_servers : s.stun_server ? [s.stun_server] : [];
     stunServersCsv = joinCsv(allSrvs);
     stunWebhookInput = '';
+    stunWebhookClear = false;
     stunCfEnabled = Boolean(s.on_change_cloudflare_redirect);
     stunCfDraft = s.on_change_cloudflare_redirect || {
       zone_id: '',
@@ -298,71 +471,131 @@
       status_code: 302,
     };
     stunCfTokenInput = '';
+    stunCfTokenClear = false;
     stunDrawerOpen = true;
   }
 
   async function saveStun(e) {
     e.preventDefault();
-    const orig = stunEditIdx >= 0 ? settingsJson.stun[stunEditIdx] : null;
-    const srvs = splitCsv(stunServersCsv);
-    stunDraft.stun_servers = srvs;
-    stunDraft.stun_server = srvs[0] || '';
-    stunDraft.local_port = Number(stunDraft.local_port || 0);
-    stunDraft.keepalive_secs = Number(stunDraft.keepalive_secs || 25);
-    stunDraft.webhook_url = resolveSecretInput(orig?.webhook_url, stunWebhookInput);
+    if (saving) return;
+    saving = true;
+    try {
+      const orig = stunEditIdx >= 0 ? settingsJson.stun[stunEditIdx] : null;
+      const srvs = splitCsv(stunServersCsv);
+      stunDraft.stun_servers = srvs;
+      stunDraft.stun_server = srvs[0] || '';
+      stunDraft.local_port = Number(stunDraft.local_port || 0);
+      stunDraft.keepalive_secs = Number(stunDraft.keepalive_secs || 25);
+      stunDraft.webhook_url = resolveSecretInput(orig?.webhook_url, stunWebhookInput, stunWebhookClear);
 
-    if (stunCfEnabled) {
-      stunCfDraft.status_code = Number(stunCfDraft.status_code || 302);
-      stunCfDraft.api_token = resolveSecretInput(orig?.on_change_cloudflare_redirect?.api_token, stunCfTokenInput);
-      stunDraft.on_change_cloudflare_redirect = stunCfDraft;
-    } else {
-      stunDraft.on_change_cloudflare_redirect = null;
+      if (stunCfEnabled) {
+        stunCfDraft.status_code = Number(stunCfDraft.status_code || 302);
+        stunCfDraft.api_token = resolveSecretInput(
+          orig?.on_change_cloudflare_redirect?.api_token,
+          stunCfTokenInput,
+          stunCfTokenClear
+        );
+        stunDraft.on_change_cloudflare_redirect = stunCfDraft;
+      } else {
+        stunDraft.on_change_cloudflare_redirect = null;
+      }
+
+      const next = deepClone(settingsJson);
+      const renames = [];
+      if (stunEditIdx >= 0) {
+        if (stunOrigName && stunOrigName !== stunDraft.name) {
+          renames.push({ from: `stun.${stunOrigName}`, to: `stun.${stunDraft.name}` });
+        }
+        next.stun[stunEditIdx] = stunDraft;
+      } else {
+        next.stun.push(stunDraft);
+      }
+      if (await onSaveSettings(next, renames)) stunDrawerOpen = false;
+    } finally {
+      saving = false;
     }
-
-    const next = deepClone(settingsJson);
-    if (stunEditIdx >= 0) next.stun[stunEditIdx] = stunDraft;
-    else next.stun.push(stunDraft);
-    if (await onSaveSettings(next)) stunDrawerOpen = false;
   }
 
-  async function deleteStun(idx) {
+  async function toggleStunEnabled(idx) {
     const next = deepClone(settingsJson);
-    next.stun.splice(idx, 1);
+    next.stun[idx].enabled = !next.stun[idx].enabled;
     await onSaveSettings(next);
+  }
+
+  function deleteStun(idx) {
+    const s = settingsJson.stun[idx];
+    askConfirm({
+      title: t.common.confirmDeleteTitle,
+      message: s.name,
+      confirmLabel: t.delete,
+      danger: true,
+      onConfirm: async () => {
+        const next = deepClone(settingsJson);
+        next.stun.splice(idx, 1);
+        await onSaveSettings(next);
+      },
+    });
   }
 
   async function triggerStunProbe(name) {
     busyKey = `stun:${name}`;
     try {
       const r = await apiFetch(`/api/stun/${encodeURIComponent(name)}/probe`, { method: 'POST' });
-      showToast(`${name} -> ${r.public_addr}`);
+      showToast(`${name} → ${r.public_addr}`, 'success');
       await onRefresh();
     } catch (err) {
-      showToast(err.message);
+      showToast(err.message, 'error');
       await onRefresh();
     } finally {
       busyKey = '';
     }
   }
+
+  let filteredDdns = $derived(
+    (settingsJson?.ddns || [])
+      .map((d, idx) => ({ d, idx }))
+      .filter(({ d }) => !searchQuery.trim() || `${d.name} ${d.domain} ${d.provider}`.toLowerCase().includes(searchQuery.trim().toLowerCase()))
+  );
 </script>
 
-<!-- ===================== DDNS & DNS 服务商账号 ===================== -->
-{#if settingsJson && mode === 'ddns'}
+<svelte:window
+  onkeydown={(e) => {
+    if (e.key === 'Escape') {
+      if (provDrawerOpen) provDrawerOpen = false;
+      else if (ddnsDrawerOpen) ddnsDrawerOpen = false;
+      else if (acmeDrawerOpen) acmeDrawerOpen = false;
+      else if (stunDrawerOpen) stunDrawerOpen = false;
+    }
+  }}
+/>
+
+<datalist id="ddns-iface-list">
+  {#each ifaceNames as name}
+    <option value={name}></option>
+  {/each}
+</datalist>
+<datalist id="ddns-mac-list">
+  {#each neighborEntries as nb}
+    <option value={nb.mac}>{nb.iface} · {nb.ip}</option>
+  {/each}
+</datalist>
+
+<!-- ===================== DNS 云服务商凭据池（DDNS 与 ACME 页面共享展示） ===================== -->
+{#if settingsJson && (mode === 'ddns' || mode === 'acme')}
   <div class="card" style="margin-bottom:16px;">
     <div class="card-header">
       <div>
-        <div class="card-title">{lang === 'en' ? 'DNS Cloud Provider Accounts' : 'DNS 云服务商凭据池（供 DDNS 与 ACME 共用）'}</div>
-        <div style="font-size:12px;color:var(--text-secondary);">Cloudflare / Aliyun DNS / DNSPod · ChaCha20-Poly1305 Vault Sealed</div>
+        <div class="card-title">{t.dns.poolTitle}</div>
+        <div style="font-size:12px;color:var(--text-secondary);">{t.dns.poolDesc}</div>
       </div>
       <button type="button" class="btn btn-sm" onclick={() => openProviderDrawer('')}>
-        + {lang === 'en' ? 'Add DNS Account' : '添加服务商账号'}
+        <Icons name="plus" size={14} />
+        <span>{t.dns.addAccount}</span>
       </button>
     </div>
 
     {#if !Object.keys(settingsJson.dns_providers || {}).length}
-      <div class="empty-state" style="padding:18px;">
-        {lang === 'en' ? 'Add a Cloudflare / Aliyun / DNSPod account first (or use custom_http in DDNS).' : '尚未配置云解析账号（可添加 Cloudflare / 阿里云 / DNSPod 供 DDNS 与 ACME 证书签发复用）'}
-      </div>
+      <div class="empty-state" style="padding:18px;">{t.dns.emptyPool}</div>
     {:else}
       <div class="bento-grid" style="margin-bottom:0;">
         {#each Object.entries(settingsJson.dns_providers) as [id, p]}
@@ -382,42 +615,52 @@
       </div>
     {/if}
   </div>
+{/if}
 
+<!-- ===================== DDNS ===================== -->
+{#if settingsJson && mode === 'ddns'}
   <div class="card">
     <div class="card-header">
       <div>
         <div class="card-title">{t.nav.ddns}</div>
-        <div style="font-size:12px;color:var(--text-secondary);">
-          {lang === 'en'
-            ? 'Event-driven IPv4/IPv6 sync, CGNAT/deprecated filtering, /128 sub-device synthesis & Split-DNS.'
-            : 'Netlink 事件驱动 + CGNAT/过期前缀自动剔除 + 内网子设备 /128 精准放行与内网回流'}
-        </div>
+        <div style="font-size:12px;color:var(--text-secondary);">{t.ddns.subtitle}</div>
       </div>
       <div class="btn-group">
-        <button type="button" class="btn btn-xs" onclick={() => openDdnsDrawer(-1, 'subdevice_v6')}>
-          + {lang === 'en' ? 'Sub-Device IPv6 /128' : '子设备 IPv6 直连预设'}
+        <button type="button" class="btn btn-xs" onclick={() => openDdnsDrawer(-1, 'subdevice_v6')}>+ {t.ddns.presetSubdevice}</button>
+        <button type="button" class="btn btn-primary btn-sm" onclick={() => openDdnsDrawer(-1, 'wan')}>
+          <Icons name="plus" size={14} />
+          <span>{t.add}</span>
         </button>
-        <button type="button" class="btn btn-primary btn-sm" onclick={() => openDdnsDrawer(-1, 'wan')}>+ {t.add}</button>
       </div>
     </div>
 
+    {#if settingsJson.ddns?.length}
+      <div class="toolbar">
+        <div class="search-wrap">
+          <span class="search-icon"><Icons name="search" size={15} /></span>
+          <input type="text" placeholder={t.search} bind:value={searchQuery} />
+        </div>
+      </div>
+    {/if}
+
     {#if !settingsJson.ddns?.length}
       <div class="empty-state">{t.common.empty}</div>
+    {:else if !filteredDdns.length}
+      <div class="empty-state">{t.common.noMatches}</div>
     {:else}
       <div style="display:grid;gap:12px;">
-        {#each settingsJson.ddns as d, idx}
+        {#each filteredDdns as { d, idx }}
           {@const rt = (dashboard?.ddns || []).find((x) => x.name === d.name)}
           <div class="subcard">
             <div class="row-between">
-              <div>
+              <div style="min-width:0;flex:1;">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <span class="status-dot {d.enabled ? (rt?.status === 'failed' ? 'danger' : rt?.status === 'synced' ? 'ok' : 'warn') : 'muted'}"></span>
                   <span style="font-weight:700;font-size:15px;" class="mono">{d.domain}</span>
                   <span class="badge badge-muted">{d.name}</span>
                   <span class="badge badge-info">{d.provider} ({d.records.join('+')})</span>
                   {#if rt}
-                    <span class="badge {rt.status === 'synced' ? 'badge-ok' : rt.status === 'failed' ? 'badge-danger' : 'badge-warn'}">
-                      {rt.status}
-                    </span>
+                    <span class="badge {rt.status === 'synced' ? 'badge-ok' : rt.status === 'failed' ? 'badge-danger' : 'badge-warn'}">{rt.status}</span>
                   {/if}
                 </div>
                 <div class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:6px;">
@@ -426,6 +669,11 @@
                   {#if rt?.last_ipv6} · AAAA={rt.last_ipv6}{/if}
                   {#if rt?.last_sync_unix} · Synced {formatUnixTime(rt.last_sync_unix)}{/if}
                 </div>
+                {#if d.split_dns_lan_ips?.length}
+                  <div class="mono" style="font-size:11px;color:var(--info);margin-top:4px;">
+                    Split-DNS: {d.split_dns_lan_ips.join(', ')}
+                  </div>
+                {/if}
                 {#if rt?.ipv4?.error || rt?.ipv6?.error || rt?.firewall_error}
                   <div class="mono" style="font-size:11px;color:var(--danger);margin-top:4px;">
                     {rt.ipv4?.error || rt.ipv6?.error || rt.firewall_error}
@@ -433,8 +681,18 @@
                 {/if}
               </div>
               <div class="btn-group">
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={d.enabled}
+                  aria-label="Toggle DDNS rule"
+                  class="switch"
+                  onclick={() => toggleDdnsEnabled(idx)}
+                >
+                  <span class="switch-thumb"></span>
+                </button>
                 <button type="button" class="btn btn-xs btn-primary" disabled={busyKey === `ddns:${d.name}`} onclick={() => triggerDdnsSync(d.name)}>
-                  {busyKey === `ddns:${d.name}` ? '...' : (lang === 'en' ? 'Sync Now' : '立即同步')}
+                  {busyKey === `ddns:${d.name}` ? '...' : t.ddns.syncNow}
                 </button>
                 <button type="button" class="btn btn-xs" onclick={() => openDdnsDrawer(idx)}>{t.edit}</button>
                 <button type="button" class="btn btn-xs btn-danger" onclick={() => deleteDdns(idx)}>{t.delete}</button>
@@ -453,13 +711,12 @@
     <div class="card-header">
       <div>
         <div class="card-title">{t.nav.acme}</div>
-        <div style="font-size:12px;color:var(--text-secondary);">
-          {lang === 'en'
-            ? 'RFC 8555 DNS-01 ECDSA P-256 issuance, CNAME alias delegation, ArcSwap hot-reload & deploy hooks.'
-            : 'RFC 8555 DNS-01 自动签发与续期、CNAME 挑战委派、ArcSwap 零中断热加载与自动部署钩子'}
-        </div>
+        <div style="font-size:12px;color:var(--text-secondary);">{t.acme.subtitle}</div>
       </div>
-      <button type="button" class="btn btn-primary btn-sm" onclick={() => openAcmeDrawer(-1)}>+ {t.add}</button>
+      <button type="button" class="btn btn-primary btn-sm" onclick={() => openAcmeDrawer(-1)}>
+        <Icons name="plus" size={14} />
+        <span>{t.add}</span>
+      </button>
     </div>
 
     {#if !settingsJson.acme?.length}
@@ -470,29 +727,40 @@
           {@const st = (dashboard?.certs || []).find((c) => c.domain === a.domain)}
           <div class="subcard">
             <div class="row-between">
-              <div>
+              <div style="min-width:0;flex:1;">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <span class="status-dot {a.enabled ? (st?.status === 'active' ? 'ok' : st?.status === 'failed' ? 'danger' : 'warn') : 'muted'}"></span>
                   <span style="font-weight:700;font-size:15px;" class="mono">{a.domain}</span>
                   {#if a.extra_domains?.length}
                     <span class="badge badge-muted mono">+{a.extra_domains.length} SAN</span>
                   {/if}
                   <span class="badge badge-info">{a.directory_url}</span>
-                  {#if a.use_for_admin}<span class="badge badge-warn">Admin Panel Cert</span>{/if}
+                  {#if a.use_for_admin}<span class="badge badge-warn">Admin Panel</span>{/if}
                   {#if st}
                     <span class="badge {st.status === 'active' ? 'badge-ok' : 'badge-danger'}">{st.status}</span>
                   {/if}
                 </div>
                 <div class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:6px;">
                   DNS: {a.dns_provider} · Renew &lt; {a.renew_before_days}d
-                  {#if st?.expires_at_unix} · Expires: {formatUnixTime(st.expires_at_unix)}{/if}
+                  {#if st?.expires_at_unix} · {t.dash.expires}: {formatUnixTime(st.expires_at_unix)}{/if}
                 </div>
                 {#if st?.last_error}
                   <div class="mono" style="font-size:11px;color:var(--danger);margin-top:4px;">{st.last_error}</div>
                 {/if}
               </div>
               <div class="btn-group">
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={a.enabled}
+                  aria-label="Toggle ACME rule"
+                  class="switch"
+                  onclick={() => toggleAcmeEnabled(idx)}
+                >
+                  <span class="switch-thumb"></span>
+                </button>
                 <button type="button" class="btn btn-xs btn-primary" disabled={busyKey === `acme:${a.domain}`} onclick={() => triggerAcmeIssue(a.domain)}>
-                  {busyKey === `acme:${a.domain}` ? '...' : (lang === 'en' ? 'Issue / Renew' : '立即签发/续期')}
+                  {busyKey === `acme:${a.domain}` ? '...' : t.acme.issueNow}
                 </button>
                 <button type="button" class="btn btn-xs" onclick={() => openAcmeDrawer(idx)}>{t.edit}</button>
                 <button type="button" class="btn btn-xs btn-danger" onclick={() => deleteAcme(idx)}>{t.delete}</button>
@@ -511,13 +779,12 @@
     <div class="card-header">
       <div>
         <div class="card-title">{t.nav.stun}</div>
-        <div style="font-size:12px;color:var(--text-secondary);">
-          {lang === 'en'
-            ? 'Persistent SO_REUSEPORT UDP/TCP NAT mapping keepalive with Webhook & Cloudflare Redirect Ruleset sync.'
-            : '同端口持久持有 NAT1 公网映射，端口变化自动同步 Cloudflare Redirect 固定域名跳转与通知'}
-        </div>
+        <div style="font-size:12px;color:var(--text-secondary);">{t.stun.subtitle}</div>
       </div>
-      <button type="button" class="btn btn-primary btn-sm" onclick={() => openStunDrawer(-1)}>+ {t.add}</button>
+      <button type="button" class="btn btn-primary btn-sm" onclick={() => openStunDrawer(-1)}>
+        <Icons name="plus" size={14} />
+        <span>{t.add}</span>
+      </button>
     </div>
 
     {#if !settingsJson.stun?.length}
@@ -529,8 +796,9 @@
           {@const pubAddr = st?.public_addr || dashboard?.stun_public_addrs?.[s.name] || ''}
           <div class="subcard">
             <div class="row-between">
-              <div>
+              <div style="min-width:0;flex:1;">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <span class="status-dot {s.enabled ? (st?.status === 'active' ? 'ok' : st?.status === 'error' ? 'danger' : 'warn') : 'muted'}"></span>
                   <span style="font-weight:700;font-size:15px;">{s.name}</span>
                   <span class="badge badge-info mono">{s.proto.toUpperCase()} :{s.local_port || 'auto'}</span>
                   {#if s.bind_rule}<span class="badge badge-muted">Bind: {s.bind_rule}</span>{/if}
@@ -545,13 +813,23 @@
                 {/if}
               </div>
               <div class="btn-group">
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={s.enabled}
+                  aria-label="Toggle STUN rule"
+                  class="switch"
+                  onclick={() => toggleStunEnabled(idx)}
+                >
+                  <span class="switch-thumb"></span>
+                </button>
                 {#if pubAddr}
-                  <button type="button" class="btn btn-xs" onclick={async () => { if (await copyText(pubAddr)) showToast(t.copied); }}>
+                  <button type="button" class="btn btn-xs" onclick={async () => { if (await copyText(pubAddr)) showToast(t.copied, 'success'); }}>
                     {t.copy}
                   </button>
                 {/if}
                 <button type="button" class="btn btn-xs btn-primary" disabled={busyKey === `stun:${s.name}`} onclick={() => triggerStunProbe(s.name)}>
-                  {busyKey === `stun:${s.name}` ? '...' : (lang === 'en' ? 'Probe Now' : '立即探测')}
+                  {busyKey === `stun:${s.name}` ? '...' : t.stun.probeNow}
                 </button>
                 <button type="button" class="btn btn-xs" onclick={() => openStunDrawer(idx)}>{t.edit}</button>
                 <button type="button" class="btn btn-xs btn-danger" onclick={() => deleteStun(idx)}>{t.delete}</button>
@@ -575,11 +853,11 @@
       <div class="drawer-body">
         <div class="form-grid">
           <div class="field">
-            <label for="dp-id">Account ID</label>
+            <label for="dp-id">{t.dns.accountId}</label>
             <input id="dp-id" type="text" class="mono" bind:value={provDraftId} required />
           </div>
           <div class="field">
-            <label for="dp-kind">Provider</label>
+            <label for="dp-kind">{t.dns.provider}</label>
             <select id="dp-kind" bind:value={provDraft.provider}>
               <option value="cloudflare">cloudflare</option>
               <option value="aliyun">aliyun</option>
@@ -587,43 +865,44 @@
             </select>
           </div>
         </div>
-        <div class="field">
-          <label for="dp-tok">API Token / AccessKeyId / SecretId</label>
-          <input
-            id="dp-tok"
-            type="password"
-            class="mono"
-            placeholder={isSecretConfigured(provDraft.api_token) ? secretMaskedHint(provDraft.api_token) : 'Paste API token'}
-            bind:value={provTokenInput}
-          />
-          <div class="field-hint">{isSecretConfigured(provDraft.api_token) ? t.common.secretConfigured : t.common.secretEmpty}</div>
-        </div>
+        <SecretField
+          id="dp-tok"
+          label={t.dns.apiToken}
+          original={provDraft.api_token}
+          bind:value={provTokenInput}
+          bind:clear={provTokenClear}
+          placeholder="Paste API token"
+          {t}
+        />
         {#if provDraft.provider !== 'cloudflare'}
-          <div class="field">
-            <label for="dp-sec">AccessKeySecret / SecretKey</label>
-            <input
-              id="dp-sec"
-              type="password"
-              class="mono"
-              placeholder={isSecretConfigured(provDraft.secret_key) ? secretMaskedHint(provDraft.secret_key) : 'Paste secret key'}
-              bind:value={provSecretInput}
-            />
-          </div>
+          <SecretField
+            id="dp-sec"
+            label={t.dns.secretKey}
+            original={provDraft.secret_key}
+            bind:value={provSecretInput}
+            bind:clear={provSecretClear}
+            placeholder="Paste secret key"
+            {t}
+          />
         {/if}
         <div class="form-grid">
           <div class="field">
-            <label for="dp-zn">Optional Zone Name (e.g. example.com)</label>
+            <label for="dp-zn">{t.dns.zoneName}</label>
             <input id="dp-zn" type="text" class="mono" bind:value={provDraft.zone_name} />
           </div>
           <div class="field">
-            <label for="dp-zid">Optional Cloudflare Zone ID</label>
+            <label for="dp-zid">{t.dns.zoneId}</label>
             <input id="dp-zid" type="text" class="mono" bind:value={provDraft.zone_id} />
+          </div>
+          <div class="field">
+            <label for="dp-he">{t.dns.happyDelay}</label>
+            <input id="dp-he" type="number" min="100" max="2000" bind:value={provDraft.happy_eyeballs_delay_ms} />
           </div>
         </div>
       </div>
       <div class="drawer-footer">
         <button type="button" class="btn" onclick={() => provDrawerOpen = false}>{t.cancel}</button>
-        <button type="submit" class="btn btn-primary">{t.confirm}</button>
+        <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
       </div>
     </form>
   </div>
@@ -634,35 +913,35 @@
   <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) ddnsDrawerOpen = false; }}>
     <form class="drawer-panel" onsubmit={saveDdns}>
       <div class="drawer-header">
-        <div class="card-title">{ddnsEditIdx >= 0 ? t.edit : t.add} · DDNS</div>
+        <div class="card-title">{ddnsEditIdx >= 0 ? t.edit : t.add} · {t.nav.ddns}</div>
         <button type="button" class="btn btn-sm" onclick={() => ddnsDrawerOpen = false}>{t.cancel}</button>
       </div>
       <div class="drawer-body">
         <div class="form-grid">
           <div class="field">
-            <label for="dd-name">Rule Name</label>
+            <label for="dd-name">{t.ddns.ruleName}</label>
             <input id="dd-name" type="text" class="mono" bind:value={ddnsDraft.name} required />
           </div>
           <div class="field">
-            <label for="dd-dom">Domain (FQDN)</label>
+            <label for="dd-dom">{t.ddns.domain}</label>
             <input id="dd-dom" type="text" class="mono" placeholder="home.example.com" bind:value={ddnsDraft.domain} required />
           </div>
           <div class="field">
-            <label for="dd-prov">DNS Provider Account</label>
+            <label for="dd-prov">{t.ddns.providerAccount}</label>
             <select id="dd-prov" bind:value={ddnsDraft.provider}>
               {#each Object.keys(settingsJson.dns_providers || {}) as pid}
                 <option value={pid}>{pid}</option>
               {/each}
-              <option value="custom_http">custom_http (Template)</option>
+              <option value="custom_http">custom_http</option>
             </select>
           </div>
           <div class="field">
-            <label for="dd-src">IP Source Mode</label>
+            <label for="dd-src">{t.ddns.sourceMode}</label>
             <select id="dd-src" bind:value={ddnsSourceKind} onchange={onDdnsSourceKindChange}>
-              <option value="interface">interface (Router WAN)</option>
-              <option value="prefix_and_iid">prefix_and_iid (PD Prefix + Fixed IID)</option>
-              <option value="neighbor_mac">neighbor_mac (LAN NDP MAC Discovery)</option>
-              <option value="external_url">external_url (Public IP API)</option>
+              <option value="interface">interface (WAN)</option>
+              <option value="prefix_and_iid">prefix_and_iid (PD + IID)</option>
+              <option value="neighbor_mac">neighbor_mac (LAN NDP)</option>
+              <option value="external_url">external_url</option>
               <option value="custom_http_extract">custom_http_extract</option>
             </select>
           </div>
@@ -671,96 +950,205 @@
         {#if ddnsDraft.source.kind === 'interface'}
           <div class="form-grid">
             <div class="field">
-              <label for="dd-if">WAN Interface</label>
-              <input id="dd-if" type="text" class="mono" bind:value={ddnsDraft.source.name} required />
+              <label for="dd-if">{t.ddns.wanIface}</label>
+              <input id="dd-if" type="text" class="mono" list="ddns-iface-list" bind:value={ddnsDraft.source.name} required />
             </div>
             <div class="field">
-              <label for="dd-sub">Preferred Subnet CIDR (optional)</label>
+              <label for="dd-sub">{t.ddns.prefSubnet}</label>
               <input id="dd-sub" type="text" class="mono" bind:value={ddnsDraft.source.preferred_subnet} />
+            </div>
+            <div class="field">
+              <label for="dd-idx">{t.ddns.addrIndex}</label>
+              <input id="dd-idx" type="number" min="0" max="16" bind:value={ddnsDraft.source.index} />
             </div>
           </div>
         {:else if ddnsDraft.source.kind === 'prefix_and_iid'}
           <div class="form-grid">
             <div class="field">
-              <label for="dd-pif">PD Prefix Interface</label>
-              <input id="dd-pif" type="text" class="mono" bind:value={ddnsDraft.source.prefix_iface} required />
+              <label for="dd-pif">{t.ddns.prefixIface}</label>
+              <input id="dd-pif" type="text" class="mono" list="ddns-iface-list" bind:value={ddnsDraft.source.prefix_iface} required />
             </div>
             <div class="field">
-              <label for="dd-iid">Fixed IPv6 IID Suffix (e.g. ::10)</label>
+              <label for="dd-iid">{t.ddns.fixedIid}</label>
               <input id="dd-iid" type="text" class="mono" bind:value={ddnsDraft.source.iid} required />
             </div>
           </div>
         {:else if ddnsDraft.source.kind === 'neighbor_mac'}
           <div class="form-grid">
             <div class="field">
-              <label for="dd-nif">PD Prefix Interface</label>
-              <input id="dd-nif" type="text" class="mono" bind:value={ddnsDraft.source.prefix_iface} required />
+              <label for="dd-nif">{t.ddns.prefixIface}</label>
+              <input id="dd-nif" type="text" class="mono" list="ddns-iface-list" bind:value={ddnsDraft.source.prefix_iface} required />
             </div>
             <div class="field">
-              <label for="dd-mac">Target LAN Device MAC</label>
-              <input id="dd-mac" type="text" class="mono" placeholder="00:11:32:aa:bb:cc" bind:value={ddnsDraft.source.mac} required />
+              <label for="dd-mac">{t.ddns.targetMac}</label>
+              <input id="dd-mac" type="text" class="mono" list="ddns-mac-list" placeholder="00:11:32:aa:bb:cc" bind:value={ddnsDraft.source.mac} required />
             </div>
           </div>
         {:else if ddnsDraft.source.kind === 'external_url'}
           <div class="form-grid">
-            <div class="field">
-              <label for="dd-uv4">IPv4 Check URL</label>
-              <input id="dd-uv4" type="text" class="mono" placeholder="https://4.ipw.cn" bind:value={ddnsSrcUrlV4Input} />
-            </div>
-            <div class="field">
-              <label for="dd-uv6">IPv6 Check URL</label>
-              <input id="dd-uv6" type="text" class="mono" placeholder="https://6.ipw.cn" bind:value={ddnsSrcUrlV6Input} />
-            </div>
+            <SecretField
+              id="dd-uv4"
+              label={t.ddns.extUrlV4}
+              original={ddnsDraft.source.url_v4}
+              bind:value={ddnsSrcUrlV4Input}
+              bind:clear={ddnsSrcUrlV4Clear}
+              placeholder="https://4.ipw.cn"
+              {t}
+            />
+            <SecretField
+              id="dd-uv6"
+              label={t.ddns.extUrlV6}
+              original={ddnsDraft.source.url_v6}
+              bind:value={ddnsSrcUrlV6Input}
+              bind:clear={ddnsSrcUrlV6Clear}
+              placeholder="https://6.ipw.cn"
+              {t}
+            />
           </div>
         {:else}
-          <div class="field">
-            <label for="dd-uex">Extract URL</label>
-            <input id="dd-uex" type="text" class="mono" bind:value={ddnsSrcExtractUrlInput} />
-          </div>
+          <SecretField
+            id="dd-uex"
+            label={t.ddns.extractUrl}
+            original={ddnsDraft.source.url}
+            bind:value={ddnsSrcExtractUrlInput}
+            bind:clear={ddnsSrcExtractUrlClear}
+            placeholder="https://..."
+            {t}
+          />
         {/if}
 
         {#if ddnsDraft.provider === 'custom_http'}
-          <div class="form-grid">
-            <div class="field">
-              <label for="dd-chm">HTTP Method</label>
-              <select id="dd-chm" bind:value={ddnsDraft.custom_http.method}>
-                <option value="GET">GET</option>
-                <option value="POST">POST</option>
-                <option value="PUT">PUT</option>
-              </select>
+          <div class="subcard" style="margin-bottom:12px;">
+            <div class="form-grid">
+              <div class="field">
+                <label for="dd-chm">{t.ddns.httpMethod}</label>
+                <select id="dd-chm" bind:value={ddnsDraft.custom_http.method}>
+                  <option value="GET">GET</option>
+                  <option value="POST">POST</option>
+                  <option value="PUT">PUT</option>
+                </select>
+              </div>
+              <SecretField
+                id="dd-tok"
+                label={t.ddns.httpToken}
+                original={ddnsDraft.token}
+                bind:value={ddnsTokenInput}
+                bind:clear={ddnsTokenClear}
+                placeholder="Optional"
+                {t}
+              />
             </div>
-            <div class="field">
-              <label for="dd-tok">Template {'{{token}}'}</label>
-              <input id="dd-tok" type="password" class="mono" placeholder={secretMaskedHint(ddnsDraft.token, 'Optional token')} bind:value={ddnsTokenInput} />
+            <SecretField
+              id="dd-chu"
+              label={t.ddns.httpUrl}
+              original={ddnsDraft.custom_http?.url}
+              bind:value={ddnsHttpUrlInput}
+              bind:clear={ddnsHttpUrlClear}
+              placeholder="https://..."
+              {t}
+            />
+            <div class="form-grid">
+              <SecretField
+                id="dd-chb"
+                label={t.ddns.httpBody}
+                original={ddnsDraft.custom_http?.body}
+                bind:value={ddnsHttpBodyInput}
+                bind:clear={ddnsHttpBodyClear}
+                placeholder="Optional JSON/form body"
+                {t}
+              />
+              <div class="field">
+                <label for="dd-chk">{t.ddns.httpKeyword}</label>
+                <input id="dd-chk" type="text" class="mono" bind:value={ddnsDraft.custom_http.success_keyword} />
+              </div>
             </div>
-          </div>
-          <div class="field">
-            <label for="dd-chu">Custom HTTP URL ({'{{ip}} {{domain}} {{token}}'})</label>
-            <input id="dd-chu" type="text" class="mono" placeholder={secretMaskedHint(ddnsDraft.custom_http?.url, 'https://...')} bind:value={ddnsHttpUrlInput} />
+            <div class="field" style="margin-bottom:0;">
+              <label for="dd-chh">{t.ddns.httpHeaders}</label>
+              <textarea id="dd-chh" class="mono" bind:value={ddnsHttpHeadersTxt}></textarea>
+            </div>
           </div>
         {/if}
 
         <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:12px;">
           <label class="check-row"><input type="checkbox" bind:checked={ddnsDraft.enabled} /> {t.enabled}</label>
-          <label class="check-row"><input type="checkbox" bind:checked={ddnsRecA} /> Record A (IPv4)</label>
-          <label class="check-row"><input type="checkbox" bind:checked={ddnsRecAAAA} /> Record AAAA (IPv6)</label>
-          <label class="check-row"><input type="checkbox" bind:checked={ddnsDraft.proxied} /> Cloudflare Proxied</label>
+          <label class="check-row"><input type="checkbox" bind:checked={ddnsRecA} /> A (IPv4)</label>
+          <label class="check-row"><input type="checkbox" bind:checked={ddnsRecAAAA} /> AAAA (IPv6)</label>
+          <label class="check-row"><input type="checkbox" bind:checked={ddnsDraft.proxied} /> {t.ddns.proxied}</label>
         </div>
 
         <div class="form-grid">
           <div class="field">
-            <label for="dd-fw6">Sub-Device /128 Allow TCP Ports</label>
-            <input id="dd-fw6" type="text" class="mono" placeholder="e.g. 5001, 8443" bind:value={ddnsTcpPortsCsv} />
+            <label for="dd-fw6">{t.ddns.tcpPorts}</label>
+            <input id="dd-fw6" type="text" class="mono" placeholder="5001, 8443" bind:value={ddnsTcpPortsCsv} />
           </div>
           <div class="field">
-            <label for="dd-split">Split-DNS LAN Loopback IPs</label>
-            <input id="dd-split" type="text" class="mono" placeholder="e.g. 192.168.1.10" bind:value={ddnsSplitCsv} />
+            <label for="dd-fwu">{t.ddns.udpPorts}</label>
+            <input id="dd-fwu" type="text" class="mono" placeholder="51820" bind:value={ddnsUdpPortsCsv} />
+          </div>
+          <div class="field">
+            <label for="dd-split">{t.ddns.splitIps}</label>
+            <input id="dd-split" type="text" class="mono" placeholder="192.168.1.10" bind:value={ddnsSplitCsv} />
           </div>
         </div>
+
+        {#if splitCsv(ddnsSplitCsv).length > 0 && networkInfo?.split_dns_path}
+          <div class="banner banner-info" style="margin-bottom:10px;">
+            <div style="flex:1;min-width:0;">
+              <div style="font-weight:600;">{t.ddns.splitHint}</div>
+              <code class="mono" style="font-size:11.5px;word-break:break-all;">addn-hosts={networkInfo.split_dns_path}</code>
+            </div>
+            <button
+              type="button"
+              class="btn btn-xs"
+              onclick={async () => {
+                if (await copyText(`addn-hosts=${networkInfo.split_dns_path}`)) showToast(t.copied, 'success');
+              }}
+            >
+              {t.copy}
+            </button>
+          </div>
+        {/if}
+
+        <details>
+          <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--text-secondary);padding:6px 0;">
+            {t.common.advanced}
+          </summary>
+          <div class="form-grid" style="padding-top:10px;">
+            <div class="field">
+              <label for="dd-miss">{t.ddns.missingPolicy}</label>
+              <select id="dd-miss" bind:value={ddnsDraft.on_missing_public_ip}>
+                <option value="keep_existing">keep_existing</option>
+                <option value="delete_record">delete_record</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="dd-ttl">{t.ddns.ttl}</label>
+              <input id="dd-ttl" type="number" min="1" max="86400" bind:value={ddnsDraft.ttl} />
+            </div>
+            <div class="field">
+              <label for="dd-int">{t.ddns.interval}</label>
+              <input id="dd-int" type="number" min="30" max="86400" bind:value={ddnsDraft.reconcile_interval_secs} />
+            </div>
+            <div class="field">
+              <label for="dd-line">{t.ddns.line}</label>
+              <select id="dd-line" bind:value={ddnsDraft.line}>
+                <option value="default">default</option>
+                <option value="telecom">telecom</option>
+                <option value="unicom">unicom</option>
+                <option value="mobile">mobile</option>
+                <option value="oversea">oversea</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="dd-cmt">{t.ddns.comment}</label>
+              <input id="dd-cmt" type="text" bind:value={ddnsDraft.comment} />
+            </div>
+          </div>
+        </details>
       </div>
       <div class="drawer-footer">
         <button type="button" class="btn" onclick={() => ddnsDrawerOpen = false}>{t.cancel}</button>
-        <button type="submit" class="btn btn-primary">{t.confirm}</button>
+        <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
       </div>
     </form>
   </div>
@@ -771,21 +1159,21 @@
   <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) acmeDrawerOpen = false; }}>
     <form class="drawer-panel" onsubmit={saveAcme}>
       <div class="drawer-header">
-        <div class="card-title">{acmeEditIdx >= 0 ? t.edit : t.add} · ACME TLS</div>
+        <div class="card-title">{acmeEditIdx >= 0 ? t.edit : t.add} · {t.nav.acme}</div>
         <button type="button" class="btn btn-sm" onclick={() => acmeDrawerOpen = false}>{t.cancel}</button>
       </div>
       <div class="drawer-body">
         <div class="form-grid">
           <div class="field">
-            <label for="ac-dom">Primary Domain</label>
+            <label for="ac-dom">{t.acme.primaryDomain}</label>
             <input id="ac-dom" type="text" class="mono" placeholder="*.home.example.com" bind:value={acmeDraft.domain} required />
           </div>
           <div class="field">
-            <label for="ac-extra">Extra SAN Domains (comma separated)</label>
+            <label for="ac-extra">{t.acme.extraDomains}</label>
             <input id="ac-extra" type="text" class="mono" placeholder="home.example.com" bind:value={acmeExtraCsv} />
           </div>
           <div class="field">
-            <label for="ac-prov">DNS-01 Provider Account</label>
+            <label for="ac-prov">{t.acme.dnsProvider}</label>
             <select id="ac-prov" bind:value={acmeDraft.dns_provider} required>
               {#each Object.keys(settingsJson.dns_providers || {}) as pid}
                 <option value={pid}>{pid}</option>
@@ -793,52 +1181,110 @@
             </select>
           </div>
           <div class="field">
-            <label for="ac-ca">CA Directory</label>
-            <select id="ac-ca" bind:value={acmeDraft.directory_url}>
+            <label for="ac-ca">{t.acme.caDir}</label>
+            <select
+              id="ac-ca"
+              value={acmeCaChoice}
+              onchange={(e) => {
+                acmeCaChoice = e.currentTarget.value;
+                if (acmeCaChoice !== 'custom') acmeDraft.directory_url = acmeCaChoice;
+                else if (PRESET_CA.has(acmeDraft.directory_url)) acmeDraft.directory_url = 'https://';
+              }}
+            >
               <option value="letsencrypt">Let's Encrypt (Production)</option>
-              <option value="letsencrypt_staging">Let's Encrypt (Staging Test)</option>
+              <option value="letsencrypt_staging">Let's Encrypt (Staging)</option>
               <option value="zerossl">ZeroSSL</option>
               <option value="buypass">Buypass</option>
               <option value="google">Google Trust Services</option>
+              <option value="custom">Custom HTTPS Directory</option>
             </select>
           </div>
+        </div>
+
+        {#if acmeCaChoice === 'custom'}
           <div class="field">
-            <label for="ac-email">Account Email</label>
+            <label for="ac-cdir">{t.acme.customCaUrl}</label>
+            <input id="ac-cdir" type="url" class="mono" placeholder="https://..." bind:value={acmeDraft.directory_url} required />
+          </div>
+        {/if}
+
+        <div class="form-grid">
+          <div class="field">
+            <label for="ac-email">{t.acme.email}</label>
             <input id="ac-email" type="email" bind:value={acmeDraft.email} />
           </div>
           <div class="field">
-            <label for="ac-alias">CNAME Challenge Alias Domain (optional)</label>
+            <label for="ac-alias">{t.acme.aliasDomain}</label>
             <input id="ac-alias" type="text" class="mono" placeholder="auth.secondary-domain.com" bind:value={acmeDraft.challenge_alias_domain} />
           </div>
           <div class="field">
-            <label for="ac-dir">Cert Storage Dir (absolute path)</label>
+            <label for="ac-dir">{t.acme.certDir}</label>
             <input id="ac-dir" type="text" class="mono" bind:value={acmeDraft.cert_dir} required />
           </div>
           <div class="field">
-            <label for="ac-copy">Auto Export PEM Copy Dir (optional)</label>
+            <label for="ac-copy">{t.acme.copyDir}</label>
             <input id="ac-copy" type="text" class="mono" placeholder="/mnt/usb/shared-certs" bind:value={acmeCopyDir} />
+          </div>
+          <div class="field">
+            <label for="ac-rdays">{t.acme.renewDays}</label>
+            <input id="ac-rdays" type="number" min="7" max="60" bind:value={acmeDraft.renew_before_days} />
+          </div>
+          <div class="field">
+            <label for="ac-pto">{t.acme.propTimeout}</label>
+            <input id="ac-pto" type="number" min="10" max="900" bind:value={acmeDraft.propagation_timeout_secs} />
           </div>
         </div>
 
         <div class="form-grid">
           <div class="field">
-            <label for="ac-kid">EAB Key ID (ZeroSSL / Google)</label>
+            <label for="ac-kid">{t.acme.eabKid}</label>
             <input id="ac-kid" type="text" class="mono" bind:value={acmeDraft.eab_kid} />
           </div>
-          <div class="field">
-            <label for="ac-hmac">EAB HMAC Key (Base64URL)</label>
-            <input id="ac-hmac" type="password" class="mono" placeholder={secretMaskedHint(acmeDraft.eab_hmac_key, 'Optional')} bind:value={acmeEabKeyInput} />
+          <SecretField
+            id="ac-hmac"
+            label={t.acme.eabHmac}
+            original={acmeDraft.eab_hmac_key}
+            bind:value={acmeEabKeyInput}
+            bind:clear={acmeEabKeyClear}
+            placeholder="Optional Base64URL"
+            {t}
+          />
+        </div>
+
+        <div style="margin-bottom:12px;">
+          <div class="row-between" style="margin-bottom:8px;">
+            <span style="font-size:13px;font-weight:600;color:var(--text-secondary);">{t.acme.webhooks}</span>
+            <button type="button" class="btn btn-xs" onclick={addAcmeWebhook}>+ {t.acme.addWebhook}</button>
           </div>
+          {#each acmeHookEdits as wh, wIdx}
+            <div class="subcard" style="margin-bottom:8px;">
+              <SecretField
+                id="ac-wh-{wIdx}"
+                label={`Webhook #${wIdx + 1} URL`}
+                original={wh.urlOrig}
+                bind:value={wh.urlInput}
+                bind:clear={wh.urlClear}
+                placeholder="https://..."
+                {t}
+              />
+              <div class="row-between">
+                <label class="check-row" style="min-height:30px;">
+                  <input type="checkbox" bind:checked={wh.include_private_key} /> {t.acme.includePrivKey}
+                </label>
+                <button type="button" class="btn btn-xs btn-danger" onclick={() => removeAcmeWebhook(wIdx)}>{t.delete}</button>
+              </div>
+            </div>
+          {/each}
         </div>
 
         <div style="display:flex;gap:18px;flex-wrap:wrap;">
           <label class="check-row"><input type="checkbox" bind:checked={acmeDraft.enabled} /> {t.enabled}</label>
-          <label class="check-row"><input type="checkbox" bind:checked={acmeDraft.use_for_admin} /> Also Use for Admin HTTPS Console</label>
+          <label class="check-row"><input type="checkbox" bind:checked={acmeDraft.use_for_admin} /> {t.acme.useForAdmin}</label>
         </div>
       </div>
       <div class="drawer-footer">
         <button type="button" class="btn" onclick={() => acmeDrawerOpen = false}>{t.cancel}</button>
-        <button type="submit" class="btn btn-primary">{t.confirm}</button>
+        <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
       </div>
     </form>
   </div>
@@ -849,28 +1295,28 @@
   <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) stunDrawerOpen = false; }}>
     <form class="drawer-panel" onsubmit={saveStun}>
       <div class="drawer-header">
-        <div class="card-title">{stunEditIdx >= 0 ? t.edit : t.add} · STUN NAT</div>
+        <div class="card-title">{stunEditIdx >= 0 ? t.edit : t.add} · {t.nav.stun}</div>
         <button type="button" class="btn btn-sm" onclick={() => stunDrawerOpen = false}>{t.cancel}</button>
       </div>
       <div class="drawer-body">
         <div class="form-grid">
           <div class="field">
-            <label for="st-name">Rule Name</label>
+            <label for="st-name">{t.stun.ruleName}</label>
             <input id="st-name" type="text" class="mono" bind:value={stunDraft.name} required />
           </div>
           <div class="field">
-            <label for="st-proto">Protocol</label>
+            <label for="st-proto">{t.stun.proto}</label>
             <select id="st-proto" bind:value={stunDraft.proto}>
               <option value="udp">udp</option>
               <option value="tcp">tcp</option>
             </select>
           </div>
           <div class="field">
-            <label for="st-port">Local Port (0 = follow Bound Rule)</label>
+            <label for="st-port">{t.stun.localPort}</label>
             <input id="st-port" type="number" min="0" max="65535" bind:value={stunDraft.local_port} />
           </div>
           <div class="field">
-            <label for="st-bind">Bind Local Proxy / Forward Rule</label>
+            <label for="st-bind">{t.stun.bindRule}</label>
             <select id="st-bind" bind:value={stunDraft.bind_rule}>
               <option value="">— None —</option>
               {#each settingsJson.reverse_proxy || [] as rp}
@@ -884,60 +1330,80 @@
         </div>
 
         <div class="field">
-          <label for="st-srvs">STUN Servers (host:port, comma separated)</label>
+          <label for="st-srvs">{t.stun.servers}</label>
           <input id="st-srvs" type="text" class="mono" bind:value={stunServersCsv} required />
         </div>
 
         <div class="form-grid">
           <div class="field">
-            <label for="st-ka">Keepalive Interval (secs)</label>
+            <label for="st-ka">{t.stun.keepalive}</label>
             <input id="st-ka" type="number" min="5" max="3600" bind:value={stunDraft.keepalive_secs} />
           </div>
-          <div class="field">
-            <label for="st-wh">On-Change Webhook URL (optional)</label>
-            <input id="st-wh" type="password" class="mono" placeholder={secretMaskedHint(stunDraft.webhook_url, 'https://...')} bind:value={stunWebhookInput} />
-          </div>
+          <SecretField
+            id="st-wh"
+            label={t.stun.webhook}
+            original={stunDraft.webhook_url}
+            bind:value={stunWebhookInput}
+            bind:clear={stunWebhookClear}
+            placeholder="https://..."
+            {t}
+          />
         </div>
 
         <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:10px;">
           <label class="check-row"><input type="checkbox" bind:checked={stunDraft.enabled} /> {t.enabled}</label>
-          <label class="check-row"><input type="checkbox" bind:checked={stunCfEnabled} /> Sync Cloudflare Redirect Ruleset on Change</label>
+          <label class="check-row"><input type="checkbox" bind:checked={stunCfEnabled} /> {t.stun.cfSync}</label>
         </div>
 
         {#if stunCfEnabled && stunCfDraft}
           <div class="subcard">
             <div class="form-grid">
               <div class="field">
-                <label for="cf-host">Entry Host (e.g. go.example.com)</label>
+                <label for="cf-host">{t.stun.cfHost}</label>
                 <input id="cf-host" type="text" class="mono" bind:value={stunCfDraft.source_host} required />
               </div>
               <div class="field">
-                <label for="cf-tpl">Target Template ({'{{public_addr}}'})</label>
+                <label for="cf-tpl">{t.stun.cfTpl}</label>
                 <input id="cf-tpl" type="text" class="mono" bind:value={stunCfDraft.target_template} required />
               </div>
               <div class="field">
-                <label for="cf-zid">Zone ID</label>
+                <label for="cf-code">{t.stun.cfCode}</label>
+                <select id="cf-code" bind:value={stunCfDraft.status_code}>
+                  <option value={301}>301</option>
+                  <option value={302}>302</option>
+                  <option value={307}>307</option>
+                  <option value={308}>308</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="cf-zid">{t.stun.cfZone}</label>
                 <input id="cf-zid" type="text" class="mono" bind:value={stunCfDraft.zone_id} required />
               </div>
               <div class="field">
-                <label for="cf-rsid">Ruleset ID</label>
+                <label for="cf-rsid">{t.stun.cfRuleset}</label>
                 <input id="cf-rsid" type="text" class="mono" bind:value={stunCfDraft.ruleset_id} required />
               </div>
               <div class="field">
-                <label for="cf-rid">Rule ID</label>
+                <label for="cf-rid">{t.stun.cfRule}</label>
                 <input id="cf-rid" type="text" class="mono" bind:value={stunCfDraft.rule_id} required />
               </div>
-              <div class="field">
-                <label for="cf-tok">Cloudflare API Token</label>
-                <input id="cf-tok" type="password" class="mono" placeholder={secretMaskedHint(stunCfDraft.api_token, 'Bearer Token')} bind:value={stunCfTokenInput} />
-              </div>
             </div>
+            <SecretField
+              id="cf-tok"
+              label={t.stun.cfToken}
+              original={stunCfDraft.api_token}
+              bind:value={stunCfTokenInput}
+              bind:clear={stunCfTokenClear}
+              placeholder="Bearer Token"
+              required={true}
+              {t}
+            />
           </div>
         {/if}
       </div>
       <div class="drawer-footer">
         <button type="button" class="btn" onclick={() => stunDrawerOpen = false}>{t.cancel}</button>
-        <button type="submit" class="btn btn-primary">{t.confirm}</button>
+        <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
       </div>
     </form>
   </div>

@@ -3,21 +3,55 @@
     t,
     lang,
     initialTarget = 'host',
+    targetNonce = 0,
     containers = [],
     requireReauth = false,
     apiFetch,
     showToast,
   } = $props();
 
+  const ANSI_COLORS = {
+    30: '#475569',
+    31: '#f87171',
+    32: '#34d399',
+    33: '#fbbf24',
+    34: '#60a5fa',
+    35: '#c084fc',
+    36: '#22d3ee',
+    37: '#e2e8f0',
+    90: '#94a3b8',
+    91: '#fca5a5',
+    92: '#6ee7b7',
+    93: '#fde047',
+    94: '#93c5fd',
+    95: '#d8b4fe',
+    96: '#67e8f9',
+    97: '#f8fafc',
+  };
+
   let target = $state('host');
+  let lastNonce = -1;
   let reauthPassword = $state('');
   let ptySocket = $state(null);
-  let screenText = $state('');
+  let connState = $state('disconnected'); // disconnected | connecting | connected
+  let rawScreen = $state('');
   let lineInput = $state('');
   let viewportEl = $state(null);
 
   $effect(() => {
-    if (initialTarget) target = initialTarget;
+    const nonce = targetNonce;
+    const nextTarget = initialTarget || 'host';
+    if (nonce !== lastNonce) {
+      lastNonce = nonce;
+      if (nextTarget !== target) {
+        if (ptySocket) {
+          ptySocket.close();
+          ptySocket = null;
+          connState = 'disconnected';
+        }
+        target = nextTarget;
+      }
+    }
   });
 
   $effect(() => {
@@ -29,12 +63,52 @@
     };
   });
 
-  function stripAnsi(str) {
-    // 保留换行/回车并剥离控制转义，轻量无依赖地清晰呈现交互式 Shell 输出
-    return str
-      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')
-      .replace(/\x1b\][^\x07]*(\x07|\x1b\\)/g, '');
+  function sanitizePtyChunk(str) {
+    // 统一换行，剥离 OSC 与非 SGR 的 CSI 控制序列，保留 \x1b[...m 配色转义
+    return String(str || '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+      .replace(/\x1b\[[0-9;?]*[A-Za-ln-z]/g, '')
+      .replace(/\x1b\([A-Z0-9]|\x1b[=>NOM]/g, '');
   }
+
+  function parseAnsiSgr(text) {
+    if (!text) return [];
+    const segs = [];
+    const re = /\x1b\[([0-9;]*)m/g;
+    let lastIdx = 0;
+    let curColor = '';
+    let curBold = false;
+    let match;
+
+    while ((match = re.exec(text)) !== null) {
+      if (match.index > lastIdx) {
+        segs.push({ text: text.slice(lastIdx, match.index), color: curColor, bold: curBold });
+      }
+      const codes = match[1] ? match[1].split(';').map((n) => parseInt(n, 10)) : [0];
+      for (const c of codes) {
+        if (Number.isNaN(c) || c === 0) {
+          curColor = '';
+          curBold = false;
+        } else if (c === 1) {
+          curBold = true;
+        } else if (c === 22) {
+          curBold = false;
+        } else if (c === 39) {
+          curColor = '';
+        } else if (ANSI_COLORS[c]) {
+          curColor = ANSI_COLORS[c];
+        }
+      }
+      lastIdx = re.lastIndex;
+    }
+    if (lastIdx < text.length) {
+      segs.push({ text: text.slice(lastIdx), color: curColor, bold: curBold });
+    }
+    return segs;
+  }
+
+  let segments = $derived(parseAnsiSgr(rawScreen));
 
   function estimateGrid() {
     if (!viewportEl) return { cols: 100, rows: 28 };
@@ -50,6 +124,8 @@
   }
 
   async function connectPty() {
+    if (connState === 'connecting') return;
+    connState = 'connecting';
     try {
       const { cols, rows } = estimateGrid();
       const { ticket } = await apiFetch('/api/pty/ticket', {
@@ -61,21 +137,35 @@
       const ws = new WebSocket(
         `${proto}//${location.host}/api/pty/ws?ticket=${encodeURIComponent(ticket)}&target=${encodeURIComponent(target)}&cols=${cols}&rows=${rows}`
       );
-      screenText = '';
-      ws.onopen = () => sendResize();
+      rawScreen = '';
+      ws.onopen = () => {
+        connState = 'connected';
+        sendResize();
+      };
       ws.onmessage = (ev) => {
-        const chunk = stripAnsi(String(ev.data || ''));
-        screenText = (screenText + chunk).slice(-32768);
+        const chunk = sanitizePtyChunk(ev.data);
+        const combined = rawScreen + chunk;
+        if (combined.length > 32768) {
+          const cut = combined.indexOf('\n', combined.length - 32768);
+          rawScreen = cut >= 0 ? combined.slice(cut + 1) : combined.slice(-32768);
+        } else {
+          rawScreen = combined;
+        }
         queueMicrotask(() => {
           if (viewportEl) viewportEl.scrollTop = viewportEl.scrollHeight;
         });
       };
+      ws.onerror = () => {
+        showToast(lang === 'en' ? 'PTY WebSocket connection error' : '终端 WebSocket 连接异常', 'error');
+      };
       ws.onclose = () => {
         ptySocket = null;
+        connState = 'disconnected';
       };
       ptySocket = ws;
     } catch (err) {
-      showToast(err.message);
+      connState = 'disconnected';
+      showToast(err.message, 'error');
     }
   }
 
@@ -92,17 +182,30 @@
     lineInput = '';
   }
 
+  function handleTerminalPaste(e) {
+    if (!ptySocket || ptySocket.readyState !== WebSocket.OPEN) return;
+    const pasted = e.clipboardData?.getData('text/plain');
+    if (pasted) {
+      e.preventDefault();
+      sendRaw(pasted);
+    }
+  }
+
   function handleTerminalKeydown(e) {
     if (!ptySocket || ptySocket.readyState !== WebSocket.OPEN) return;
     if (e.ctrlKey && !e.metaKey && !e.altKey) {
       const k = e.key.toLowerCase();
       if (k === 'c') { e.preventDefault(); sendRaw('\x03'); return; }
       if (k === 'd') { e.preventDefault(); sendRaw('\x04'); return; }
-      if (k === 'l') { e.preventDefault(); screenText = ''; sendRaw('\x0c'); return; }
+      if (k === 'l') { e.preventDefault(); rawScreen = ''; sendRaw('\x0c'); return; }
     }
     if (e.key === 'Enter') { e.preventDefault(); sendRaw('\r'); }
     else if (e.key === 'Backspace') { e.preventDefault(); sendRaw('\x7f'); }
     else if (e.key === 'Tab') { e.preventDefault(); sendRaw('\t'); }
+    else if (e.key === 'Escape') { e.preventDefault(); sendRaw('\x1b'); }
+    else if (e.key === 'Home') { e.preventDefault(); sendRaw('\x1b[H'); }
+    else if (e.key === 'End') { e.preventDefault(); sendRaw('\x1b[F'); }
+    else if (e.key === 'Delete') { e.preventDefault(); sendRaw('\x1b[3~'); }
     else if (e.key === 'ArrowUp') { e.preventDefault(); sendRaw('\x1b[A'); }
     else if (e.key === 'ArrowDown') { e.preventDefault(); sendRaw('\x1b[B'); }
     else if (e.key === 'ArrowRight') { e.preventDefault(); sendRaw('\x1b[C'); }
@@ -119,16 +222,18 @@
 <div class="card">
   <div class="card-header">
     <div>
-      <div class="card-title">{t.nav.web_terminal}</div>
-      <div style="font-size:12px;color:var(--text-secondary);">
-        {lang === 'en'
-          ? 'Real Unix openpty + TIOCSWINSZ session bound to single-use ticket and process-group SIGHUP/SIGKILL reap.'
-          : '原生 openpty 伪终端流式会话（一次性票据绑定 + 空闲自动断连 + 登出即时强杀进程组回收）'}
+      <div class="card-title">
+        <span>{t.nav.web_terminal}</span>
+        <span class="badge {connState === 'connected' ? 'badge-ok' : connState === 'connecting' ? 'badge-warn' : 'badge-muted'}">
+          <span class="status-dot {connState === 'connected' ? 'ok' : connState === 'connecting' ? 'warn' : 'muted'}"></span>
+          <span>{connState === 'connected' ? t.term.connected : connState === 'connecting' ? t.term.connecting : t.term.disconnected}</span>
+        </span>
       </div>
+      <div style="font-size:12px;color:var(--text-secondary);">{t.term.subtitle}</div>
     </div>
     <div class="btn-group">
       <select style="width:210px;min-height:38px;font-size:13px;" bind:value={target} disabled={Boolean(ptySocket)}>
-        <option value="host">{lang === 'en' ? 'Host Router Shell' : '宿主机 Shell (host)'}</option>
+        <option value="host">{t.term.hostShell}</option>
         {#each (containers || []).filter((c) => c.state === 'running' && !c.protected) as c}
           <option value={`container:${c.name || c.id}`}>Docker: {c.name || c.id}</option>
         {/each}
@@ -137,17 +242,17 @@
         <input
           type="password"
           style="width:160px;min-height:38px;font-size:13px;"
-          placeholder={lang === 'en' ? 'Admin password' : '二次验证密码'}
+          placeholder={t.term.reauthPh}
           bind:value={reauthPassword}
         />
       {/if}
       {#if !ptySocket}
-        <button type="button" class="btn btn-primary btn-sm" onclick={connectPty}>
-          {lang === 'en' ? 'Connect PTY' : '连接终端'}
+        <button type="button" class="btn btn-primary btn-sm" disabled={connState === 'connecting'} onclick={connectPty}>
+          {connState === 'connecting' ? t.term.connecting : t.term.connect}
         </button>
       {:else}
         <button type="button" class="btn btn-danger btn-sm" onclick={() => ptySocket.close()}>
-          {lang === 'en' ? 'Disconnect' : '断开终端'}
+          {t.term.disconnect}
         </button>
       {/if}
     </div>
@@ -156,25 +261,39 @@
   <!-- 触屏 / 快捷控制键栏 -->
   {#if ptySocket}
     <div class="btn-group" style="margin-bottom:10px;">
+      <button type="button" class="btn btn-xs mono" onclick={() => sendRaw('\x1b')}>Esc</button>
       <button type="button" class="btn btn-xs mono" onclick={() => sendRaw('\t')}>Tab</button>
       <button type="button" class="btn btn-xs mono" onclick={() => sendRaw('\x03')}>Ctrl+C</button>
       <button type="button" class="btn btn-xs mono" onclick={() => sendRaw('\x04')}>Ctrl+D</button>
       <button type="button" class="btn btn-xs mono" onclick={() => sendRaw('\x1b[A')}>↑</button>
       <button type="button" class="btn btn-xs mono" onclick={() => sendRaw('\x1b[B')}>↓</button>
-      <button type="button" class="btn btn-xs" onclick={() => { screenText = ''; }}>Clear</button>
+      <button type="button" class="btn btn-xs" onclick={() => { rawScreen = ''; }}>Clear</button>
     </div>
   {/if}
 
-  <!-- 交互式 PTY 视口（点击聚焦后可直接键盘盲打交互，同时保留下方命令输入框兼容手机输入法） -->
+  <!-- 交互式 PTY 视口（支持直接键盘输入、粘贴文本、ANSI SGR 配色；下方保留命令栏兼容移动端输入法） -->
   <div
     bind:this={viewportEl}
     role="textbox"
     aria-label="PTY Terminal Viewport"
     tabindex="0"
     onkeydown={handleTerminalKeydown}
+    onpaste={handleTerminalPaste}
     class="mono"
-    style="background:#05070a;color:#10b981;padding:16px;border-radius:12px;min-height:340px;max-height:500px;overflow-y:auto;font-size:13px;line-height:1.45;white-space:pre-wrap;word-break:break-all;outline:none;border:1px solid var(--border-subtle);"
-  >{screenText || (ptySocket ? '' : (lang === 'en' ? 'Click "Connect PTY" to start an interactive session...' : '点击右上角「连接终端」开启交互式 PTY 会话（点击黑框可直接键盘输入）...'))}</div>
+    style="background:#05070a;color:#e2e8f0;padding:16px;border-radius:12px;min-height:340px;max-height:500px;overflow-y:auto;font-size:13px;line-height:1.45;white-space:pre-wrap;word-break:break-all;outline:none;border:1px solid var(--border-subtle);"
+  >
+    {#if segments.length > 0}
+      {#each segments as seg}
+        {#if seg.color || seg.bold}
+          <span style={`${seg.color ? `color:${seg.color};` : ''}${seg.bold ? 'font-weight:700;' : ''}`}>{seg.text}</span>
+        {:else}
+          {seg.text}
+        {/if}
+      {/each}
+    {:else if !ptySocket}
+      <span style="color:#94a3b8;">{t.term.placeholder}</span>
+    {/if}
+  </div>
 
   {#if ptySocket}
     <form onsubmit={submitLine} style="display:flex;gap:8px;margin-top:12px;">
@@ -182,9 +301,9 @@
         type="text"
         class="mono"
         bind:value={lineInput}
-        placeholder={lang === 'en' ? 'Type command and press Enter...' : '输入命令并回车发送（支持移动端输入法）...'}
+        placeholder={t.term.inputPh}
       />
-      <button type="submit" class="btn btn-primary">{lang === 'en' ? 'Send' : '发送'}</button>
+      <button type="submit" class="btn btn-primary">{t.term.send}</button>
     </form>
   {/if}
 </div>

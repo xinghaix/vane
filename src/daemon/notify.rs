@@ -47,6 +47,18 @@ fn render_template(value: &mut Value, variables: &[(&str, &str)]) {
     }
 }
 
+fn insert_header_ci(headers: &mut std::collections::BTreeMap<String, String>, key: &str, val: String) {
+    let existing: Vec<String> = headers
+        .keys()
+        .filter(|k| k.eq_ignore_ascii_case(key))
+        .cloned()
+        .collect();
+    for k in existing {
+        headers.remove(&k);
+    }
+    headers.insert(key.to_string(), val);
+}
+
 fn build_request(cfg: &NotificationConfig, event: &str, title: &str, message: &str, severity: &str, now_ms: u128) -> Result<HttpRequest, String> {
     let mut url = cfg.url.clone();
     let mut payload = match cfg.provider.as_str() {
@@ -56,7 +68,11 @@ fn build_request(cfg: &NotificationConfig, event: &str, title: &str, message: &s
             json!({"device_key":cfg.token,"title":title,"body":message,"group":"Vane"})
         },
         "telegram" => {
-            if url.is_empty() { url = format!("https://api.telegram.org/bot{}/sendMessage", cfg.token); }
+            if url.is_empty() {
+                url = format!("https://api.telegram.org/bot{}/sendMessage", cfg.token);
+            } else if !url.contains("/sendMessage") {
+                url = format!("{}/bot{}/sendMessage", url.trim_end_matches('/'), cfg.token);
+            }
             // 使用纯文本避免用户输入被解析为 Markdown 控制字符。
             json!({"chat_id":cfg.chat_id,"text":format!("{title}\n{message}")})
         },
@@ -91,13 +107,17 @@ fn build_request(cfg: &NotificationConfig, event: &str, title: &str, message: &s
     let method = if cfg.method.is_empty() { "POST" } else { &cfg.method };
     let mut request = HttpRequest::new(method, &url).json(&payload);
     request.response_limit = 64 * 1024;
-    request.headers.extend(cfg.headers.clone());
-    if cfg.provider == "gotify" { request.headers.insert("x-gotify-key".into(), cfg.token.clone()); }
-    if cfg.provider == "ntfy" && cfg.body_template.is_empty() {
-        request.body = message.as_bytes().to_vec();
-        request.headers.insert("content-type".into(), "text/plain; charset=utf-8".into());
-        request.headers.insert("title".into(), format!("=?UTF-8?B?{}?=", B64.encode(title.as_bytes())));
-        if !cfg.token.is_empty() { request.headers.insert("authorization".into(), format!("Bearer {}", cfg.token)); }
+    for (k, v) in &cfg.headers {
+        insert_header_ci(&mut request.headers, k, v.clone());
+    }
+    if cfg.provider == "gotify" { insert_header_ci(&mut request.headers, "x-gotify-key", cfg.token.clone()); }
+    if cfg.provider == "ntfy" {
+        if cfg.body_template.is_empty() {
+            request.body = message.as_bytes().to_vec();
+            insert_header_ci(&mut request.headers, "content-type", "text/plain; charset=utf-8".into());
+            insert_header_ci(&mut request.headers, "title", format!("=?UTF-8?B?{}?=", B64.encode(title.as_bytes())));
+        }
+        if !cfg.token.is_empty() { insert_header_ci(&mut request.headers, "authorization", format!("Bearer {}", cfg.token)); }
     }
     Ok(request)
 }
@@ -115,7 +135,20 @@ fn validate_delivery(provider: &str, response: HttpResponse) -> Result<(), Strin
         _ => false,
     };
     // 不把服务商原始响应写入日志，其中可能包含敏感 URL 或令牌。
-    if accepted { Ok(()) } else { Err(format!("通知渠道 {provider} 拒绝投递")) }
+    if accepted {
+        Ok(())
+    } else {
+        let code = value
+            .get("errcode")
+            .or_else(|| value.get("code"))
+            .or_else(|| value.get("error_code"))
+            .or_else(|| value.get("StatusCode"))
+            .and_then(|v| v.as_i64().map(|n| n.to_string()).or_else(|| v.as_str().filter(|s| s.len() <= 32 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')).map(str::to_string)));
+        match code {
+            Some(c) => Err(format!("通知渠道 {provider} 拒绝投递 (code={c})")),
+            None => Err(format!("通知渠道 {provider} 拒绝投递")),
+        }
+    }
 }
 
 pub async fn dispatch_notification(cfg: &NotificationConfig, vault: &Vault, event: &str, title: &str, message: &str, severity: &str) -> Result<DeliveryOutcome, String> {
@@ -128,6 +161,15 @@ pub async fn dispatch_notification(cfg: &NotificationConfig, vault: &Vault, even
     let request = build_request(&plain, event, title, message, severity, logger::unix_now_ms())?;
     validate_delivery(&cfg.provider, shared().execute(request).await?)?;
     logger::log(Level::Info, "notify", &format!("通知渠道 {} 已确认投递事件 {}", cfg.name, event));
+    Ok(DeliveryOutcome::Sent)
+}
+
+/// 手动测试推送：忽略 enabled/events/min_severity 过滤，直接验证凭据与网络连通性
+pub async fn send_test_notification(cfg: &NotificationConfig, vault: &Vault, title: &str, message: &str) -> Result<DeliveryOutcome, String> {
+    let plain = reveal_config(cfg, vault)?;
+    let request = build_request(&plain, "test", title, message, "info", logger::unix_now_ms())?;
+    validate_delivery(&cfg.provider, shared().execute(request).await?)?;
+    logger::log(Level::Info, "notify", &format!("通知渠道 {} 测试推送已确认投递", cfg.name));
     Ok(DeliveryOutcome::Sent)
 }
 

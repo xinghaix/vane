@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::net::UnixStream;
 
-const MAX_DOCKER_JSON_BYTES: usize = 512 * 1024;
+const MAX_DOCKER_JSON_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DOCKER_LOG_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -56,7 +56,8 @@ async fn docker_http_request(
     method: Method,
     path_and_query: &str,
     max_bytes: usize,
-) -> Result<(u16, Vec<u8>), String> {
+    truncate_at_limit: bool,
+) -> Result<(u16, Vec<u8>, bool), String> {
     if socket_path.is_empty() || !Path::new(socket_path).exists() {
         return Err(format!("Docker Socket 不存在或未挂载: {}", socket_path));
     }
@@ -89,19 +90,26 @@ async fn docker_http_request(
         let status = resp.status().as_u16();
         let mut body = resp.into_body();
         let mut out = Vec::with_capacity(4096);
+        let mut truncated = false;
         while let Some(frame_res) = body.frame().await {
             let frame = frame_res.map_err(|e| format!("读取 Docker 响应流失败: {}", e))?;
             if let Ok(data) = frame.into_data() {
                 if out.len().saturating_add(data.len()) > max_bytes {
+                    if truncate_at_limit {
+                        let rem = max_bytes.saturating_sub(out.len());
+                        out.extend_from_slice(&data[..rem]);
+                        truncated = true;
+                        break;
+                    }
                     return Err(format!("Docker 响应超过 {} 字节安全上限", max_bytes));
                 }
                 out.extend_from_slice(&data);
             }
         }
-        Ok::<_, String>((status, out))
+        Ok::<_, String>((status, out, truncated))
     };
 
-    let res = tokio::time::timeout(Duration::from_secs(15), read_fut)
+    let res = tokio::time::timeout(Duration::from_secs(30), read_fut)
         .await
         .map_err(|_| "读取 docker.sock 响应超时".to_string())?;
     conn_task.abort();
@@ -109,8 +117,8 @@ async fn docker_http_request(
 }
 
 pub async fn list_containers(socket_path: &str, cfg: &DockerConfig) -> Result<Vec<ContainerSummary>, String> {
-    let (status, body) =
-        docker_http_request(socket_path, Method::GET, "/containers/json?all=1", MAX_DOCKER_JSON_BYTES).await?;
+    let (status, body, _) =
+        docker_http_request(socket_path, Method::GET, "/containers/json?all=1", MAX_DOCKER_JSON_BYTES, false).await?;
     if status >= 400 {
         return Err(format!(
             "Docker API 返回错误 ({}): {}",
@@ -167,8 +175,9 @@ pub async fn ensure_not_protected(
     }
     let containers = list_containers(socket_path, cfg).await?;
     for c in containers {
-        let id_match = (clean.len() >= 6 && c.full_id.eq_ignore_ascii_case(clean))
-            || (clean.len() >= 6 && c.full_id.to_ascii_lowercase().starts_with(&clean.to_ascii_lowercase()))
+        let clean_low = clean.to_ascii_lowercase();
+        let id_match = c.full_id.eq_ignore_ascii_case(clean)
+            || (!clean_low.is_empty() && c.full_id.to_ascii_lowercase().starts_with(&clean_low))
             || c.id.eq_ignore_ascii_case(clean)
             || c.name.eq_ignore_ascii_case(clean);
         if id_match && c.protected {
@@ -192,7 +201,7 @@ pub async fn container_action(
         ensure_not_protected(socket_path, cfg, clean, action).await?;
     }
     let path = format!("/containers/{}/{}", clean, action);
-    let (status, body) = docker_http_request(socket_path, Method::POST, &path, MAX_DOCKER_JSON_BYTES).await?;
+    let (status, body, _) = docker_http_request(socket_path, Method::POST, &path, MAX_DOCKER_JSON_BYTES, false).await?;
     if status >= 400 {
         return Err(format!(
             "Docker 操作失败 ({}): {}",
@@ -216,12 +225,16 @@ pub async fn container_logs(
         "/containers/{}/logs?stdout=1&stderr=1&tail={}&timestamps={}",
         clean, lines, ts_flag
     );
-    let (status, body) = docker_http_request(socket_path, Method::GET, &path, MAX_DOCKER_LOG_BYTES).await?;
+    let (status, body, truncated) = docker_http_request(socket_path, Method::GET, &path, MAX_DOCKER_LOG_BYTES, true).await?;
     if status >= 400 {
         return Err(format!("读取容器日志失败 ({})", status));
     }
     let cleaned = strip_docker_stream_headers(&body);
-    Ok(String::from_utf8_lossy(&cleaned).into_owned())
+    let mut text = String::from_utf8_lossy(&cleaned).into_owned();
+    if truncated {
+        text.push_str("\n...[日志超过 1 MiB 安全上限，已截断]");
+    }
+    Ok(text)
 }
 
 pub async fn prune_images(socket_path: &str, dangling_only: bool) -> Result<String, String> {
@@ -230,7 +243,7 @@ pub async fn prune_images(socket_path: &str, dangling_only: bool) -> Result<Stri
     } else {
         "/images/prune?filters=%7B%22dangling%22%3A%5B%22false%22%5D%7D"
     };
-    let (status, body) = docker_http_request(socket_path, Method::POST, path, MAX_DOCKER_JSON_BYTES).await?;
+    let (status, body, _) = docker_http_request(socket_path, Method::POST, path, MAX_DOCKER_JSON_BYTES, false).await?;
     if status >= 400 {
         return Err(format!("清理镜像失败 ({})", status));
     }

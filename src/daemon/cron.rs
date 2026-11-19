@@ -212,27 +212,40 @@ fn parse_field_u64(s: &str, min: u32, max: u32) -> Result<u64, String> {
         } else {
             (part, 1)
         };
-        let (lo, hi) = if range_part == "*" {
-            (min, max)
+        let (lo, hi, extra_sun) = if range_part == "*" {
+            (min, max, false)
         } else if let Some((a, b)) = range_part.split_once('-') {
-            let av: u32 = a.parse().map_err(|_| format!("非法范围: {}", part))?;
-            let bv: u32 = b.parse().map_err(|_| format!("非法范围: {}", part))?;
+            let mut av: u32 = a.parse().map_err(|_| format!("非法范围: {}", part))?;
+            let mut bv: u32 = b.parse().map_err(|_| format!("非法范围: {}", part))?;
+            let mut sun = false;
+            if max == 6 && bv == 7 {
+                sun = true;
+                if av == 7 {
+                    av = 0;
+                    bv = 0;
+                } else {
+                    bv = 6;
+                }
+            }
             if av < min || bv > max || av > bv {
                 return Err(format!("数值超出范围 {}..={}: {}", min, max, part));
             }
-            (av, bv)
+            (av, bv, sun)
         } else {
             let v: u32 = range_part.parse().map_err(|_| format!("非法数值: {}", part))?;
             let v = if max == 6 && v == 7 { 0 } else { v };
             if v < min || v > max {
                 return Err(format!("数值超出范围 {}..={}: {}", min, max, part));
             }
-            (v, v)
+            (v, v, false)
         };
         let mut v = lo;
         while v <= hi {
             mask |= 1u64 << v;
             v += step;
+        }
+        if extra_sun && (step == 1 || (7 - lo) % step == 0) {
+            mask |= 1u64;
         }
     }
     if mask == 0 {

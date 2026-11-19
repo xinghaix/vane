@@ -108,6 +108,22 @@ async fn provider_business_failure_is_not_success() {
     task.await.unwrap();
 }
 
+#[tokio::test]
+async fn upsert_skips_write_when_existing_ip_matches() {
+    let (endpoint, task) = fixture(vec![
+        json!({"TotalCount":1,"DomainRecords":{"Record":[{"RecordId":"77","RR":"home","Type":"AAAA","Value":"2606:4700:0000:0000:0000:0000:0000:1111","Line":"default"}]}}),
+    ])
+    .await;
+    let mut api = api("aliyun");
+    api.endpoint = endpoint;
+    let zone = Zone { id: String::new(), name: "example.com".into() };
+    let id = api.upsert(&zone, &spec()).await.unwrap();
+    assert_eq!(id, "77");
+    let requests = task.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("Action=DescribeDomainRecords"));
+}
+
 #[test]
 fn relative_record_names_are_zone_scoped() {
     let zone=Zone{id:"zone-id".into(),name:"example.com".into()};

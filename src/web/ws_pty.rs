@@ -292,6 +292,9 @@ pub async fn handle_pty_websocket<F>(
             return;
         }
         let mut c = Command::new("docker");
+        if !docker_socket.is_empty() && docker_socket != "/var/run/docker.sock" {
+            c.args(["-H", &format!("unix://{}", docker_socket)]);
+        }
         c.args(["exec", "-it", "--", container, "/bin/sh"]);
         c
     } else {
@@ -318,6 +321,8 @@ pub async fn handle_pty_websocket<F>(
     );
 
     let idle_limit = Duration::from_secs(cfg.idle_timeout_secs.clamp(60, 3600));
+    let idle_sleep = tokio::time::sleep(idle_limit);
+    tokio::pin!(idle_sleep);
     let mut auth_ticker = tokio::time::interval(Duration::from_secs(2));
     auth_ticker.tick().await;
     let mut buf = vec![0u8; PTY_CHUNK_BYTES];
@@ -325,7 +330,7 @@ pub async fn handle_pty_websocket<F>(
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(idle_limit) => {
+            _ = &mut idle_sleep => {
                 let _ = ws.send(Message::Text("\r\n[会话空闲超时已自动断开]\r\n".into())).await;
                 break;
             }
@@ -345,6 +350,7 @@ pub async fn handle_pty_websocket<F>(
                 match read_res {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_limit);
                         utf8_carry.extend_from_slice(&buf[..n]);
                         let valid_up_to = match std::str::from_utf8(&utf8_carry) {
                             Ok(_) => utf8_carry.len(),
@@ -369,6 +375,7 @@ pub async fn handle_pty_websocket<F>(
             msg = ws.recv() => {
                 match msg {
                     Some(Ok(Message::Text(txt))) => {
+                        idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_limit);
                         if let Some((c, r)) = parse_resize_message(&txt) {
                             pty.resize(c, r);
                         } else if write_pty_all(&pty.master, txt.as_bytes()).await.is_err() {
@@ -376,6 +383,7 @@ pub async fn handle_pty_websocket<F>(
                         }
                     }
                     Some(Ok(Message::Binary(bin))) => {
+                        idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_limit);
                         if write_pty_all(&pty.master, &bin).await.is_err() {
                             break;
                         }

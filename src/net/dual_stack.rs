@@ -103,6 +103,10 @@ pub fn bind_dual_stack_tcp_on(port: u16, mode: StackMode, iface: &str) -> io::Re
 fn bind_single_tcp(domain: Domain, addr: SocketAddr, v6_only: bool, iface: &str) -> io::Result<TcpListener> {
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    if addr.port() != 0 {
+        let _ = socket.set_reuse_port(true);
+    }
     if v6_only {
         socket.set_only_v6(true)?;
     }
@@ -139,7 +143,7 @@ pub fn bind_dual_stack_udp_on(
             false,
             iface,
             enable_pktinfo,
-            false,
+            port != 0,
         ) {
             Ok(s) => v4_sock = Some(s),
             Err(e) => last_err = Some(e),
@@ -153,7 +157,7 @@ pub fn bind_dual_stack_udp_on(
             true,
             iface,
             enable_pktinfo,
-            false,
+            port != 0,
         ) {
             Ok(s) => v6_sock = Some(s),
             Err(e) => last_err = Some(e),

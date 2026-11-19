@@ -47,6 +47,12 @@ idle_timeout_secs = 900                # 空闲 15 分钟自动断开并回收�
 max_sessions = 2
 
 [security]
+tls_handshake_timeout_secs = 5
+http_header_timeout_secs = 10
+max_login_failures = 5                 # IPv4 按 /32、IPv6 按 /64 子网聚合计数
+ban_duration_secs = 1800
+kernel_ban_offload = true              # 封禁时同步写入防火墙前置 drop 集合并清理对应 Conntrack
+
 [monitor]
 interfaces = ["pppoe-wan", "br-lan"]
 thermal_path = ""
@@ -55,12 +61,6 @@ mem_low_mb = 32
 alert_cooldown_secs = 1800
 sample_interval_secs = 2
 top_processes = 10
-
-tls_handshake_timeout_secs = 5
-http_header_timeout_secs = 10
-max_login_failures = 5                 # IPv4 按 /32、IPv6 按 /64 子网聚合计数
-ban_duration_secs = 1800
-kernel_ban_offload = true              # 封禁时同步写入防火墙前置 drop 集合并清理对应 Conntrack
 
 [firewall]
 auto_manage = true                     # 启动首轮先预清扫残留链，仅对实际绑定成功的协议栈开门
@@ -150,14 +150,6 @@ keepalive_secs = 25
 webhook_url = "enc:v1:d2ViaG9vay1zZWFsZWQtdXJsLWV4YW1wbGU=..."
 
 # --- M7: 安全计划任务（支持内置 Docker API 动作或无 Shell 结构化参数数组） ---
-[[alerts]]
-name = "system_health"
-enabled = true
-cpu_threshold_pct = 90.0
-mem_threshold_pct = 90.0
-temp_threshold_celsius = 85.0
-channels = ["ntfy_home"]
-
 [[cron]]
 name = "prune_dangling_docker_images"
 enabled = true

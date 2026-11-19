@@ -1049,8 +1049,14 @@ impl Config {
                     }
                 }
             }
+            if d.domain.starts_with("*.") && !d.split_dns_lan_ips.is_empty() {
+                return Err(format!("ddns.{} Split DNS 不支持通配域名", d.name));
+            }
             for ip in &d.split_dns_lan_ips {
                 ip.parse::<IpAddr>().map_err(|_| format!("ddns.{} split_dns_lan_ips 非法 {}", d.name, ip))?;
+            }
+            if d.firewall_allow_tcp_ports.contains(&0) || d.firewall_allow_udp_ports.contains(&0) {
+                return Err(format!("ddns.{} 防火墙放行端口不能为 0", d.name));
             }
         }
 
@@ -1096,10 +1102,12 @@ impl Config {
                 crate::firewall::validate_wan_input_port(r.listen_port, admin_port, "wan")?;
             }
             range("reverse_proxy.max_concurrent_conns", r.max_concurrent_conns as u64, 1, 4096)?;
-            if used_ports.iter().any(|(p, k)| *p == r.listen_port && *k == "tcp") {
-                return Err(format!("端口冲突: {}", r.listen_port));
+            if r.enabled {
+                if used_ports.iter().any(|(p, k)| *p == r.listen_port && *k == "tcp") {
+                    return Err(format!("端口冲突: {}", r.listen_port));
+                }
+                used_ports.push((r.listen_port, "tcp"));
             }
-            used_ports.push((r.listen_port, "tcp"));
             for rule in &r.rules {
                 validate_rule(rule).map_err(|e| format!("reverse_proxy.{} 规则 {}: {}", r.name, rule.host, e))?;
             }
@@ -1176,11 +1184,13 @@ impl Config {
             range("port_forwards.tcp_idle_timeout_secs", p.tcp_idle_timeout_secs, 5, 86_400)?;
             range("port_forwards.udp_session_timeout_secs", p.udp_session_timeout_secs, 10, 600)?;
             range("port_forwards.max_concurrent_conns", p.max_concurrent_conns as u64, 1, 4096)?;
-            for kind in proto_kinds(&p.proto) {
-                if used_ports.iter().any(|(port, k)| *port == p.listen_port && *k == kind) {
-                    return Err(format!("端口冲突: {}/{}", p.listen_port, kind));
+            if p.enabled {
+                for kind in proto_kinds(&p.proto) {
+                    if used_ports.iter().any(|(port, k)| *port == p.listen_port && *k == kind) {
+                        return Err(format!("端口冲突: {}/{}", p.listen_port, kind));
+                    }
+                    used_ports.push((p.listen_port, kind));
                 }
-                used_ports.push((p.listen_port, kind));
             }
         }
 
@@ -1258,6 +1268,19 @@ impl Config {
                 "webhook" | "bark" | "telegram" | "wecom" | "feishu" | "dingtalk" | "ntfy" | "gotify"
             ) {
                 return Err(format!("notifications.{}.provider 不支持: {}", n.name, n.provider));
+            }
+            if !matches!(n.min_severity.as_str(), "debug" | "info" | "warn" | "warning" | "error" | "critical") {
+                return Err(format!("notifications.{}.min_severity 非法: {}", n.name, n.min_severity));
+            }
+            if !n.method.is_empty() && !matches!(n.method.as_str(), "GET" | "POST" | "PUT" | "PATCH") {
+                return Err(format!("notifications.{}.method 非法: {}", n.name, n.method));
+            }
+            if !n.body_template.is_empty()
+                && !n.body_template.starts_with("enc:v1:")
+                && n.body_template != UNCHANGED_SENTINEL
+                && serde_json::from_str::<serde_json::Value>(&n.body_template).is_err()
+            {
+                return Err(format!("notifications.{}.body_template 必须是合法 JSON", n.name));
             }
         }
         Ok(())
@@ -1512,9 +1535,14 @@ pub fn parse_tz_offset(s: &str) -> Option<i64> {
     Some(sign * (h * 3600 + m * 60))
 }
 
-/// 读取 /etc/TZ（OpenWrt POSIX TZ，例如 "CST-8"）解析偏移，失败回退 UTC
+/// 读取 /etc/TZ（OpenWrt POSIX TZ，例如 "CST-8"）或 TZ 环境变量解析偏移，失败回退 UTC
 fn detect_system_tz_offset() -> i64 {
     if let Ok(tz) = fs::read_to_string("/etc/TZ") {
+        if let Some(off) = parse_posix_tz(tz.trim()) {
+            return off;
+        }
+    }
+    if let Ok(tz) = std::env::var("TZ") {
         if let Some(off) = parse_posix_tz(tz.trim()) {
             return off;
         }

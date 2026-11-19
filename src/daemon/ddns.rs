@@ -222,9 +222,10 @@ pub async fn sync_ddns_entry(cfg: &DdnsConfig, all: &Config, vault: &Vault, fire
         let success = [status.ipv4.action.as_str(),status.ipv6.action.as_str()].iter().any(|a| matches!(*a,"synced"|"deleted"));
         let missing = status.ipv4.action=="kept_missing_ip" || status.ipv6.action=="kept_missing_ip";
         status.status = if failed { if success {"partial"} else {"failed"} } else if missing { if success {"partial"}else{"waiting_public_ip"} } else {"synced"}.into();
-        if !failed && !missing { status.last_sync_unix=logger::unix_now(); }
-        // 缺失或失败立即撤销旧 /128 放行；只为明确的子设备源开放 FORWARD。
-        let allowed = matches!(cfg.source,DdnsSource::PrefixAndIid{..}|DdnsSource::NeighborMac{..}) && status.ipv6.action=="synced";
+        if !failed && success { status.last_sync_unix=logger::unix_now(); }
+        // 缺失或关闭立即撤销旧 /128 放行；仅因上游 DNS API 临时错误而保持已有 last_ipv6 时不误删放行规则。
+        let keep_on_transient_err = status.ipv6.action == "failed" && status.last_ipv6.is_some();
+        let allowed = matches!(cfg.source,DdnsSource::PrefixAndIid{..}|DdnsSource::NeighborMac{..}) && (status.ipv6.action=="synced" || keep_on_transient_err);
         let next = if allowed { status.last_ipv6.as_ref().and_then(|ip|ip.parse::<Ipv6Addr>().ok()) } else {None};
         let existing = firewall.list_rules().into_iter().find(|rule| rule.owner()=="ddns" && rule.name()==cfg.name);
         let unchanged = matches!(existing.as_ref(),Some(FirewallRule::SubDeviceIpv6Forward{device_ip,tcp_ports,udp_ports,..})

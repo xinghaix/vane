@@ -237,9 +237,11 @@ async fn order_certificate(
         journal.leases.push(lease.clone());
         save_journal(journal_path, journal).await?;
         dns.create(&lease).await?;
-        // 查询原始挑战名，确保 CNAME 委派本身也已生效，而不只检查目标 TXT。
+        // 查询原始挑战名，确保 CNAME 委派本身也已生效，而不只检查目标 TXT；
+        // 先短暂等待权威 DNS 生效，避免 t=0 查询在本地 dnsmasq 产生 NXDOMAIN 负缓存。
         let lookup_name = dns01_record_name(&domain, "");
         tokio::time::timeout(Duration::from_secs(cfg.propagation_timeout_secs), async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
             loop {
                 if dns.propagated(&lookup_name, &value).await? {
                     return Ok::<(), String>(());
@@ -419,6 +421,30 @@ fn activate(
     })
 }
 
+/// 仅从磁盘预加载有效本地证书到反代与管理面（不触发网络签发或部署钩子），
+/// 用于在 ACME 自动续期模块关闭或排队签发前保持既有 HTTPS 服务可用。
+pub async fn preload_cached_cert(
+    cfg: &AcmeConfig,
+    all: &Config,
+    table: &Arc<ArcSwap<CertTable>>,
+    runtime: &AcmeRuntime,
+    admin: &Arc<ArcSwap<rustls::sign::CertifiedKey>>,
+) {
+    if !cfg.enabled {
+        return;
+    }
+    let path = acme_store::bundle_path(Path::new(&cfg.cert_dir), &cfg.domain);
+    if let Ok(Some(bytes)) = acme_store::read_bounded(&path, 1024 * 1024).await {
+        if let Ok(bundle) = serde_json::from_slice::<Bundle>(&bytes) {
+            if let Ok(status) = activate(cfg, all, &bundle, table, admin) {
+                if let Ok(mut statuses) = runtime.write() {
+                    statuses.insert(cfg.domain.clone(), status);
+                }
+            }
+        }
+    }
+}
+
 pub async fn issue_or_renew_cert(
     cfg: &AcmeConfig,
     all: &Config,
@@ -435,8 +461,9 @@ pub async fn issue_or_renew_cert(
     let _slot = runtime
         .slots
         .get_or_init(|| tokio::sync::Semaphore::new(2))
-        .try_acquire()
-        .map_err(|_| "ACME 同时签发任务已达上限")?;
+        .acquire()
+        .await
+        .map_err(|_| "ACME 并发槽已关闭")?;
     let lock = runtime.lock(&format!("domain:{}", cfg.domain))?;
     let _guard = lock.try_lock().map_err(|_| "该域名已有签发任务")?;
     let result = async {
@@ -470,25 +497,37 @@ pub async fn issue_or_renew_cert(
         }
         let path = acme_store::bundle_path(Path::new(&cfg.cert_dir), &cfg.domain);
         if let Some(bytes) = acme_store::read_bounded(&path, 1024 * 1024).await? {
-            let bundle: Bundle = serde_json::from_slice(&bytes).map_err(|_| "持久化证书包损坏")?;
-            let metadata = acme_store::verify(&bundle)?;
-            let mut wanted: Vec<_> = std::iter::once(cfg.domain.clone())
-                .chain(cfg.extra_domains.clone())
-                .collect();
-            wanted.sort();
-            let mut existing = bundle.domains.clone();
-            existing.sort();
-            if !force
-                && wanted == existing
-                && bundle.directory == directory
-                && metadata.expires > logger::unix_now() + u64::from(cfg.renew_before_days) * 86400
+            match serde_json::from_slice::<Bundle>(&bytes)
+                .map_err(|_| "持久化证书包损坏".to_string())
+                .and_then(|bundle| acme_store::verify(&bundle).map(|metadata| (bundle, metadata)))
             {
-                let mut status = activate(cfg, all, &bundle, table, admin)?;
-                if let Err(error) = deploy(cfg, vault, &bundle).await {
-                    status.status = "deployment_failed".into();
-                    status.last_error = Some(error);
+                Ok((bundle, metadata)) => {
+                    let mut wanted: Vec<_> = std::iter::once(cfg.domain.clone())
+                        .chain(cfg.extra_domains.clone())
+                        .collect();
+                    wanted.sort();
+                    let mut existing = bundle.domains.clone();
+                    existing.sort();
+                    if !force
+                        && wanted == existing
+                        && bundle.directory == directory
+                        && metadata.expires > logger::unix_now() + u64::from(cfg.renew_before_days) * 86400
+                    {
+                        let mut status = activate(cfg, all, &bundle, table, admin)?;
+                        if let Err(error) = deploy(cfg, vault, &bundle).await {
+                            status.status = "deployment_failed".into();
+                            status.last_error = Some(error);
+                        }
+                        return Ok(status);
+                    }
                 }
-                return Ok(status);
+                Err(err) => {
+                    logger::log(
+                        logger::Level::Warn,
+                        "acme",
+                        &format!("{} 本地证书包异常（{}），将重新签发", cfg.domain, err),
+                    );
+                }
             }
         }
         let provider = all

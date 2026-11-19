@@ -88,9 +88,12 @@ impl HttpClient {
         if port == 0 { return Err("目标端口不能为 0".into()); }
         let method = Method::from_bytes(spec.method.as_bytes()).map_err(|_| "非法 HTTP 方法")?;
         if method == Method::CONNECT { return Err("后台 HTTP 不允许 CONNECT".into()); }
+        let has_custom_ua = spec.headers.keys().any(|k| k.eq_ignore_ascii_case("user-agent"));
         let mut request = Request::builder().method(method).uri(uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"));
-        request = request.header(header::HOST, authority.as_str()).header(header::CONNECTION, "close")
-            .header(header::USER_AGENT, concat!("vane/", env!("CARGO_PKG_VERSION")));
+        request = request.header(header::HOST, authority.as_str()).header(header::CONNECTION, "close");
+        if !has_custom_ua {
+            request = request.header(header::USER_AGENT, concat!("vane/", env!("CARGO_PKG_VERSION")));
+        }
         for (name, value) in &spec.headers {
             let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| "非法 HTTP 请求头名称")?;
             if matches!(name.as_str(), "host" | "content-length" | "transfer-encoding" | "connection" | "upgrade" | "proxy-authorization") {

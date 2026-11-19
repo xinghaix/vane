@@ -573,7 +573,7 @@ pub async fn probe_and_sync_stun_with_cf_base(
                 server: out.server_used,
                 status: if hook_err.is_empty() { "active".into() } else { "degraded".into() },
                 last_probe_unix: now,
-                last_change_unix: if changed { now } else { prev_last_change.max(now) },
+                last_change_unix: if changed { now } else { prev_last_change },
                 error: hook_err,
             };
             update_status(runtime, st.clone());

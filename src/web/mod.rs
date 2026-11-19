@@ -9,7 +9,7 @@ use crate::config::{save_config, Config, Ed25519KeyEntry, ModulesConfig};
 use crate::daemon::acme::{issue_or_renew_cert, AcmeRuntime};
 use crate::daemon::cron::{execute_cron_job_with_ctx, CronExecutionContext, CronRuntime, CronSchedule};
 use crate::daemon::ddns::{sync_ddns_entry, DdnsStatusMap};
-use crate::daemon::notify::{broadcast_event, dispatch_notification};
+use crate::daemon::notify::{broadcast_event, send_test_notification};
 use crate::docker::unix_client::{container_action, container_logs, list_containers, prune_dangling_images};
 use crate::firewall::FirewallManager;
 use crate::logger::{self, Level};
@@ -81,9 +81,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn apply_runtime_settings(&self, next_cfg: &Config) {
+    pub async fn apply_runtime_settings(&self, next_cfg: &Config) {
         logger::global().set_capacity(next_cfg.system.log_ring_capacity);
         logger::global().set_tz_offset(next_cfg.timezone_offset_secs());
+        if self.firewall.is_auto_manage() && !next_cfg.firewall.auto_manage {
+            let _ = self.firewall.pre_start_sweep().await;
+        }
         self.firewall.update_config(next_cfg.firewall.clone());
         self.global_quota.set_capacity(next_cfg.system.global_max_conns);
         if let Ok(mut auth) = self.auth.lock() {
@@ -140,7 +143,7 @@ impl AppState {
                 }
                 save_config(&st.config_path, &next)?;
                 st.config.store(Arc::new(next));
-                st.reload_notify.notify_waiters();
+                st.reload_notify.notify_one();
                 Ok(format!("已将 {}.{} 设为 enabled={}", target_kind, rule_name, enable))
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>
         });
@@ -343,25 +346,33 @@ fn require_any_session(state: &AppState, headers: &HeaderMap) -> Result<(String,
 async fn api_auth_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let cfg = state.config.load();
     let session = current_session_scope(&state, &headers);
-    let authenticated = session.is_some();
-    let must_change_password = match session {
-        Some((_, scope)) => scope == SessionScope::MustChangePassword,
-        None => cfg.admin.must_change_password,
-    };
-    Json(serde_json::json!({
-        "authenticated": authenticated,
-        "username": cfg.admin.username,
-        "must_change_password": must_change_password,
-        "password_login_enabled": cfg.admin.password_login_enabled,
-        "totp_enabled": cfg.admin.totp_enabled,
-        "totp_recovery_remaining": cfg.admin.totp_recovery_hashes.len(),
-        "has_ed25519_keys": !cfg.admin.authorized_ed25519_keys.is_empty(),
-        "ed25519_key_ids": cfg.admin.authorized_ed25519_keys.iter().map(|k| &k.id).collect::<Vec<_>>(),
-        "session_ttl_secs": cfg.admin.session_ttl_secs,
-        "language": cfg.system.language,
-        "modules": cfg.modules,
-    }))
-    .into_response()
+    let key_ids: Vec<&String> = cfg.admin.authorized_ed25519_keys.iter().map(|k| &k.id).collect();
+    if let Some((_, scope)) = session {
+        Json(serde_json::json!({
+            "authenticated": true,
+            "username": cfg.admin.username,
+            "must_change_password": scope == SessionScope::MustChangePassword,
+            "password_login_enabled": cfg.admin.password_login_enabled,
+            "totp_enabled": cfg.admin.totp_enabled,
+            "totp_recovery_remaining": cfg.admin.totp_recovery_hashes.len(),
+            "has_ed25519_keys": !key_ids.is_empty(),
+            "ed25519_key_ids": key_ids,
+            "session_ttl_secs": cfg.admin.session_ttl_secs,
+            "language": cfg.system.language,
+            "modules": cfg.modules,
+        }))
+        .into_response()
+    } else {
+        Json(serde_json::json!({
+            "authenticated": false,
+            "password_login_enabled": cfg.admin.password_login_enabled,
+            "totp_enabled": cfg.admin.totp_enabled,
+            "has_ed25519_keys": !key_ids.is_empty(),
+            "ed25519_key_ids": key_ids,
+            "language": cfg.system.language,
+        }))
+        .into_response()
+    }
 }
 
 #[derive(Deserialize)]
@@ -565,6 +576,8 @@ fn build_session_response(token: &str, ttl_secs: u64, must_change: bool, cfg: &C
         "password_login_enabled": cfg.admin.password_login_enabled,
         "totp_enabled": cfg.admin.totp_enabled,
         "totp_recovery_remaining": cfg.admin.totp_recovery_hashes.len(),
+        "has_ed25519_keys": !cfg.admin.authorized_ed25519_keys.is_empty(),
+        "ed25519_key_ids": cfg.admin.authorized_ed25519_keys.iter().map(|k| &k.id).collect::<Vec<_>>(),
         "session_ttl_secs": cfg.admin.session_ttl_secs,
         "language": cfg.system.language,
         "modules": cfg.modules,
@@ -726,6 +739,14 @@ async fn api_auth_challenge(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<ChallengeReq>,
 ) -> Response {
+    let client_key = BanKey::from_peer(peer.ip());
+    if state.fail2ban.is_key_banned(client_key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "IP_BANNED", "message": "认证失败次数过多，该网络已被临时封禁" })),
+        )
+            .into_response();
+    }
     let cfg = state.config.load();
     if !cfg.admin.authorized_ed25519_keys.iter().any(|k| k.id == req.key_id) {
         return (
@@ -734,7 +755,6 @@ async fn api_auth_challenge(
         )
             .into_response();
     }
-    let client_key = BanKey::from_peer(peer.ip());
     let rng = ring::rand::SystemRandom::new();
     let mut auth = state.auth.lock().unwrap();
     match auth.engine.issue_challenge(&rng, req.key_id, client_key) {
@@ -876,14 +896,24 @@ async fn api_totp_enable(
             .into_response();
     };
     let _cfg_guard = state.config_lock.lock().await;
+    if state.config.load().admin.totp_enabled {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "TOTP 已启用，请先关闭后再重新配置" })),
+        )
+            .into_response();
+    }
     let verified_opt = {
         let mut auth = state.auth.lock().unwrap();
         match auth.pending_totp_secret.clone() {
             Some((sec, issued_at)) if issued_at.elapsed() <= PENDING_TOTP_TTL => {
-                auth.engine.reset_totp_watermark();
-                if auth.engine.verify_totp(&sec, code_num, logger::unix_now()) {
+                let mut probe = AuthEngine::new(String::new());
+                if probe.verify_totp(&sec, code_num, logger::unix_now()) {
+                    let wm = probe.totp_watermark();
                     auth.pending_totp_secret = None;
-                    Some((sec, auth.engine.totp_watermark()))
+                    auth.engine.reset_totp_watermark();
+                    auth.engine.restore_totp_watermark(wm);
+                    Some((sec, wm))
                 } else {
                     None
                 }
@@ -1144,6 +1174,19 @@ async fn api_put_settings(
         return resp;
     }
     let _cfg_guard = state.config_lock.lock().await;
+    let mut renames: Vec<(String, String)> = Vec::new();
+    if let Some(obj) = incoming_json.as_object_mut() {
+        if let Some(arr) = obj.remove("_renames").and_then(|v| v.as_array().cloned()) {
+            for item in arr {
+                if let (Some(from), Some(to)) = (
+                    item.get("from").and_then(|v| v.as_str()),
+                    item.get("to").and_then(|v| v.as_str()),
+                ) {
+                    renames.push((from.to_string(), to.to_string()));
+                }
+            }
+        }
+    }
     crate::security::vault::normalize_masked_input(&mut incoming_json);
     // 剥离 masked_config_json 注入的只读摘要字段（如 totp_recovery_hashes: { remaining: N }），防止反序列化类型冲突
     if let Some(admin_obj) = incoming_json.get_mut("admin").and_then(|v| v.as_object_mut()) {
@@ -1171,7 +1214,7 @@ async fn api_put_settings(
     next_cfg.admin.totp_last_step = current_cfg.admin.totp_last_step;
     next_cfg.admin.totp_recovery_hashes = current_cfg.admin.totp_recovery_hashes.clone();
 
-    if let Err(e) = state.vault.merge_secrets(&mut next_cfg, &current_cfg, None) {
+    if let Err(e) = state.vault.merge_secrets_many(&mut next_cfg, &current_cfg, &renames) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response();
     }
     if let Err(e) = next_cfg.validate() {
@@ -1180,9 +1223,9 @@ async fn api_put_settings(
     if let Err(e) = save_config(&state.config_path, &next_cfg) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response();
     }
-    state.apply_runtime_settings(&next_cfg);
+    state.apply_runtime_settings(&next_cfg).await;
     state.config.store(Arc::new(next_cfg.clone()));
-    state.reload_notify.notify_waiters();
+    state.reload_notify.notify_one();
     logger::log(Level::Info, "config", "配置已在 Web 设置页更新并热生效");
 
     let mut resp = Json(state.vault.masked_config_json(&next_cfg)).into_response();
@@ -1223,7 +1266,7 @@ async fn api_put_modules(
         state.pty_mgr.notify_revoke();
     }
     state.config.store(Arc::new(next_cfg));
-    state.reload_notify.notify_waiters();
+    state.reload_notify.notify_one();
     logger::log(Level::Info, "modules", &format!("子功能模块开关已更新: {:?}", modules));
     Json(serde_json::json!({ "modules": modules })).into_response()
 }
@@ -1258,7 +1301,7 @@ async fn api_port_forward_lease(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response();
     }
     state.config.store(Arc::new(next_cfg));
-    state.reload_notify.notify_waiters();
+    state.reload_notify.notify_one();
     Json(serde_json::json!({ "name": name, "expire_at_unix": exp })).into_response()
 }
 
@@ -1275,15 +1318,17 @@ async fn api_ddns_sync(
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "DDNS 规则不存在" }))).into_response();
     };
     match sync_ddns_entry(entry, &cfg, &state.vault, &state.firewall, &state.ddns_status).await {
-        Ok(st) => (
-            if st.status == "failed" || st.status == "partial" {
-                StatusCode::BAD_GATEWAY
-            } else {
-                StatusCode::OK
-            },
-            Json(st),
-        )
-            .into_response(),
+        Ok(st) => {
+            let has_err = st.status == "failed"
+                || st.ipv4.error.is_some()
+                || st.ipv6.error.is_some()
+                || st.firewall_error.is_some();
+            (
+                if has_err { StatusCode::BAD_GATEWAY } else { StatusCode::OK },
+                Json(st),
+            )
+                .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
     }
 }
@@ -1390,13 +1435,11 @@ async fn api_notification_test(
     let Some(n) = cfg.notifications.iter().find(|x| x.name == name) else {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({ "error": "通知渠道不存在" }))).into_response();
     };
-    match dispatch_notification(
+    match send_test_notification(
         n,
         &state.vault,
-        "test",
         "Vane 通知测试",
         "这是一条来自 Vane 网关管理面板的测试消息",
-        "info",
     )
     .await
     {
@@ -1541,6 +1584,7 @@ struct BackupImportReq {
 
 async fn api_backup_import(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<BackupImportReq>,
 ) -> Response {
@@ -1571,18 +1615,38 @@ async fn api_backup_import(
     if let Err(e) = save_config(&state.config_path, &restored_cfg) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response();
     }
-    state.apply_runtime_settings(&restored_cfg);
+    state.apply_runtime_settings(&restored_cfg).await;
+    let ban_key = BanKey::from_peer(peer.ip());
+    let ttl = Duration::from_secs(restored_cfg.admin.session_ttl_secs.clamp(300, 86_400));
+    let scope = match PasswordHash::parse(&restored_cfg.admin.password_hash) {
+        Some(ph) => AuthEngine::resolve_session_scope(
+            restored_cfg.admin.must_change_password,
+            &ph.salt,
+            &ph.hash,
+            ph.iters,
+        ),
+        None => SessionScope::MustChangePassword,
+    };
+    let new_token = {
+        let mut auth = state.auth.lock().unwrap_or_else(|e| e.into_inner());
+        auth.engine.reset_totp_watermark();
+        auth.engine.restore_totp_watermark(restored_cfg.admin.totp_last_step);
+        auth.pending_totp_secret = None;
+        auth.sessions.revoke_all();
+        auth.sessions.issue(scope, ban_key, ttl).unwrap_or_default()
+    };
+    state.pty_mgr.notify_revoke();
     state.config.store(Arc::new(restored_cfg.clone()));
-    state.reload_notify.notify_waiters();
+    state.reload_notify.notify_one();
     logger::log(Level::Info, "backup", "加密备份已成功导入并热重载生效");
 
-    let mut resp = Json(serde_json::json!({ "ok": true })).into_response();
-    if let Some(sp) = boundary::active_secret_path(&restored_cfg) {
-        if let Some(entry_hv) = boundary::build_entry_set_cookie(state.vault.mac_key(), sp) {
-            resp.headers_mut().append(header::SET_COOKIE, entry_hv);
-        }
-    }
-    resp
+    build_session_response(
+        &new_token,
+        ttl.as_secs(),
+        scope == SessionScope::MustChangePassword,
+        &restored_cfg,
+        &state.vault,
+    )
 }
 
 async fn api_backup_sanitized(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1644,9 +1708,24 @@ async fn api_pty_ticket(
     } else {
         req.target.trim().to_string()
     };
+    if target.starts_with("container:") && !cfg.modules.docker {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "MODULE_DISABLED", "message": "Docker 模块已关闭" })),
+        )
+            .into_response();
+    }
 
-    // 若开启打开终端二次认证，校验管理员密码
+    // 若开启打开终端二次认证，校验管理员密码（使用 403 防止前端误判为会话过期登出）
     if cfg.web_terminal.require_reauth {
+        let ban_key = BanKey::from_peer(peer.ip());
+        if state.fail2ban.is_key_banned(ban_key) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({ "error": "IP_BANNED", "message": "认证失败次数过多，该网络已被临时封禁" })),
+            )
+                .into_response();
+        }
         if req.reauth_password.is_empty() {
             return (
                 StatusCode::FORBIDDEN,
@@ -1669,9 +1748,10 @@ async fn api_pty_ticket(
             return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "认证繁忙" }))).into_response();
         };
         if !ok {
+            on_login_failed(&state, ban_key).await;
             return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({ "error": "INVALID_PASSWORD", "message": "二次验证密码错误" })),
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "INVALID_REAUTH_PASSWORD", "message": "二次验证密码错误" })),
             )
                 .into_response();
         }
@@ -1835,18 +1915,22 @@ async fn serve_static_or_spa(uri: Uri, method: Method, headers: HeaderMap) -> Re
         "no-cache"
     };
 
+    let is_head = method == Method::HEAD;
+
     // 优先检查 Brotli (.br) 与 Gzip (.gz) 预压缩切片，直接零拷贝返回 ELF .rodata Bytes
     if accept_enc.contains("br") {
         let br_name = format!("{}.br", path);
         if let Some(f) = load_asset(&br_name) {
+            let len = f.len().to_string();
             return (
                 [
                     (header::CONTENT_TYPE, mime),
                     (header::CONTENT_ENCODING, "br"),
                     (header::CACHE_CONTROL, cache_ctrl),
                     (header::VARY, "Accept-Encoding"),
+                    (header::CONTENT_LENGTH, len.as_str()),
                 ],
-                Body::from(f),
+                if is_head { Body::empty() } else { Body::from(f) },
             )
                 .into_response();
         }
@@ -1854,22 +1938,29 @@ async fn serve_static_or_spa(uri: Uri, method: Method, headers: HeaderMap) -> Re
     if accept_enc.contains("gzip") {
         let gz_name = format!("{}.gz", path);
         if let Some(f) = load_asset(&gz_name) {
+            let len = f.len().to_string();
             return (
                 [
                     (header::CONTENT_TYPE, mime),
                     (header::CONTENT_ENCODING, "gzip"),
                     (header::CACHE_CONTROL, cache_ctrl),
                     (header::VARY, "Accept-Encoding"),
+                    (header::CONTENT_LENGTH, len.as_str()),
                 ],
-                Body::from(f),
+                if is_head { Body::empty() } else { Body::from(f) },
             )
                 .into_response();
         }
     }
     if let Some(f) = load_asset(path) {
+        let len = f.len().to_string();
         return (
-            [(header::CONTENT_TYPE, mime), (header::CACHE_CONTROL, cache_ctrl)],
-            Body::from(f),
+            [
+                (header::CONTENT_TYPE, mime),
+                (header::CACHE_CONTROL, cache_ctrl),
+                (header::CONTENT_LENGTH, len.as_str()),
+            ],
+            if is_head { Body::empty() } else { Body::from(f) },
         )
             .into_response();
     }
@@ -2386,9 +2477,101 @@ mod tests {
             .header(header::ACCEPT_ENCODING, "br, gzip")
             .body(Body::empty())
             .unwrap();
-        let static_resp = app.oneshot(static_req).await.unwrap();
+        let static_resp = app.clone().oneshot(static_req).await.unwrap();
         assert_eq!(static_resp.status(), StatusCode::OK);
         assert_eq!(static_resp.headers().get(header::CONTENT_ENCODING).unwrap(), "br");
+
+        // HEAD 请求必须返回 Content-Length 但空响应体
+        let head_resp = app
+            .clone()
+            .oneshot(trusted_request().method("HEAD").uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(head_resp.status(), StatusCode::OK);
+        assert!(head_resp.headers().contains_key(header::CONTENT_LENGTH));
+        assert!(to_bytes(head_resp.into_body(), 1024).await.unwrap().is_empty());
+
+        // 添加 DNS 服务商并用 _renames 重命名，Vault 机密必须保留而非被清空
+        let get_s = app
+            .clone()
+            .oneshot(trusted_request().uri("/api/settings").header(header::COOKIE, &new_cookie).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let mut cfg_val: serde_json::Value = serde_json::from_slice(&to_bytes(get_s.into_body(), 131_072).await.unwrap()).unwrap();
+        cfg_val["dns_providers"]["cf_a"] = serde_json::json!({
+            "provider": "cloudflare",
+            "api_token": "super-secret-cf-tok-999",
+            "secret_key": "",
+            "happy_eyeballs_delay_ms": 250,
+            "zone_name": "example.com",
+            "zone_id": ""
+        });
+        let put1 = app
+            .clone()
+            .oneshot(
+                trusted_request()
+                    .method("PUT")
+                    .uri("/api/settings")
+                    .header(header::COOKIE, &new_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(cfg_val.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put1.status(), StatusCode::OK);
+        let mut cfg_renamed: serde_json::Value = serde_json::from_slice(&to_bytes(put1.into_body(), 131_072).await.unwrap()).unwrap();
+        let prov_val = cfg_renamed["dns_providers"].as_object_mut().unwrap().remove("cf_a").unwrap();
+        cfg_renamed["dns_providers"]["cf_b"] = prov_val;
+        cfg_renamed["_renames"] = serde_json::json!([{ "from": "dns_providers.cf_a", "to": "dns_providers.cf_b" }]);
+        let put2 = app
+            .clone()
+            .oneshot(
+                trusted_request()
+                    .method("PUT")
+                    .uri("/api/settings")
+                    .header(header::COOKIE, &new_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(cfg_renamed.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put2.status(), StatusCode::OK);
+        let after_rename: serde_json::Value = serde_json::from_slice(&to_bytes(put2.into_body(), 131_072).await.unwrap()).unwrap();
+        assert_eq!(after_rename["dns_providers"]["cf_b"]["api_token"]["configured"], true);
+
+        // 开启 web_terminal + require_reauth 后，错误的二次密码必须返回 403 而非 401
+        let mut cfg_pty = after_rename;
+        cfg_pty["modules"]["web_terminal"] = serde_json::json!(true);
+        cfg_pty["web_terminal"]["require_reauth"] = serde_json::json!(true);
+        let put3 = app
+            .clone()
+            .oneshot(
+                trusted_request()
+                    .method("PUT")
+                    .uri("/api/settings")
+                    .header(header::COOKIE, &new_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(cfg_pty.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put3.status(), StatusCode::OK);
+        let bad_reauth = app
+            .oneshot(
+                trusted_request()
+                    .method("POST")
+                    .uri("/api/pty/ticket")
+                    .header(header::COOKIE, &new_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"target":"host","reauth_password":"wrong"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_reauth.status(), StatusCode::FORBIDDEN);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

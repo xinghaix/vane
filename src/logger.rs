@@ -177,7 +177,7 @@ pub fn redact(input: &str) -> String {
             }
             continue;
         }
-        if input[i..].starts_with("Bearer ") {
+        if input.get(i..i + 7).is_some_and(|s| s.eq_ignore_ascii_case("bearer ")) {
             out.push_str("Bearer ****");
             i += 7;
             while i < bytes.len() && is_token_byte(bytes[i]) {
@@ -189,29 +189,53 @@ pub fn redact(input: &str) -> String {
         out.push(ch);
         i += ch.len_utf8();
         if ch == '=' || ch == ':' {
-            let prefix = out[..out.len() - 1].to_ascii_lowercase();
-            let key_start = prefix
+            let trimmed_prefix = out[..out.len() - 1]
+                .trim_end_matches(|c: char| c == ' ' || c == '"' || c == '\'')
+                .to_ascii_lowercase();
+            let key_start = trimmed_prefix
                 .char_indices()
                 .rev()
                 .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-'))
                 .map(|(p, c)| p + c.len_utf8())
                 .unwrap_or(0);
-            let key = prefix[key_start..].trim_matches(|c| c == '"' || c == '\'');
+            let key = &trimmed_prefix[key_start..];
             if SENSITIVE_KEYS.iter().any(|k| key.ends_with(k)) {
                 while i < bytes.len() && bytes[i] == b' ' {
                     out.push(' ');
                     i += 1;
                 }
-                if input[i..].len() >= 7 && input[i..i + 7].eq_ignore_ascii_case("bearer ") {
+                let quote = bytes.get(i).copied().filter(|&b| b == b'"' || b == b'\'');
+                if let Some(q) = quote {
+                    out.push(q as char);
+                    i += 1;
+                }
+                if input.get(i..i + 7).is_some_and(|s| s.eq_ignore_ascii_case("bearer ")) {
                     out.push_str("Bearer ");
                     i += 7;
                 }
                 let start = i;
-                while i < bytes.len() && is_token_byte(bytes[i]) {
-                    i += 1;
-                }
-                if i > start {
-                    out.push_str("****");
+                if let Some(q) = quote {
+                    while i < bytes.len() && bytes[i] != q && bytes[i] != b'\n' && bytes[i] != b'\r' {
+                        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    if i > start {
+                        out.push_str("****");
+                    }
+                    if bytes.get(i) == Some(&q) {
+                        out.push(q as char);
+                        i += 1;
+                    }
+                } else {
+                    while i < bytes.len() && is_token_byte(bytes[i]) {
+                        i += 1;
+                    }
+                    if i > start {
+                        out.push_str("****");
+                    }
                 }
             }
         }
@@ -323,11 +347,16 @@ mod tests {
 
     #[test]
     fn redacts_secrets() {
-        let s = redact("api_token=abcdef123 value enc:v1:QUJDREVGRw== Authorization: Bearer xyz.abc password: hunter2");
+        let s = redact(
+            r#"api_token=abcdef123 value enc:v1:QUJDREVGRw== Authorization: bearer xyz.abc password: hunter2 {"password":"json-secret","token": "tok 123"} secret="quoted val""#,
+        );
         assert!(!s.contains("abcdef123"));
         assert!(!s.contains("QUJDREVGRw"));
         assert!(!s.contains("xyz.abc"));
         assert!(!s.contains("hunter2"));
+        assert!(!s.contains("json-secret"));
+        assert!(!s.contains("tok 123"));
+        assert!(!s.contains("quoted val"));
         assert!(s.contains("value"));
     }
 

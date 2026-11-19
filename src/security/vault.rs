@@ -235,6 +235,20 @@ impl Vault {
     /// 合并写回：新配置中值为 __UNCHANGED__ 的字段保留旧密文；新明文重新加封。
     /// rename 用于规则改名时将旧路径前缀映射到新路径前缀（解密后按新路径重新加封）。
     pub fn merge_secrets(&self, new_cfg: &mut Config, old_cfg: &Config, rename: Option<(&str, &str)>) -> Result<(), String> {
+        let pairs: Vec<(String, String)> = rename
+            .into_iter()
+            .map(|(f, t)| (f.to_string(), t.to_string()))
+            .collect();
+        self.merge_secrets_many(new_cfg, old_cfg, &pairs)
+    }
+
+    /// 支持多条改名映射的密钥合并写回。
+    pub fn merge_secrets_many(
+        &self,
+        new_cfg: &mut Config,
+        old_cfg: &Config,
+        renames: &[(String, String)],
+    ) -> Result<(), String> {
         let old = old_cfg.secret_map();
         let mut err: Option<String> = None;
         new_cfg.for_each_secret_mut(|path, v| {
@@ -246,21 +260,28 @@ impl Vault {
                     *v = o.clone();
                     return;
                 }
-                if let Some((from, to)) = rename {
-                    if let Some(rest) = path.strip_prefix(to) {
-                        let old_path = format!("{}{}", from, rest);
-                        if let Some(o) = old.get(&old_path) {
-                            match self.reveal(&old_path, o).and_then(|p| {
-                                if p.is_empty() {
-                                    Ok(String::new())
-                                } else {
-                                    self.seal(path, p.expose())
+                for (from, to) in renames {
+                    let from_base = from.trim_end_matches('.');
+                    let to_base = to.trim_end_matches('.');
+                    if from_base.is_empty() || to_base.is_empty() {
+                        continue;
+                    }
+                    if let Some(rest) = path.strip_prefix(to_base) {
+                        if rest.is_empty() || rest.starts_with('.') {
+                            let old_path = format!("{}{}", from_base, rest);
+                            if let Some(o) = old.get(&old_path) {
+                                match self.reveal(&old_path, o).and_then(|p| {
+                                    if p.is_empty() {
+                                        Ok(String::new())
+                                    } else {
+                                        self.seal(path, p.expose())
+                                    }
+                                }) {
+                                    Ok(s) => *v = s,
+                                    Err(e) => err = Some(e),
                                 }
-                            }) {
-                                Ok(s) => *v = s,
-                                Err(e) => err = Some(e),
+                                return;
                             }
-                            return;
                         }
                     }
                 }

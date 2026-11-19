@@ -39,8 +39,7 @@ impl Drop for CancelOnDrop {
 pub fn encode_proxy_protocol_v1(client: SocketAddr, local: SocketAddr) -> Vec<u8> {
     match (client.ip(), local.ip()) {
         (IpAddr::V4(src), IpAddr::V4(dst)) => {
-            format!("PROXY TCP4 {} {} {} {}
-", src, dst, client.port(), local.port()).into_bytes()
+            format!("PROXY TCP4 {} {} {} {}\r\n", src, dst, client.port(), local.port()).into_bytes()
         }
         _ => {
             let src6 = match client.ip() {
@@ -51,8 +50,7 @@ pub fn encode_proxy_protocol_v1(client: SocketAddr, local: SocketAddr) -> Vec<u8
                 IpAddr::V6(v6) => v6,
                 IpAddr::V4(v4) => v4.to_ipv6_mapped(),
             };
-            format!("PROXY TCP6 {} {} {} {}
-", src6, dst6, client.port(), local.port()).into_bytes()
+            format!("PROXY TCP6 {} {} {} {}\r\n", src6, dst6, client.port(), local.port()).into_bytes()
         }
     }
 }
@@ -522,7 +520,10 @@ async fn run_tcp_listener(
             _ = cancel.cancelled() => break,
             _ = conns.join_next(), if !conns.is_empty() => {},
             res = listener.accept() => {
-                let Ok((inbound, peer)) = res else { continue };
+                let Ok((inbound, peer)) = res else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
                 if !is_rule_active_now(&cfg, logger::unix_now(), tz_offset_secs)
                     || !check_forward_cidr(&cfg, peer.ip())
                 {
@@ -615,40 +616,59 @@ impl Drop for OwnedPipe {
 }
 
 #[cfg(target_os = "linux")]
-async fn splice_one_way(src: &TcpStream, dst: &TcpStream, idle: Duration) -> io::Result<()> {
+async fn splice_one_way(
+    src: &TcpStream,
+    dst: &TcpStream,
+    idle: Duration,
+    start: Instant,
+    last_active_ms: &std::sync::atomic::AtomicU64,
+) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     use tokio::io::Interest;
 
     let pipe = OwnedPipe::create_bounded()?;
     let mut in_pipe = 0usize;
     let mut eof = false;
+    let idle_ms = idle.as_millis().max(1) as u64;
 
     while !eof || in_pipe > 0 {
         if !eof && in_pipe < RELAY_BUF_SIZE {
-            let read_step = src.async_io(Interest::READABLE, || {
-                let n = unsafe {
-                    libc::splice(
-                        src.as_raw_fd(),
-                        std::ptr::null_mut(),
-                        pipe.w,
-                        std::ptr::null_mut(),
-                        RELAY_BUF_SIZE - in_pipe,
-                        libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
-                    )
-                };
-                if n < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
+            loop {
+                let elapsed_since = (start.elapsed().as_millis() as u64).saturating_sub(last_active_ms.load(Ordering::Relaxed));
+                if elapsed_since >= idle_ms {
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "TCP splice 读取空闲超时"));
                 }
-            });
-            let n = tokio::time::timeout(idle, read_step)
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP splice 读取空闲超时"))??;
-            if n == 0 {
-                eof = true;
-            } else {
-                in_pipe += n;
+                let wait_dur = Duration::from_millis((idle_ms - elapsed_since).max(50));
+                let read_step = src.async_io(Interest::READABLE, || {
+                    let n = unsafe {
+                        libc::splice(
+                            src.as_raw_fd(),
+                            std::ptr::null_mut(),
+                            pipe.w,
+                            std::ptr::null_mut(),
+                            RELAY_BUF_SIZE - in_pipe,
+                            libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+                        )
+                    };
+                    if n < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                        Ok(n as usize)
+                    }
+                });
+                match tokio::time::timeout(wait_dur, read_step).await {
+                    Ok(res) => {
+                        let n = res?;
+                        if n == 0 {
+                            eof = true;
+                        } else {
+                            in_pipe += n;
+                            last_active_ms.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                        }
+                        break;
+                    }
+                    Err(_) => continue,
+                }
             }
         }
 
@@ -674,6 +694,9 @@ async fn splice_one_way(src: &TcpStream, dst: &TcpStream, idle: Duration) -> io:
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP splice 写入空闲超时"))??;
             in_pipe -= n;
+            if n > 0 {
+                last_active_ms.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+            }
         }
     }
 
@@ -683,7 +706,13 @@ async fn splice_one_way(src: &TcpStream, dst: &TcpStream, idle: Duration) -> io:
 
 #[cfg(target_os = "linux")]
 async fn splice_bidirectional(a: &TcpStream, b: &TcpStream, idle: Duration) -> io::Result<()> {
-    tokio::try_join!(splice_one_way(a, b, idle), splice_one_way(b, a, idle)).map(|_| ())
+    let start = Instant::now();
+    let last_active_ms = std::sync::atomic::AtomicU64::new(0);
+    tokio::try_join!(
+        splice_one_way(a, b, idle, start, &last_active_ms),
+        splice_one_way(b, a, idle, start, &last_active_ms)
+    )
+    .map(|_| ())
 }
 
 struct UdpSessionEntry {
@@ -711,7 +740,10 @@ async fn run_udp_proxy(
             _ = cancel.cancelled() => break,
             _ = session_tasks.join_next(), if !session_tasks.is_empty() => {},
             recv_res = recv_udp_pkt(&inbound, &mut buf) => {
-                let Ok((n, peer, local_dst_ip)) = recv_res else { continue };
+                let Ok((n, peer, local_dst_ip)) = recv_res else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
                 if !is_rule_active_now(&cfg, logger::unix_now(), tz_offset_secs)
                     || !check_forward_cidr(&cfg, peer.ip())
                 {
@@ -931,8 +963,7 @@ mod tests {
         let c: SocketAddr = "198.51.100.7:54321".parse().unwrap();
         let l: SocketAddr = "192.168.1.1:2222".parse().unwrap();
         let v1 = encode_proxy_protocol_v1(c, l);
-        assert_eq!(v1, b"PROXY TCP4 198.51.100.7 192.168.1.1 54321 2222
-");
+        assert_eq!(v1, b"PROXY TCP4 198.51.100.7 192.168.1.1 54321 2222\r\n");
 
         let v2 = encode_proxy_protocol_v2(c, l);
         assert_eq!(v2.len(), 28);

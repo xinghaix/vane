@@ -120,21 +120,40 @@ pub fn usable_ipv6_addresses(text: &str) -> std::collections::BTreeSet<(String,I
     result
 }
 
-/// 从文本响应中提取第一个合法 IPv4 或 IPv6 地址
+/// 从文本响应中提取第一个合法公网 IPv4 或 IPv6 地址（跳过 127.0.0.1 / :: 等非公网地址）
 pub fn extract_ip_from_text(text: &str, want_v6: bool) -> Option<IpAddr> {
-    for token in text.split(|c: char| !c.is_ascii_hexdigit() && c != '.' && c != ':') {
+    let mut fallback: Option<IpAddr> = None;
+    for raw_token in text.split(|c: char| !c.is_ascii_hexdigit() && c != '.' && c != ':') {
+        let mut token = raw_token.trim_end_matches('.');
+        if token.starts_with(':') && !token.starts_with("::") {
+            token = token.trim_start_matches(':');
+        }
         if token.is_empty() {
             continue;
         }
         if let Ok(ip) = token.parse::<IpAddr>() {
-            if want_v6 && ip.is_ipv6() {
-                return Some(ip);
-            } else if !want_v6 && ip.is_ipv4() {
-                return Some(ip);
+            match (want_v6, ip) {
+                (true, IpAddr::V6(v6)) => {
+                    if is_public_gua_ipv6(v6) {
+                        return Some(ip);
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(ip);
+                    }
+                }
+                (false, IpAddr::V4(v4)) => {
+                    if is_public_ipv4(v4) {
+                        return Some(ip);
+                    }
+                    if fallback.is_none() {
+                        fallback = Some(ip);
+                    }
+                }
+                _ => {}
             }
         }
     }
-    None
+    fallback
 }
 
 #[cfg(test)]
@@ -165,6 +184,15 @@ mod tests {
         assert_eq!(
             synthesize_subdevice_ipv6(p, iid),
             "240e:3b0:1234:5678:200:5eff:fe00:5301".parse::<Ipv6Addr>().unwrap()
+        );
+
+        assert_eq!(
+            extract_ip_from_text("css::before 127.0.0.1 ip:1.1.1.1.", false),
+            Some("1.1.1.1".parse().unwrap())
+        );
+        assert_eq!(
+            extract_ip_from_text(":: fe80::1 240e:3b0:1234:5678::9", true),
+            Some("240e:3b0:1234:5678::9".parse().unwrap())
         );
     }
 }

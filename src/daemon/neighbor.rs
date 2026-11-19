@@ -24,24 +24,88 @@ pub fn parse_neighbors(value: &serde_json::Value, mac: &str) -> Result<Vec<Ipv6A
     addresses.sort();addresses.dedup();Ok(addresses)
 }
 
-async fn query(interface:&str) -> Result<Vec<u8>,String> {
-    crate::firewall::validate_iface_name(interface)?;
-    if !cfg!(target_os="linux") {return Err("NDP 查询仅支持 Linux；请使用 prefix_and_iid".into());}
-    let mut child=tokio::process::Command::new("ip").args(["-j","-6","neigh","show","dev",interface])
-        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null())
-        .kill_on_drop(true).spawn().map_err(|_| "无法执行 ip -j -6 neigh，请安装 iproute2")?;
-    let mut output=Vec::new();
-    let stdout=child.stdout.take().ok_or("无法读取邻居表")?;
-    let result=tokio::time::timeout(Duration::from_secs(3),async {
-        stdout.take(256*1024+1).read_to_end(&mut output).await.map_err(|_|"读取邻居表失败")?;
-        if output.len()>256*1024 {return Err("邻居表超过大小限制");}
-        if !child.wait().await.map_err(|_|"等待邻居表命令失败")?.success() {return Err("邻居表命令失败");}
-        Ok(())
-    }).await;
-    match result {
-        Ok(Ok(()))=>Ok(output),
-        other=>{let _=child.kill().await;let _=child.wait().await;Err(match other {Ok(Err(e))=>e.into(),_=>"邻居表查询超时".into()})}
+pub fn parse_neighbors_text(text: &str, mac: &str) -> Result<Vec<Ipv6Addr>, String> {
+    let wanted = parse_mac(mac).ok_or("无效的邻居 MAC")?;
+    let mut addresses = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.is_empty() {
+            continue;
+        }
+        let Ok(ip) = parts[0].parse::<Ipv6Addr>() else { continue };
+        if !is_public_gua_ipv6(ip) {
+            continue;
+        }
+        let lladdr = parts
+            .windows(2)
+            .find(|w| w[0] == "lladdr")
+            .and_then(|w| parse_mac(w[1]));
+        if lladdr != Some(wanted) {
+            continue;
+        }
+        let upper = line.to_ascii_uppercase();
+        if upper.contains("FAILED") || upper.contains("INCOMPLETE") {
+            continue;
+        }
+        addresses.push(ip);
     }
+    addresses.sort();
+    addresses.dedup();
+    Ok(addresses)
+}
+
+async fn run_ip_neigh(args: &[&str]) -> Result<Vec<u8>, String> {
+    let mut child = tokio::process::Command::new("ip")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| "无法执行 ip 邻居查询命令")?;
+    let mut output = Vec::new();
+    let stdout = child.stdout.take().ok_or("无法读取邻居表")?;
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        stdout
+            .take(256 * 1024 + 1)
+            .read_to_end(&mut output)
+            .await
+            .map_err(|_| "读取邻居表失败")?;
+        if output.len() > 256 * 1024 {
+            return Err("邻居表超过大小限制");
+        }
+        if !child.wait().await.map_err(|_| "等待邻居表命令失败")?.success() {
+            return Err("邻居表命令失败");
+        }
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => Ok(output),
+        other => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(match other {
+                Ok(Err(e)) => e.into(),
+                _ => "邻居表查询超时".into(),
+            })
+        }
+    }
+}
+
+async fn query_neighbors(interface: &str, mac: &str) -> Result<Vec<Ipv6Addr>, String> {
+    crate::firewall::validate_iface_name(interface)?;
+    if !cfg!(target_os = "linux") {
+        return Err("NDP 查询仅支持 Linux；请使用 prefix_and_iid".into());
+    }
+    if let Ok(bytes) = run_ip_neigh(&["-j", "-6", "neigh", "show", "dev", interface]).await {
+        if let Ok(value) = serde_json::from_slice(&bytes) {
+            return parse_neighbors(&value, mac);
+        }
+    }
+    let bytes = run_ip_neigh(&["-6", "neigh", "show", "dev", interface]).await?;
+    let text = String::from_utf8_lossy(&bytes);
+    parse_neighbors_text(&text, mac)
 }
 
 pub async fn resolve(interface:&str,mac:&str,data_dir:&Path) -> Result<Option<Ipv6Addr>,String> {
@@ -57,9 +121,7 @@ pub async fn resolve(interface:&str,mac:&str,data_dir:&Path) -> Result<Option<Ip
         serde_json::from_slice::<CachedNeighbor>(&bytes).ok()
             .filter(|cache|cache.interface==interface && parse_mac(&cache.mac)==Some(mac_bytes))
     } else {None};
-    let bytes=query(interface).await?;
-    let value=serde_json::from_slice(&bytes).map_err(|_|"NDP 响应不是合法 JSON")?;
-    let addresses=parse_neighbors(&value,mac)?;
+    let addresses=query_neighbors(interface,mac).await?;
     let candidates:Vec<_>=addresses.into_iter().filter(|ip|ip.octets()[..8]==prefix.octets()[..8]).collect();
     let known=cached.as_ref().and_then(|cache|candidates.iter().copied().find(|ip|ip.octets()[8..]==cache.iid.octets()[8..]));
     let selected=known.or_else(||candidates.first().copied());

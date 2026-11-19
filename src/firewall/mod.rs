@@ -535,17 +535,25 @@ impl FirewallManager {
             return;
         }
         match rule {
-            FirewallRule::WanInput { proto, port, .. }
-            | FirewallRule::KernelDnat { proto, listen_port: port, .. } => {
+            FirewallRule::WanInput { proto, port, .. } => {
                 let port_s = port.to_string();
                 let _ = self
                     .executor
                     .run("conntrack", &["-D", "-p", proto, "--dport", &port_s], None)
                     .await;
             }
+            FirewallRule::KernelDnat { proto, listen_port: port, target, .. } => {
+                let port_s = port.to_string();
+                let target_ip = target.ip().to_string();
+                let fam = if target.is_ipv6() { "ipv6" } else { "ipv4" };
+                let _ = self
+                    .executor
+                    .run("conntrack", &["-D", "-f", fam, "-p", proto, "--dport", &port_s, "--reply-src", &target_ip], None)
+                    .await;
+            }
             FirewallRule::SubDeviceIpv6Forward { device_ip, .. } => {
                 let ip_s = device_ip.to_string();
-                let _ = self.executor.run("conntrack", &["-D", "-d", &ip_s], None).await;
+                let _ = self.executor.run("conntrack", &["-D", "-f", "ipv6", "-d", &ip_s], None).await;
             }
         }
     }

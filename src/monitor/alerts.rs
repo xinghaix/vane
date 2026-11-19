@@ -44,10 +44,14 @@ pub async fn evaluate_and_notify_alerts(
             );
             logger::log(Level::Warn, "monitor", &msg);
             for ch in &cfg.notifications {
-                if let Ok(DeliveryOutcome::Sent) =
-                    dispatch_notification(ch, vault, "high_temp", "Vane 高温告警", &msg, "critical").await
-                {
-                    logger::log(Level::Info, "monitor", &format!("已向渠道 {} 投递高温告警", ch.name));
+                match dispatch_notification(ch, vault, "high_temp", "Vane 高温告警", &msg, "critical").await {
+                    Ok(DeliveryOutcome::Sent) => {
+                        logger::log(Level::Info, "monitor", &format!("已向渠道 {} 投递高温告警", ch.name));
+                    }
+                    Ok(DeliveryOutcome::Skipped) => {}
+                    Err(e) => {
+                        logger::log(Level::Warn, "monitor", &format!("向渠道 {} 投递高温告警失败: {}", ch.name, e));
+                    }
                 }
             }
         }
@@ -63,7 +67,15 @@ pub async fn evaluate_and_notify_alerts(
             );
             logger::log(Level::Warn, "monitor", &msg);
             for ch in &cfg.notifications {
-                let _ = dispatch_notification(ch, vault, "low_memory", "Vane 低内存告警", &msg, "warning").await;
+                match dispatch_notification(ch, vault, "low_memory", "Vane 低内存告警", &msg, "warning").await {
+                    Ok(DeliveryOutcome::Sent) => {
+                        logger::log(Level::Info, "monitor", &format!("已向渠道 {} 投递低内存告警", ch.name));
+                    }
+                    Ok(DeliveryOutcome::Skipped) => {}
+                    Err(e) => {
+                        logger::log(Level::Warn, "monitor", &format!("向渠道 {} 投递低内存告警失败: {}", ch.name, e));
+                    }
+                }
             }
         }
     }

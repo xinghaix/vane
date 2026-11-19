@@ -625,3 +625,47 @@ async fn http2_authority_routes_and_streams_a_binary_response() {
     task.abort();
     let _ = task.await;
 }
+
+#[tokio::test]
+async fn websocket_works_without_ticket_when_auth_gate_disabled() {
+    use axum::extract::ws::WebSocketUpgrade;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = axum::Router::new().route(
+        "/ws",
+        axum::routing::get(|ws: WebSocketUpgrade| async move {
+            ws.on_upgrade(|mut socket| async move {
+                if let Some(Ok(msg)) = socket.recv().await {
+                    let _ = socket.send(msg).await;
+                }
+            })
+        }),
+    );
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut normal = rule(&format!("http://{address}"));
+    normal.auth_gate = false;
+    normal.websocket = true;
+    let proxy = TestProxy::start(vec![normal], Arc::new(NoAuthorization)).await;
+    let request = format!(
+        "GET /ws HTTP/1.1\r\nHost: proxy.example.com:{}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        proxy.port
+    );
+    let mut socket = proxy.tls(false).await;
+    socket.write_all(request.as_bytes()).await.unwrap();
+    let response = response_head(&mut socket).await;
+    assert!(response.starts_with(b"HTTP/1.1 101"), "unexpected response: {}", String::from_utf8_lossy(&response));
+    socket
+        .write_all(&[0x81, 0x82, 1, 2, 3, 4, b'o' ^ 1, b'k' ^ 2])
+        .await
+        .unwrap();
+    let mut echo = [0; 4];
+    tokio::time::timeout(Duration::from_secs(2), socket.read_exact(&mut echo))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(echo, [0x81, 2, b'o', b'k']);
+    drop(socket);
+    proxy.shutdown().await;
+    task.abort();
+    let _ = task.await;
+}

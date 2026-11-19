@@ -11,17 +11,17 @@ pub mod supervisor;
 pub mod web;
 
 use crate::config::{load_or_init, save_config, Config};
-use crate::daemon::acme::issue_or_renew_cert;
+use crate::daemon::acme::{issue_or_renew_cert, preload_cached_cert};
 use crate::daemon::cron::{due_seconds_window, execute_cron_job_with_ctx, CronRuntime, CronSchedule};
 use crate::daemon::ddns::sync_ddns_entry;
 use crate::daemon::notify::broadcast_event;
 use crate::firewall::FirewallManager;
 use crate::logger::Level;
-use crate::monitor::alerts::AlertState;
+use crate::monitor::alerts::{evaluate_and_notify_alerts, AlertState};
 use crate::monitor::procfs::MonitorSampler;
 use crate::net::listener::ConnectionQuota;
 use crate::net::port_forward::run_port_forward_rule;
-use crate::net::reverse_proxy::run_reverse_proxy_authorized;
+use crate::net::reverse_proxy::{run_reverse_proxy_with_options, ProxyTimeouts};
 use crate::net::stun::{new_stun_runtime, run_stun_rule};
 use crate::net::tls_resolver::{certified_key_from_pem, load_or_create_admin_cert, CertTable};
 use crate::security::auth::{AuthState, HashGate, PasswordHash, DEFAULT_INITIAL_PASSWORD};
@@ -102,6 +102,10 @@ fn main() {
             }
         }
         "check" => {
+            if !config_path.exists() {
+                eprintln!("配置校验失败: 配置文件不存在 ({})", config_path.display());
+                std::process::exit(1);
+            }
             let data_dir = config_path
                 .parent()
                 .filter(|p| !p.as_os_str().is_empty())
@@ -248,7 +252,23 @@ fn reset_admin_password(config_path: &Path) -> Result<(), String> {
     let default_hash = PasswordHash::create(DEFAULT_INITIAL_PASSWORD).map_err(|e| e.to_string())?;
     outcome.config.admin.password_hash = default_hash.encode();
     outcome.config.admin.must_change_password = true;
+    outcome.config.admin.password_login_enabled = true;
     save_config(config_path, &outcome.config)
+}
+
+async fn wait_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = sigterm.recv() => {},
+            }
+            return;
+        }
+    }
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn load_admin_tls_cert(
@@ -353,6 +373,7 @@ async fn run_gateway(config_path: PathBuf, listen_override: Option<String>) -> R
     }
 
     // 管理监听器准备完成后才启动数据面，避免管理绑定失败时先开放公网规则。
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (network_tx, network_rx) = watch::channel(0u64);
     let network_task = tokio::spawn(async move {
         if let Err(error) = daemon::network_events::watch_changes(network_tx).await {
@@ -360,8 +381,29 @@ async fn run_gateway(config_path: PathBuf, listen_override: Option<String>) -> R
         }
     });
     let state_for_sup = state.clone();
+    let sup_shutdown = shutdown_rx.clone();
     let orchestrator = tokio::spawn(async move {
-        orchestrate_modules(state_for_sup, network_rx).await;
+        orchestrate_modules(state_for_sup, network_rx, sup_shutdown).await;
+    });
+    let state_for_alert = state.clone();
+    let mut alert_shutdown = shutdown_rx.clone();
+    let alert_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {},
+                _ = alert_shutdown.changed() => {
+                    if *alert_shutdown.borrow() { break; }
+                }
+            }
+            let cfg = state_for_alert.config.load_full();
+            if cfg.notifications.iter().any(|n| n.enabled) {
+                let st = state_for_alert.clone();
+                let mcfg = cfg.monitor.clone();
+                if let Ok(sys) = tokio::task::spawn_blocking(move || st.monitor_sampler.sample(&mcfg)).await {
+                    evaluate_and_notify_alerts(&state_for_alert.alert_state, &cfg, &state_for_alert.vault, &sys).await;
+                }
+            }
+        }
     });
 
     let entry_suffix = boundary::active_secret_path(&outcome.config).unwrap_or("");
@@ -386,11 +428,13 @@ async fn run_gateway(config_path: PathBuf, listen_override: Option<String>) -> R
         }));
     }
 
-    let _ = tokio::signal::ctrl_c().await;
-    logger::log(Level::Info, "system", "收到退出信号，正在清理防火墙规则并优雅停机...");
-    orchestrator.abort();
+    wait_shutdown_signal().await;
+    logger::log(Level::Info, "system", "收到退出信号，正在优雅回收子模块并清理防火墙规则...");
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(4), orchestrator).await;
+    alert_task.abort();
     network_task.abort();
-    let _ = orchestrator.await;
+    let _ = alert_task.await;
     let _ = network_task.await;
     state.pty_mgr.notify_revoke();
     let _ = firewall.pre_start_sweep().await;
@@ -491,7 +535,11 @@ async fn reconcile_stale_firewall_and_runtime(state: &AppState, cfg: &Config) {
     state.cron_status.retain_configured(&cfg.cron);
 }
 
-async fn orchestrate_modules(state: Arc<AppState>, network_rx: watch::Receiver<u64>) {
+async fn orchestrate_modules(
+    state: Arc<AppState>,
+    network_rx: watch::Receiver<u64>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
     let mut active_stops: Vec<watch::Sender<bool>> = Vec::new();
     let mut active_tasks = tokio::task::JoinSet::new();
     loop {
@@ -506,6 +554,9 @@ async fn orchestrate_modules(state: Arc<AppState>, network_rx: watch::Receiver<u
         {
             active_tasks.abort_all();
             while active_tasks.join_next().await.is_some() {}
+        }
+        if *shutdown_rx.borrow() {
+            break;
         }
         let cfg: Arc<Config> = state.config.load_full();
         let reg = &state.health_registry;
@@ -568,7 +619,10 @@ async fn orchestrate_modules(state: Arc<AppState>, network_rx: watch::Receiver<u
             set_module_health(reg, "ddns", ModuleHealth::Disabled);
         }
 
-        // 2. ACME
+        // 2. ACME：先从磁盘预加载已有合法证书到反代与管理面（即使自动续期关闭仍保持现有 TLS 生效）
+        for entry in cfg.acme.iter().filter(|entry| entry.enabled) {
+            preload_cached_cert(entry, &cfg, &state.cert_table, &state.cert_status, &state.admin_cert).await;
+        }
         if cfg.modules.acme {
             set_module_health(reg, "acme", ModuleHealth::Running);
             for entry in cfg.acme.iter().filter(|entry| entry.enabled).cloned() {
@@ -609,6 +663,10 @@ async fn orchestrate_modules(state: Arc<AppState>, network_rx: watch::Receiver<u
         // 3. Reverse Proxy
         if cfg.modules.reverse_proxy {
             set_module_health(reg, "reverse_proxy", ModuleHealth::Running);
+            let timeouts = ProxyTimeouts {
+                tls_handshake: Duration::from_secs(cfg.security.tls_handshake_timeout_secs),
+                http_header: Duration::from_secs(cfg.security.http_header_timeout_secs),
+            };
             for rp in cfg.reverse_proxy.iter().filter(|r| r.enabled).cloned() {
                 let (stop_tx, stop_rx) = watch::channel(false);
                 active_stops.push(stop_tx);
@@ -624,7 +682,7 @@ async fn orchestrate_modules(state: Arc<AppState>, network_rx: watch::Receiver<u
                         let rp = rp.clone();
                         let st = st.clone();
                         async move {
-                            run_reverse_proxy_authorized(
+                            run_reverse_proxy_with_options(
                                 rp,
                                 st.cert_table.clone(),
                                 st.global_quota.clone(),
@@ -632,6 +690,7 @@ async fn orchestrate_modules(state: Arc<AppState>, network_rx: watch::Receiver<u
                                 st.stun_addrs.clone(),
                                 rx,
                                 st.clone(),
+                                timeouts,
                             )
                             .await
                         }
@@ -766,6 +825,25 @@ async fn orchestrate_modules(state: Arc<AppState>, network_rx: watch::Receiver<u
             },
         );
 
-        state.reload_notify.notified().await;
+        tokio::select! {
+            _ = state.reload_notify.notified() => {},
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    for stop in active_stops.drain(..) {
+                        let _ = stop.send(true);
+                    }
+                    if tokio::time::timeout(Duration::from_secs(3), async {
+                        while active_tasks.join_next().await.is_some() {}
+                    })
+                    .await
+                    .is_err()
+                    {
+                        active_tasks.abort_all();
+                        while active_tasks.join_next().await.is_some() {}
+                    }
+                    break;
+                }
+            }
+        }
     }
 }

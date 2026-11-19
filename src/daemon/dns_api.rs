@@ -48,6 +48,29 @@ fn relative_name(name: &str, zone: &Zone) -> Result<String, String> {
     if name == zone.name { return Ok("@".into()); }
     name.strip_suffix(&format!(".{}", zone.name)).map(str::to_string).ok_or_else(|| "记录不属于指定 DNS 区域".into())
 }
+fn sanitize_error_code(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if !trimmed.is_empty()
+        && trimmed.len() <= 64
+        && trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn record_matches_content(existing: &str, desired: &str, kind: &str) -> bool {
+    if matches!(kind, "A" | "AAAA") {
+        if let (Ok(a), Ok(b)) = (existing.parse::<std::net::IpAddr>(), desired.parse::<std::net::IpAddr>()) {
+            return a == b;
+        }
+    }
+    existing == desired
+}
+
 fn dnspod_line(line: &str) -> &str {
     match line { "default" => "默认", "telecom" => "电信", "unicom" => "联通", "mobile" => "移动", "oversea" => "境外", other => other }
 }
@@ -76,7 +99,15 @@ impl DnsApi {
         request.happy_eyeballs_delay_ms = self.cfg.happy_eyeballs_delay_ms;
         if let Some(body) = body { request = request.json(&body); }
         let value = shared().execute(request).await?.json()?;
-        if value.get("success").and_then(Value::as_bool) != Some(true) { return Err("Cloudflare 拒绝 DNS 请求".into()); }
+        if value.get("success").and_then(Value::as_bool) != Some(true) {
+            let code = value
+                .pointer("/errors/0/code")
+                .and_then(|v| v.as_i64().map(|n| n.to_string()).or_else(|| sanitize_error_code(v.as_str()?)));
+            return Err(match code {
+                Some(c) => format!("Cloudflare 拒绝 DNS 请求 (code={c})"),
+                None => "Cloudflare 拒绝 DNS 请求".into(),
+            });
+        }
         Ok(value)
     }
 
@@ -96,7 +127,13 @@ impl DnsApi {
             request.headers.insert("content-type".into(), "application/x-www-form-urlencoded".into());
             request.body = parameters.iter().map(|(k,v)| format!("{}={}",url_encode(k),url_encode(v))).collect::<Vec<_>>().join("&").into_bytes();
             let value = shared().execute(request).await?.json()?;
-            if value.get("Code").is_some() { return Err("阿里云拒绝 DNS 请求".into()); }
+            if let Some(code_val) = value.get("Code") {
+                let code = code_val.as_str().and_then(sanitize_error_code);
+                return Err(match code {
+                    Some(c) => format!("阿里云拒绝 DNS 请求 (code={c})"),
+                    None => "阿里云拒绝 DNS 请求".into(),
+                });
+            }
             Ok(value)
         } else {
             request = request.json(&payload);
@@ -111,10 +148,18 @@ impl DnsApi {
             let value = shared().execute(request).await?.json()?;
             let response = value.get("Response").ok_or("DNSPod 响应缺少 Response")?;
             if let Some(error) = response.get("Error") {
-                if action == "DescribeRecordList" && error.get("Code").and_then(Value::as_str) == Some("ResourceNotFound.NoDataOfRecord") {
+                let err_code = error.get("Code").and_then(Value::as_str);
+                if action == "DescribeRecordList" && err_code == Some("ResourceNotFound.NoDataOfRecord") {
                     return Ok(json!({"RecordList":[],"RecordCountInfo":{"TotalCount":0}}));
                 }
-                return Err("DNSPod 拒绝 DNS 请求".into());
+                if action == "DescribeDomainList" && err_code == Some("ResourceNotFound.NoDataOfDomain") {
+                    return Ok(json!({"DomainList":[],"DomainCountInfo":{"AllTotal":0}}));
+                }
+                let code = err_code.and_then(sanitize_error_code);
+                return Err(match code {
+                    Some(c) => format!("DNSPod 拒绝 DNS 请求 (code={c})"),
+                    None => "DNSPod 拒绝 DNS 请求".into(),
+                });
             }
             Ok(response.clone())
         }
@@ -227,6 +272,11 @@ impl DnsApi {
         let existing: Vec<_> = self.records(zone, &spec.name, &spec.kind).await?.into_iter().filter(|record| self.matches_line(record, &spec.line)).collect();
         // 多值记录必须明确选择，不允许随意覆盖其他记录。
         if existing.len() > 1 { return Err("存在多条同名同类型 DNS 记录，拒绝不明确的更新".into()); }
+        if let Some(rec) = existing.first() {
+            if record_matches_content(&rec.content, &spec.content, &spec.kind) {
+                return Ok(rec.id.clone());
+            }
+        }
         self.write_record(zone, spec, existing.first().map(|record| record.id.as_str())).await
     }
 

@@ -12,18 +12,27 @@ pub async fn apply_rules(
     bans: &BTreeMap<BanKey, u64>,
     now_unix: u64,
 ) -> Result<(), String> {
+    let has_dnat = rules.iter().any(|r| matches!(r, FirewallRule::KernelDnat { .. }));
     let script = build_nft_script(cfg, rules, bans, now_unix)?;
     exec.run("nft", &["-f", "-"], Some(script.as_bytes())).await?;
-    ensure_fw4_jumps(exec).await
+    ensure_fw4_jumps_with_dnat(exec, has_dnat).await
 }
 
 pub async fn ensure_fw4_jumps(exec: &dyn FirewallExecutor) -> Result<(), String> {
+    ensure_fw4_jumps_with_dnat(exec, true).await
+}
+
+async fn ensure_fw4_jumps_with_dnat(exec: &dyn FirewallExecutor, has_dnat: bool) -> Result<(), String> {
     for (parent, child) in [
         ("input_wan", "vane_input"),
         ("forward_wan", "vane_forward"),
         ("dstnat_wan", "vane_dstnat"),
     ] {
-        let listed = exec.run("nft", &["list", "chain", "inet", "fw4", parent], None).await?;
+        let listed = match exec.run("nft", &["list", "chain", "inet", "fw4", parent], None).await {
+            Ok(out) => out,
+            Err(e) if parent == "dstnat_wan" && !has_dnat && e.contains("No such file") => continue,
+            Err(e) => return Err(e),
+        };
         let needle = format!("jump {}", child);
         if !listed.lines().any(|line| line.trim().ends_with(&needle) || line.contains(&format!("jump {} ", child))) {
             exec.run("nft", &["insert", "rule", "inet", "fw4", parent, "jump", child], None)

@@ -50,7 +50,9 @@ impl<T: AsyncRead + Unpin> AsyncRead for TimedIo<T> {
         match Pin::new(&mut self.inner).poll_read(cx, buf) {
             Poll::Ready(result) => {
                 if result.is_ok() && buf.filled().len() > before {
-                    self.read.as_mut().reset(tokio::time::Instant::now() + timeout);
+                    let next = tokio::time::Instant::now() + timeout;
+                    self.read.as_mut().reset(next);
+                    self.write.as_mut().reset(next);
                 }
                 Poll::Ready(result)
             }
@@ -71,7 +73,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TimedIo<T> {
         match Pin::new(&mut self.inner).poll_write(cx, buf) {
             Poll::Ready(result) => {
                 if result.as_ref().is_ok_and(|n| *n > 0) {
-                    self.write.as_mut().reset(tokio::time::Instant::now() + timeout);
+                    let next = tokio::time::Instant::now() + timeout;
+                    self.write.as_mut().reset(next);
+                    self.read.as_mut().reset(next);
                 }
                 Poll::Ready(result)
             }
@@ -86,8 +90,15 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TimedIo<T> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let timeout = self.timeout;
         match Pin::new(&mut self.inner).poll_flush(cx) {
-            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Ready(result) => {
+                if result.is_ok() {
+                    let next = tokio::time::Instant::now() + timeout;
+                    self.write.as_mut().reset(next);
+                }
+                Poll::Ready(result)
+            }
             Poll::Pending => {
                 if self.write.as_mut().poll(cx).is_ready() {
                     Poll::Ready(Err(io::Error::new(io::ErrorKind::TimedOut, "刷新写入超时")))

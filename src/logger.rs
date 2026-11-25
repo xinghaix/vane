@@ -80,17 +80,28 @@ impl RingLogger {
     }
 
     pub fn push(&self, level: Level, module: &str, message: &str) {
-        let msg = truncate_utf8(&redact(message), MAX_ENTRY_BYTES);
+        let sanitized = sanitize_log_text(message);
+        let msg = truncate_utf8(&redact(&sanitized), MAX_ENTRY_BYTES);
         let ts = unix_now();
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        g.seq += 1;
-        let entry = LogEntry { seq: g.seq, ts, level, module: truncate_utf8(module, 32), message: msg };
-        let tz = g.tz_offset_secs;
+        let entry = LogEntry {
+            seq: 0,
+            ts,
+            level,
+            module: truncate_utf8(&sanitize_log_text(module), 32),
+            message: msg,
+        };
+        let tz = {
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.seq += 1;
+            let mut stored = entry.clone();
+            stored.seq = g.seq;
+            if g.buf.len() >= g.cap {
+                g.buf.pop_front();
+            }
+            g.buf.push_back(stored);
+            g.tz_offset_secs
+        };
         eprintln!("{} [{}] [{}] {}", format_rfc3339(ts, tz), level.as_str(), entry.module, entry.message);
-        if g.buf.len() >= g.cap {
-            g.buf.pop_front();
-        }
-        g.buf.push_back(entry);
     }
 
     pub fn query(&self, min_level: Option<Level>, module: Option<&str>, limit: usize, after_seq: u64) -> Vec<LogEntry> {
@@ -184,9 +195,25 @@ pub fn truncate_utf8(s: &str, max: usize) -> String {
 }
 
 const SENSITIVE_KEYS: &[&str] = &[
-    "token", "password", "passwd", "secret", "api_key", "apikey", "sign", "signature", "authorization", "access_key",
-    "hmac", "cookie",
+    "token", "password", "passwd", "secret", "secret_key", "eab_hmac_key", "private_key",
+    "api_key", "apikey", "sign", "signature", "authorization", "access_key", "hmac", "cookie",
+    "key", "vane_session", "vane_entry", "vane_ticket",
 ];
+
+fn sanitize_log_text(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| match c {
+            '\r' | '\n' | '\x1b' => ' ',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect()
+}
+
+fn is_unquoted_value_end(b: u8) -> bool {
+    b.is_ascii_whitespace() || matches!(b, b'&' | b',' | b')' | b'}' | b']' | b'"' | b'\'' | b'\r' | b'\n' | b';')
+}
 
 /// 敏感凭据脱敏：移除 enc:v1: 密文与 key=value / key: value 形式的凭据值
 pub fn redact(input: &str) -> String {
@@ -205,7 +232,15 @@ pub fn redact(input: &str) -> String {
         if input.get(i..i + 7).is_some_and(|s| s.eq_ignore_ascii_case("bearer ")) {
             out.push_str("Bearer ****");
             i += 7;
-            while i < bytes.len() && is_token_byte(bytes[i]) {
+            while i < bytes.len() && !is_unquoted_value_end(bytes[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        if input.get(i..i + 6).is_some_and(|s| s.eq_ignore_ascii_case("basic ")) {
+            out.push_str("Basic ****");
+            i += 6;
+            while i < bytes.len() && !is_unquoted_value_end(bytes[i]) {
                 i += 1;
             }
             continue;
@@ -237,6 +272,9 @@ pub fn redact(input: &str) -> String {
                 if input.get(i..i + 7).is_some_and(|s| s.eq_ignore_ascii_case("bearer ")) {
                     out.push_str("Bearer ");
                     i += 7;
+                } else if input.get(i..i + 6).is_some_and(|s| s.eq_ignore_ascii_case("basic ")) {
+                    out.push_str("Basic ");
+                    i += 6;
                 }
                 let start = i;
                 if let Some(q) = quote {
@@ -255,7 +293,7 @@ pub fn redact(input: &str) -> String {
                         i += 1;
                     }
                 } else {
-                    while i < bytes.len() && is_token_byte(bytes[i]) {
+                    while i < bytes.len() && !is_unquoted_value_end(bytes[i]) {
                         i += 1;
                     }
                     if i > start {
@@ -373,16 +411,29 @@ mod tests {
     #[test]
     fn redacts_secrets() {
         let s = redact(
-            r#"api_token=abcdef123 value enc:v1:QUJDREVGRw== Authorization: bearer xyz.abc password: hunter2 {"password":"json-secret","token": "tok 123"} secret="quoted val""#,
+            r#"api_token=abcdef123 value enc:v1:QUJDREVGRw== Authorization: bearer xyz.abc Authorization: Basic dXNlcjpwYXNz password: Vane#2026!Strong token=123456:SECRET_TAIL Cookie: vane_session=abc123; vane_entry=def456 {"password":"json-secret","token": "tok 123"} secret="quoted val""#,
         );
         assert!(!s.contains("abcdef123"));
         assert!(!s.contains("QUJDREVGRw"));
         assert!(!s.contains("xyz.abc"));
-        assert!(!s.contains("hunter2"));
+        assert!(!s.contains("dXNlcjpwYXNz"));
+        assert!(!s.contains("Vane#2026!Strong"));
+        assert!(!s.contains("Strong"));
+        assert!(!s.contains("SECRET_TAIL"));
+        assert!(!s.contains("abc123"));
+        assert!(!s.contains("def456"));
         assert!(!s.contains("json-secret"));
         assert!(!s.contains("tok 123"));
         assert!(!s.contains("quoted val"));
         assert!(s.contains("value"));
+
+        let l = RingLogger::new(50);
+        l.push(Level::Info, "test\nmod", "line1\r\n\x1b[31mfake");
+        let entry = l.query(None, None, 1, 0).pop().unwrap();
+        assert!(!entry.message.contains('\n'));
+        assert!(!entry.message.contains('\r'));
+        assert!(!entry.message.contains('\x1b'));
+        assert!(!entry.module.contains('\n'));
     }
 
     #[test]

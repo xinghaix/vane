@@ -17,7 +17,24 @@ pub const ENC_PREFIX: &str = "enc:v1:";
 const MASTER_KEY_FILE: &str = ".master.key";
 const BACKUP_MAGIC: &[u8; 8] = b"VANEBAK1";
 const BACKUP_PBKDF2_ITERS: u32 = 200_000;
+const BACKUP_MAX_ITERS: u32 = 600_000;
+const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BACKUP_FILES: usize = 256;
 const MASK_MARKER: &str = "\u{0}__VANE_SECRET__:";
+
+fn zeroize_bytes(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        // SAFETY: b 指向切片内有效可写字节
+        unsafe { std::ptr::write_volatile(b, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+fn zeroize_string(s: &mut String) {
+    // SAFETY: 清零底层缓冲区后立刻 clear()，不会在有效 UTF-8 之外暴露半截字符
+    unsafe { zeroize_bytes(s.as_bytes_mut()) };
+    s.clear();
+}
 
 /// 解密后的明文机密：Drop 时 write_volatile 逐字节清零，禁止 Debug/Display 打印明文
 pub struct SecretBytes(Vec<u8>);
@@ -242,13 +259,23 @@ impl Vault {
         self.merge_secrets_many(new_cfg, old_cfg, &pairs)
     }
 
-    /// 支持多条改名映射的密钥合并写回。
+    /// 支持多条改名映射的密钥合并写回（先匹配具体重命名，禁止跨集合或 admin.* 重映射）。
     pub fn merge_secrets_many(
         &self,
         new_cfg: &mut Config,
         old_cfg: &Config,
         renames: &[(String, String)],
     ) -> Result<(), String> {
+        let mut validated: Vec<(String, String)> = Vec::with_capacity(renames.len());
+        for (from, to) in renames {
+            let from_base = from.trim().trim_end_matches('.');
+            let to_base = to.trim().trim_end_matches('.');
+            validate_rename_pair(from_base, to_base)?;
+            validated.push((from_base.to_string(), to_base.to_string()));
+        }
+        // 最长（最具体）前缀优先，防止外层规则改名吞掉内层 deploy_hooks/rules 索引移动
+        validated.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+
         let old = old_cfg.secret_map();
         let mut err: Option<String> = None;
         new_cfg.for_each_secret_mut(|path, v| {
@@ -256,34 +283,33 @@ impl Vault {
                 return;
             }
             if v == UNCHANGED_SENTINEL {
-                if let Some(o) = old.get(path) {
-                    *v = o.clone();
-                    return;
-                }
-                for (from, to) in renames {
-                    let from_base = from.trim_end_matches('.');
-                    let to_base = to.trim_end_matches('.');
-                    if from_base.is_empty() || to_base.is_empty() {
-                        continue;
-                    }
-                    if let Some(rest) = path.strip_prefix(to_base) {
-                        if rest.is_empty() || rest.starts_with('.') {
-                            let old_path = format!("{}{}", from_base, rest);
-                            if let Some(o) = old.get(&old_path) {
-                                match self.reveal(&old_path, o).and_then(|p| {
-                                    if p.is_empty() {
-                                        Ok(String::new())
-                                    } else {
-                                        self.seal(path, p.expose())
+                if !path.starts_with("admin.") {
+                    for (from_base, to_base) in &validated {
+                        if let Some(rest) = path.strip_prefix(to_base.as_str()) {
+                            if rest.is_empty() || rest.starts_with('.') {
+                                let old_path = format!("{}{}", from_base, rest);
+                                if let Some(o) = old.get(&old_path) {
+                                    match self.reveal(&old_path, o).and_then(|p| {
+                                        if p.is_empty() {
+                                            Ok(String::new())
+                                        } else {
+                                            self.seal(path, p.expose())
+                                        }
+                                    }) {
+                                        Ok(s) => *v = s,
+                                        Err(e) => err = Some(e),
                                     }
-                                }) {
-                                    Ok(s) => *v = s,
-                                    Err(e) => err = Some(e),
+                                } else {
+                                    *v = String::new();
                                 }
                                 return;
                             }
                         }
                     }
+                }
+                if let Some(o) = old.get(path) {
+                    *v = o.clone();
+                    return;
                 }
                 *v = String::new();
                 return;
@@ -358,42 +384,64 @@ impl Vault {
         if let Some(e) = err {
             return Err(format!("解密机密字段失败: {}", e));
         }
+        let mut config_toml = toml::to_string_pretty(&plain_cfg).map_err(|e| e.to_string())?;
+        // 清理临时明文副本
+        plain_cfg.for_each_secret_mut(|_, v| zeroize_string(v));
         let payload = BackupPayload {
             version: 1,
             created_at: crate::logger::unix_now(),
-            config_toml: toml::to_string_pretty(&plain_cfg).map_err(|e| e.to_string())?,
+            config_toml: std::mem::take(&mut config_toml),
             files: files.into_iter().map(|(k, v)| (k, B64.encode(v))).collect(),
         };
         let mut body = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+        drop(payload);
         let mut salt = [0u8; 16];
         let mut nonce = [0u8; 12];
         self.rng.fill(&mut salt).map_err(|_| "随机源失败")?;
         self.rng.fill(&mut nonce).map_err(|_| "随机源失败")?;
-        let key = derive_backup_key(password, &salt, BACKUP_PBKDF2_ITERS);
-        let unbound = UnboundKey::new(&aead::CHACHA20_POLY1305, &key).map_err(|_| "无效密钥")?;
-        LessSafeKey::new(unbound)
-            .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(BACKUP_MAGIC), &mut body)
-            .map_err(|_| "备份加密失败")?;
+        let mut key = derive_backup_key(password, &salt, BACKUP_PBKDF2_ITERS);
+        let seal_res = (|| -> Result<(), String> {
+            let unbound = UnboundKey::new(&aead::CHACHA20_POLY1305, &key).map_err(|_| "无效密钥")?;
+            LessSafeKey::new(unbound)
+                .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(BACKUP_MAGIC), &mut body)
+                .map_err(|_| "备份加密失败".into())
+        })();
+        zeroize_bytes(&mut key);
+        if let Err(e) = seal_res {
+            zeroize_bytes(&mut body);
+            return Err(e);
+        }
         let mut out = Vec::with_capacity(8 + 16 + 4 + 12 + body.len());
         out.extend_from_slice(BACKUP_MAGIC);
         out.extend_from_slice(&salt);
         out.extend_from_slice(&BACKUP_PBKDF2_ITERS.to_be_bytes());
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&body);
+        zeroize_bytes(&mut body);
         Ok(out)
     }
 
     /// 导入：校验备份密码与 AEAD 标签后，用当前机器主密钥重新加封全部机密
     pub fn import_backup(&self, data: &[u8], password: &[u8]) -> Result<(Config, BTreeMap<String, Vec<u8>>), String> {
-        let payload = decrypt_backup(data, password)?;
+        let mut payload = decrypt_backup(data, password)?;
         let mut cfg = crate::config::parse_config(&payload.config_toml)?;
+        zeroize_string(&mut payload.config_toml);
         self.auto_seal(&mut cfg)?;
+        if payload.files.len() > MAX_BACKUP_FILES {
+            return Err("备份内文件数量超过上限".into());
+        }
         let mut files = BTreeMap::new();
+        let mut total_decoded = 0usize;
         for (k, v) in payload.files {
-            if k.contains('/') || k.contains("..") || k.starts_with('.') {
+            if !validate_backup_file_key(&k) {
                 return Err(format!("备份内文件名非法: {}", k));
             }
-            files.insert(k, B64.decode(v).map_err(|_| "备份内文件编码非法")?);
+            let raw = B64.decode(v).map_err(|_| "备份内文件编码非法")?;
+            total_decoded = total_decoded
+                .checked_add(raw.len())
+                .filter(|&n| n <= MAX_BACKUP_BYTES)
+                .ok_or_else(|| "备份内附加文件总大小超过 16 MiB 上限".to_string())?;
+            files.insert(k, raw);
         }
         Ok((cfg, files))
     }
@@ -407,6 +455,11 @@ pub fn sanitized_export(cfg: &Config) -> Result<String, String> {
             *v = "<redacted>".into();
         }
     });
+    for a in c.acme.iter_mut() {
+        if !a.eab_kid.is_empty() {
+            a.eab_kid = "<redacted>".into();
+        }
+    }
     c.admin.password_hash = "<redacted>".into();
     c.admin.totp_recovery_hashes.clear();
     c.admin.totp_last_step = 0;
@@ -415,6 +468,132 @@ pub fn sanitized_export(cfg: &Config) -> Result<String, String> {
         k.pubkey = "<redacted>".into();
     }
     toml::to_string_pretty(&c).map_err(|e| e.to_string())
+}
+
+fn validate_rename_pair(from_base: &str, to_base: &str) -> Result<(), String> {
+    const ALLOWED_ROOTS: &[&str] = &[
+        "dns_providers",
+        "ddns",
+        "acme",
+        "stun",
+        "cron",
+        "notifications",
+        "reverse_proxy",
+    ];
+    let Some((root, from_rest)) = from_base.split_once('.') else {
+        return Err("无效的密钥重命名路径".into());
+    };
+    let Some((to_root, to_rest)) = to_base.split_once('.') else {
+        return Err("无效的密钥重命名路径".into());
+    };
+    if root != to_root || !ALLOWED_ROOTS.contains(&root) {
+        return Err(format!("禁止跨类别或受保护区域的密钥重映射: {} -> {}", from_base, to_base));
+    }
+    if from_rest.is_empty()
+        || to_rest.is_empty()
+        || from_rest.starts_with('.')
+        || from_rest.ends_with('.')
+        || to_rest.starts_with('.')
+        || to_rest.ends_with('.')
+        || from_rest.contains("..")
+        || to_rest.contains("..")
+    {
+        return Err("无效的密钥重命名路径".into());
+    }
+
+    let is_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+
+    // 1) ACME deploy_hooks 索引移动/重命名：acme.<domain>.deploy_hooks.<idx>.url
+    if root == "acme" && (from_rest.contains(".deploy_hooks.") || to_rest.contains(".deploy_hooks.")) {
+        let valid_hook = |rest: &str| {
+            rest.rsplit_once(".deploy_hooks.").is_some_and(|(dom, tail)| {
+                !dom.is_empty()
+                    && tail.strip_suffix(".url").is_some_and(is_digits)
+            })
+        };
+        if valid_hook(from_rest) && valid_hook(to_rest) {
+            return Ok(());
+        }
+        return Err(format!("不支持的密钥重映射层级: {} -> {}", from_base, to_base));
+    }
+
+    // 2) 反向代理规则级/请求头级：reverse_proxy.<rp>.rules.<idx>[.request_headers_set.<header>]
+    if root == "reverse_proxy" && (from_rest.contains(".rules.") || to_rest.contains(".rules.")) {
+        let rule_shape = |rest: &str| -> Option<u8> {
+            let (rp, tail) = rest.rsplit_once(".rules.")?;
+            if rp.is_empty() {
+                return None;
+            }
+            if is_digits(tail) {
+                return Some(1);
+            }
+            let (idx, hdr) = tail.split_once(".request_headers_set.")?;
+            if is_digits(idx) && !hdr.is_empty() && !hdr.contains('.') {
+                return Some(2);
+            }
+            None
+        };
+        if let (Some(a), Some(b)) = (rule_shape(from_rest), rule_shape(to_rest)) {
+            if a == b {
+                return Ok(());
+            }
+        }
+        return Err(format!("不支持的密钥重映射层级: {} -> {}", from_base, to_base));
+    }
+
+    // 3) 顶层规则项整项重命名：<collection>.<name_or_domain>（支持域名/规则名内含 '.'，但禁止携带敏感子字段路径防跨字段重映射）
+    const FORBIDDEN_SUBFIELDS: &[&str] = &[
+        ".api_token",
+        ".secret_key",
+        ".token",
+        ".custom_http.",
+        ".source.",
+        ".eab_hmac_key",
+        ".deploy_hooks.",
+        ".webhook_url",
+        ".on_change_cloudflare_redirect.",
+        ".action.",
+        ".url",
+        ".secret",
+        ".body_template",
+        ".headers.",
+        ".rules.",
+    ];
+    let has_subfield = |rest: &str| {
+        FORBIDDEN_SUBFIELDS
+            .iter()
+            .any(|m| rest.contains(m) || rest.ends_with(m.trim_end_matches('.')))
+    };
+    if has_subfield(from_rest) || has_subfield(to_rest) {
+        return Err(format!("不支持的密钥重映射层级: {} -> {}", from_base, to_base));
+    }
+    Ok(())
+}
+
+pub fn validate_backup_file_key(k: &str) -> bool {
+    if k.is_empty() || k.len() > 256 || k.contains('\\') || k.contains('\0') || k.starts_with('/') {
+        return false;
+    }
+    let segs: Vec<&str> = k.split('/').collect();
+    if segs.iter().any(|s| s.is_empty() || *s == "." || *s == ".." || s.starts_with('.')) {
+        return false;
+    }
+    let is_safe_seg = |s: &str| {
+        s.len() <= 128
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    };
+    match segs.as_slice() {
+        [single] => is_safe_seg(single),
+        ["certs", name] => matches!(*name, "admin.crt" | "admin.key"),
+        ["acme-accounts", name] => {
+            name.strip_suffix(".json")
+                .is_some_and(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+        }
+        ["acme-challenges", name] => name.ends_with(".json") && is_safe_seg(name),
+        ["acme-certs", dir_name, file_name] => *file_name == "bundle.json" && is_safe_seg(dir_name),
+        _ => false,
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -433,23 +612,31 @@ fn derive_backup_key(password: &[u8], salt: &[u8], iters: u32) -> [u8; 32] {
 }
 
 fn decrypt_backup(data: &[u8], password: &[u8]) -> Result<BackupPayload, String> {
+    if data.len() > MAX_BACKUP_BYTES {
+        return Err("备份文件超过 16 MiB 大小上限".into());
+    }
     if data.len() < 8 + 16 + 4 + 12 + 16 || &data[..8] != BACKUP_MAGIC {
         return Err("不是有效的 .vane.bak 备份文件".into());
     }
     let salt = &data[8..24];
     let iters = u32::from_be_bytes([data[24], data[25], data[26], data[27]]);
-    if !(100_000..=5_000_000).contains(&iters) {
+    if !(100_000..=BACKUP_MAX_ITERS).contains(&iters) {
         return Err("备份文件迭代参数非法".into());
     }
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&data[28..40]);
     let mut body = data[40..].to_vec();
-    let key = derive_backup_key(password, salt, iters);
-    let unbound = UnboundKey::new(&aead::CHACHA20_POLY1305, &key).map_err(|_| "无效密钥")?;
-    let plain = LessSafeKey::new(unbound)
-        .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(BACKUP_MAGIC), &mut body)
-        .map_err(|_| "备份密码错误或文件已损坏")?;
-    serde_json::from_slice(plain).map_err(|e| format!("备份内容解析失败: {}", e))
+    let mut key = derive_backup_key(password, salt, iters);
+    let parsed = (|| -> Result<BackupPayload, String> {
+        let unbound = UnboundKey::new(&aead::CHACHA20_POLY1305, &key).map_err(|_| "无效密钥")?;
+        let plain = LessSafeKey::new(unbound)
+            .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(BACKUP_MAGIC), &mut body)
+            .map_err(|_| "备份密码错误或文件已损坏")?;
+        serde_json::from_slice(plain).map_err(|e| format!("备份内容解析失败: {}", e))
+    })();
+    zeroize_bytes(&mut key);
+    zeroize_bytes(&mut body);
+    parsed
 }
 
 fn replace_markers(v: &mut serde_json::Value, f: &mut dyn FnMut(&str) -> Option<serde_json::Value>) {
@@ -644,5 +831,63 @@ mod tests {
         let s = SecretBytes::new(b"topsecret".to_vec());
         assert_eq!(format!("{:?}", s), "SecretBytes(****)");
         assert_eq!(mask_plain("short"), "****");
+    }
+
+    #[test]
+    fn merge_secrets_blocks_cross_field_rename_and_preserves_hook_shift() {
+        use crate::config::{AcmeConfig, DeployHook};
+        let v = vault();
+        let mut old_cfg = sample_cfg();
+        old_cfg.admin.totp_secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".into();
+        old_cfg.acme.push(AcmeConfig {
+            domain: "example.com".into(),
+            dns_provider: "cf_home".into(),
+            deploy_hooks: vec![
+                DeployHook::Webhook {
+                    url: "https://deleted.example/hook0".into(),
+                    include_private_key: false,
+                },
+                DeployHook::Webhook {
+                    url: "https://keep-secret.example/hook1".into(),
+                    include_private_key: true,
+                },
+            ],
+            ..Default::default()
+        });
+        v.auto_seal(&mut old_cfg).unwrap();
+
+        // 1) 攻击者企图通过 _renames 把 admin.totp_secret 跨字段复制到通知请求头 -> 必须被拒绝
+        let mut exfil = old_cfg.clone();
+        exfil.notifications[0].headers.insert("x-leak".into(), UNCHANGED_SENTINEL.into());
+        assert!(v
+            .merge_secrets_many(
+                &mut exfil,
+                &old_cfg,
+                &[("admin.totp_secret".into(), "notifications.tg.headers.x-leak".into())]
+            )
+            .is_err());
+
+        // 2) 删除 deploy_hooks[0]，deploy_hooks[1] 前移为 [0]；必须继承原 hook1 URL，而非已删除的 hook0 URL
+        let mut shifted = old_cfg.clone();
+        shifted.acme[0].deploy_hooks = vec![DeployHook::Webhook {
+            url: UNCHANGED_SENTINEL.into(),
+            include_private_key: true,
+        }];
+        v.merge_secrets_many(
+            &mut shifted,
+            &old_cfg,
+            &[(
+                "acme.example.com.deploy_hooks.1.url".into(),
+                "acme.example.com.deploy_hooks.0.url".into(),
+            )],
+        )
+        .unwrap();
+        let DeployHook::Webhook { ref url, .. } = shifted.acme[0].deploy_hooks[0] else {
+            panic!("expected webhook");
+        };
+        assert_eq!(
+            v.reveal_string("acme.example.com.deploy_hooks.0.url", url).unwrap(),
+            "https://keep-secret.example/hook1"
+        );
     }
 }

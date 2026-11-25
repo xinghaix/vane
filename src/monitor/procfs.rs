@@ -397,11 +397,15 @@ fn read_soc_temperature(custom_path: &str) -> f32 {
         ]
     };
     for p in candidates {
-        if let Ok(s) = fs::read_to_string(&p) {
-            if let Ok(raw) = s.trim().parse::<f32>() {
-                let c = if raw > 1000.0 { raw / 1000.0 } else { raw };
-                if c.is_finite() && c > 0.0 && c < 150.0 {
-                    return c;
+        if let Ok(file) = fs::File::open(&p) {
+            let mut buf = String::new();
+            use std::io::Read;
+            if file.take(64).read_to_string(&mut buf).is_ok() {
+                if let Ok(raw) = buf.trim().parse::<f32>() {
+                    let c = if raw > 1000.0 { raw / 1000.0 } else { raw };
+                    if c.is_finite() && c > 0.0 && c < 150.0 {
+                        return c;
+                    }
                 }
             }
         }

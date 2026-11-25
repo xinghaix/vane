@@ -81,6 +81,14 @@ impl PasswordHash {
     }
 }
 
+struct WaitingGuard<'a>(&'a AtomicUsize);
+
+impl Drop for WaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// PBKDF2 计算闸门：Semaphore(1) 串行 + 最多 4 个排队请求，超出直接拒绝，计算放入 spawn_blocking
 pub struct HashGate {
     sem: Semaphore,
@@ -107,8 +115,9 @@ impl HashGate {
             self.waiting.fetch_sub(1, Ordering::SeqCst);
             return Err("认证请求过多，请稍后重试");
         }
+        let guard = WaitingGuard(&self.waiting);
         let permit = self.sem.acquire().await;
-        self.waiting.fetch_sub(1, Ordering::SeqCst);
+        drop(guard);
         let _permit = permit.map_err(|_| "认证队列已关闭")?;
         tokio::task::spawn_blocking(f).await.map_err(|_| "认证计算任务异常")
     }
@@ -166,6 +175,15 @@ impl AuthEngine {
         }
         let Some(n) = NonZeroU32::new(iters) else { return false };
         pbkdf2::verify(pbkdf2::PBKDF2_HMAC_SHA256, n, salt, password, expected_hash).is_ok()
+    }
+
+    /// 用户名不存在时执行等开销占位 PBKDF2 计算，消除登录耗时差异暴露管理员用户名
+    pub fn verify_dummy_password(password: &[u8], iters: u32) {
+        const DUMMY_SALT: [u8; 16] = [0x56, 0x61, 0x6e, 0x65, 0x44, 0x75, 0x6d, 0x6d, 0x79, 0x53, 0x61, 0x6c, 0x74, 0x30, 0x31, 0x21];
+        const DUMMY_HASH: [u8; 32] = [0x9f; 32];
+        let bounded = if password.is_empty() { b"x" } else if password.len() > 256 { &password[..256] } else { password };
+        let iters = iters.clamp(100_000, 1_000_000);
+        let _ = Self::verify_password(bounded, &DUMMY_SALT, &DUMMY_HASH, iters);
     }
 
     /// 判定当前密码是否仍为初始默认密码，决定签发受限改密会话还是完整管理会话
@@ -497,6 +515,22 @@ impl SessionStore {
         self.sessions.clear();
     }
 
+    pub fn revoke_all_and_reissue(
+        &mut self,
+        current_token: &str,
+        fallback_peer: BanKey,
+        scope: SessionScope,
+        ttl: Duration,
+    ) -> Result<String, &'static str> {
+        let peer = self
+            .sessions
+            .get(&Self::token_digest(current_token))
+            .map(|s| s.client_key)
+            .unwrap_or(fallback_peer);
+        self.sessions.clear();
+        self.issue(scope, peer, ttl)
+    }
+
     pub fn purge(&mut self, ttl: Duration) {
         let now = Instant::now();
         self.sessions
@@ -701,6 +735,39 @@ mod tests {
         let g = HashGate::new();
         let r = g.run(|| 21 * 2).await.unwrap();
         assert_eq!(r, 42);
+    }
+
+    #[tokio::test]
+    async fn hash_gate_does_not_leak_waiting_slots_on_cancel() {
+        let g = Arc::new(HashGate::new());
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+        let g0 = g.clone();
+        let blocker = tokio::spawn(async move {
+            g0.run(move || {
+                let _ = entered_tx.send(());
+                let _ = rx.recv_timeout(Duration::from_secs(2));
+                1
+            })
+            .await
+        });
+        let _ = entered_rx.await;
+        // 排满剩余排队位并在等待时立刻取消，不能永久卡死 HashGate
+        for _ in 0..8 {
+            let mut waiters = Vec::new();
+            for _ in 0..(HASH_QUEUE_LIMIT - 1) {
+                let gw = g.clone();
+                waiters.push(tokio::spawn(async move { gw.run(|| 2).await }));
+            }
+            tokio::task::yield_now().await;
+            for w in waiters {
+                w.abort();
+                let _ = w.await;
+            }
+        }
+        let _ = tx.send(());
+        assert_eq!(blocker.await.unwrap().unwrap(), 1);
+        assert_eq!(g.run(|| 99).await.unwrap(), 99);
     }
 
     #[test]

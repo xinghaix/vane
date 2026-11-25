@@ -77,18 +77,22 @@ impl Fail2Ban {
         let ban_dur = Duration::from_secs(ban_duration_secs.clamp(60, 86_400));
 
         if !map.contains_key(&key) && map.len() >= MAX_TRACKED_KEYS {
-            // 优先清理已过期项，否则驱逐最久未活动的未封禁项
+            // 仅清理已过期项，绝不驱逐仍处于封禁中的活跃条目（防分布式泛洪冲刷已有封禁）
             map.retain(|_, v| {
-                v.banned_until.is_some_and(|u| now < u) || now.duration_since(v.last_seen) <= FAILURE_WINDOW
+                v.banned_until.is_some_and(|u| now < u)
+                    || (v.banned_until.is_none() && now.duration_since(v.last_seen) <= FAILURE_WINDOW)
             });
             if map.len() >= MAX_TRACKED_KEYS {
-                if let Some(oldest_k) = map
+                let Some(oldest_unbanned) = map
                     .iter()
-                    .min_by_key(|(_, v)| (v.banned_until.is_some(), v.last_seen))
+                    .filter(|(_, v)| v.banned_until.is_none())
+                    .min_by_key(|(_, v)| v.last_seen)
                     .map(|(k, _)| *k)
-                {
-                    map.remove(&oldest_k);
-                }
+                else {
+                    // 全量 1024 条均处于活跃封禁期，拒绝新增以免挤掉现有封禁
+                    return false;
+                };
+                map.remove(&oldest_unbanned);
             }
         }
 
@@ -180,5 +184,23 @@ mod tests {
         assert_eq!(f2b.list_active_bans().len(), 1);
         assert!(f2b.unban("2001:db8:1111:2222::/64"));
         assert!(!f2b.is_banned("2001:db8:1111:2222::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn fail2ban_does_not_evict_active_bans_when_full() {
+        let f2b = Fail2Ban::new();
+        for i in 0..MAX_TRACKED_KEYS {
+            let ip = std::net::Ipv4Addr::new(10, 0, ((i >> 8) & 0xff) as u8, (i & 0xff) as u8);
+            let k = BanKey::from_peer(IpAddr::V4(ip));
+            for _ in 0..3 {
+                f2b.record_failure(k, 3, 600, "flood");
+            }
+        }
+        let victim = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 0));
+        assert!(f2b.is_banned(victim));
+        let extra = BanKey::from_peer("203.0.113.5".parse().unwrap());
+        assert!(!f2b.record_failure(extra, 3, 600, "extra"));
+        assert!(f2b.is_banned(victim));
+        assert_eq!(f2b.list_active_bans().len(), MAX_TRACKED_KEYS);
     }
 }

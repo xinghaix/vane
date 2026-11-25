@@ -872,6 +872,16 @@ impl Config {
                 f(&format!("notifications.{}.headers.{}", n.name, header), value);
             }
         }
+        for rp in self.reverse_proxy.iter_mut() {
+            for (i, rule) in rp.rules.iter_mut().enumerate() {
+                for (header, value) in &mut rule.request_headers_set {
+                    f(
+                        &format!("reverse_proxy.{}.rules.{}.request_headers_set.{}", rp.name, i, header),
+                        value,
+                    );
+                }
+            }
+        }
     }
 
     pub fn secret_map(&self) -> BTreeMap<String, String> {
@@ -895,11 +905,23 @@ impl Config {
         self.admin_listen_addrs().first().map(|a| a.port()).unwrap_or(23456)
     }
 
+    pub fn admin_ports(&self) -> Vec<u16> {
+        let mut ports: Vec<u16> = self.admin_listen_addrs().into_iter().map(|a| a.port()).collect();
+        if ports.is_empty() {
+            ports.push(23456);
+        }
+        ports
+    }
+
     // -----------------------------------------------------------------------
     // 校验
     // -----------------------------------------------------------------------
 
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_with_vault(None)
+    }
+
+    pub fn validate_with_vault(&self, vault: Option<&crate::security::vault::Vault>) -> Result<(), String> {
         let s = &self.system;
         if !matches!(s.language.as_str(), "zh" | "en") {
             return Err(format!("system.language 仅支持 zh 或 en，当前值: {}", s.language));
@@ -956,12 +978,39 @@ impl Config {
                 return Err(format!("Ed25519 公钥 {} 格式非法（需 ssh-ed25519 AAAA...）", k.id));
             }
         }
+        if a.totp_enabled {
+            if a.totp_secret.is_empty() {
+                return Err("启用 TOTP 时必须先配置有效密钥".into());
+            }
+            if let Some(plain_secret) = reveal_for_validation(vault, "admin.totp_secret", &a.totp_secret)? {
+                let decoded = crate::security::auth::base32_decode(&plain_secret)
+                    .ok_or_else(|| "admin.totp_secret Base32 格式非法".to_string())?;
+                if decoded.len() < 16 {
+                    return Err("admin.totp_secret 解码后长度不足 16 字节".into());
+                }
+            }
+        }
+        if !a.tls_cert_path.is_empty() || !a.tls_key_path.is_empty() {
+            if a.tls_cert_path.is_empty() || a.tls_key_path.is_empty() {
+                return Err("admin.tls_cert_path 与 admin.tls_key_path 必须成对配置".into());
+            }
+            validate_safe_abs_path("admin.tls_cert_path", &a.tls_cert_path)?;
+            validate_safe_abs_path("admin.tls_key_path", &a.tls_key_path)?;
+        }
+        for orig in &a.extra_allowed_origins {
+            if crate::web::boundary::origin_authority(orig).is_none() {
+                return Err(format!("admin.extra_allowed_origins 非法 HTTPS Origin: {}", orig));
+            }
+        }
 
         let w = &self.web_terminal;
         range("web_terminal.idle_timeout_secs", w.idle_timeout_secs, 60, 3600)?;
         range("web_terminal.max_sessions", w.max_sessions as u64, 1, 4)?;
         if w.shell != "auto" && !w.shell.starts_with('/') {
             return Err("web_terminal.shell 必须为 auto 或绝对路径".into());
+        }
+        if !w.default_cwd.is_empty() {
+            validate_safe_abs_path("web_terminal.default_cwd", &w.default_cwd)?;
         }
 
         let sec = &self.security;
@@ -982,6 +1031,12 @@ impl Config {
         range("monitor.sample_interval_secs", m.sample_interval_secs, 1, 60)?;
         range("monitor.temp_alert_celsius", m.temp_alert_celsius as u64, 40, 125)?;
         range("monitor.top_processes", m.top_processes as u64, 1, 50)?;
+        for i in &m.interfaces {
+            crate::firewall::validate_iface_name(i)?;
+        }
+        if !m.thermal_path.is_empty() {
+            validate_thermal_path(&m.thermal_path)?;
+        }
 
         for (id, p) in &self.dns_providers {
             validate_name("dns_providers.<id>", id)?;
@@ -1011,8 +1066,18 @@ impl Config {
             if d.provider == "custom_http" && d.on_missing_public_ip == "delete_record" {
                 return Err("custom_http 不支持隐式删除记录，请使用 keep_existing".into());
             }
-            if d.provider == "custom_http" && !d.custom_http.url.starts_with("http") && !d.custom_http.url.starts_with("enc:v1:") {
-                return Err(format!("ddns.{} custom_http.url 非法", d.name));
+            if d.provider == "custom_http" {
+                if let Some(u) = reveal_for_validation(vault, &format!("ddns.{}.custom_http.url", d.name), &d.custom_http.url)? {
+                    if !is_http_or_https_url(&u) {
+                        return Err(format!("ddns.{} custom_http.url 非法", d.name));
+                    }
+                }
+                for (hk, hv) in &d.custom_http.headers {
+                    http::HeaderName::from_bytes(hk.as_bytes()).map_err(|_| format!("ddns.{} custom_http Header 名非法", d.name))?;
+                    if let Some(pv) = reveal_for_validation(vault, &format!("ddns.{}.custom_http.headers.{}", d.name, hk), hv)? {
+                        http::HeaderValue::from_str(&pv).map_err(|_| format!("ddns.{} custom_http Header 值非法", d.name))?;
+                    }
+                }
             }
             if d.records.is_empty() || !d.records.iter().all(|r| r == "A" || r == "AAAA") {
                 return Err(format!("ddns.{}.records 仅支持 A / AAAA", d.name));
@@ -1042,10 +1107,26 @@ impl Config {
                     if url_v4.is_empty() && url_v6.is_empty() {
                         return Err(format!("ddns.{} external_url 至少配置一个地址", d.name));
                     }
+                    if !url_v4.is_empty() {
+                        if let Some(u) = reveal_for_validation(vault, &format!("ddns.{}.source.url_v4", d.name), url_v4)? {
+                            if !is_http_or_https_url(&u) {
+                                return Err(format!("ddns.{} external_url.url_v4 非法", d.name));
+                            }
+                        }
+                    }
+                    if !url_v6.is_empty() {
+                        if let Some(u) = reveal_for_validation(vault, &format!("ddns.{}.source.url_v6", d.name), url_v6)? {
+                            if !is_http_or_https_url(&u) {
+                                return Err(format!("ddns.{} external_url.url_v6 非法", d.name));
+                            }
+                        }
+                    }
                 }
                 DdnsSource::CustomHttpExtract { url } => {
-                    if !url.starts_with("http") && !url.starts_with("enc:v1:") {
-                        return Err(format!("ddns.{} custom_http_extract.url 非法", d.name));
+                    if let Some(u) = reveal_for_validation(vault, &format!("ddns.{}.source.url", d.name), url)? {
+                        if !is_http_or_https_url(&u) {
+                            return Err(format!("ddns.{} custom_http_extract.url 非法", d.name));
+                        }
                     }
                 }
             }
@@ -1060,12 +1141,16 @@ impl Config {
             }
         }
 
-        let mut names = Vec::new();
+        let mut acme_domains: Vec<String> = Vec::new();
         if self.acme.len()>32 {return Err("ACME 规则数超过 32 条上限".into());}
         if self.acme.iter().filter(|entry|entry.enabled && entry.use_for_admin).count()>1 {return Err("最多允许一条 ACME 规则更新管理证书".into());}
         for a in &self.acme {
             validate_domain(&a.domain)?;
-            unique(&mut names, "acme", &a.domain)?;
+            let dom_low = a.domain.to_ascii_lowercase();
+            if acme_domains.contains(&dom_low) {
+                return Err(format!("acme 名称重复: {}", a.domain));
+            }
+            acme_domains.push(dom_low);
             for e in &a.extra_domains {
                 validate_domain(e)?;
             }
@@ -1081,14 +1166,31 @@ impl Config {
                 return Err(format!("acme.{}.directory_url 非法", a.domain));
             }
             if !a.challenge_alias_domain.is_empty() {
+                if a.challenge_alias_domain.contains('*') {
+                    return Err(format!("acme.{}.challenge_alias_domain 不允许通配符", a.domain));
+                }
                 validate_domain(a.challenge_alias_domain.strip_prefix("_acme-challenge.").unwrap_or(&a.challenge_alias_domain))?;
             }
-            if !a.cert_dir.starts_with('/') {
-                return Err("acme.cert_dir 必须为绝对路径".into());
+            validate_safe_abs_dir("acme.cert_dir", &a.cert_dir)?;
+            for (hi, h) in a.deploy_hooks.iter().enumerate() {
+                match h {
+                    DeployHook::CopyToDir { dir } => validate_safe_abs_dir("acme.deploy_hooks.copy_to_dir", dir)?,
+                    DeployHook::Webhook { url, include_private_key } => {
+                        if let Some(plain_url) = reveal_for_validation(vault, &format!("acme.{}.deploy_hooks.{}.url", a.domain, hi), url)? {
+                            if *include_private_key {
+                                if !plain_url.starts_with("https://") {
+                                    return Err(format!("acme.{}: 携带私钥的 Webhook 必须使用 HTTPS", a.domain));
+                                }
+                            } else if !is_http_or_https_url(&plain_url) {
+                                return Err(format!("acme.{}: Webhook URL 非法", a.domain));
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        let admin_port = self.admin_port();
+        let admin_ports = self.admin_ports();
         let mut names = Vec::new();
         let mut used_ports: Vec<(u16, &'static str)> = Vec::new();
         for r in &self.reverse_proxy {
@@ -1098,8 +1200,11 @@ impl Config {
             if r.listen_port == 0 {
                 return Err(format!("reverse_proxy.{} 禁止使用 0 端口", r.name));
             }
+            if admin_ports.contains(&r.listen_port) {
+                return Err(format!("安全底线拦截：reverse_proxy.{} 端口 {} 与管理端口冲突", r.name, r.listen_port));
+            }
             if r.open_wan_firewall {
-                crate::firewall::validate_wan_input_port(r.listen_port, admin_port, "wan")?;
+                crate::firewall::validate_wan_input_ports(r.listen_port, &admin_ports, "wan")?;
             }
             range("reverse_proxy.max_concurrent_conns", r.max_concurrent_conns as u64, 1, 4096)?;
             if r.enabled {
@@ -1108,8 +1213,9 @@ impl Config {
                 }
                 used_ports.push((r.listen_port, "tcp"));
             }
-            for rule in &r.rules {
-                validate_rule(rule).map_err(|e| format!("reverse_proxy.{} 规则 {}: {}", r.name, rule.host, e))?;
+            for (ri, rule) in r.rules.iter().enumerate() {
+                validate_rule(&r.name, ri, rule, vault, &admin_ports, &self.admin.listen_lan)
+                    .map_err(|e| format!("reverse_proxy.{} 规则 {}: {}", r.name, rule.host, e))?;
             }
         }
 
@@ -1127,6 +1233,9 @@ impl Config {
             if p.listen_port == 0 {
                 return Err(format!("port_forwards.{} 禁止使用 0 端口", p.name));
             }
+            if admin_ports.contains(&p.listen_port) {
+                return Err(format!("安全底线拦截：port_forwards.{} 端口 {} 与管理端口冲突", p.name, p.listen_port));
+            }
             if !matches!(p.load_balance.as_str(), "failover" | "round_robin") {
                 return Err(format!("port_forwards.{}.load_balance 非法", p.name));
             }
@@ -1143,11 +1252,11 @@ impl Config {
                 if a.port() == 0 {
                     return Err(format!("port_forwards.{} 目标端口不能为 0", p.name));
                 }
-                crate::firewall::validate_forward_target_safety(
+                crate::firewall::validate_forward_target_safety_multi(
                     a,
                     &p.engine,
                     p.open_wan_firewall,
-                    admin_port,
+                    &admin_ports,
                     &self.admin.listen_lan,
                 )
                 .map_err(|e| format!("port_forwards.{}: {}", p.name, e))?;
@@ -1165,9 +1274,9 @@ impl Config {
                     return Err(format!("port_forwards.{}: kernel_dnat 需要 stack 与目标地址同协议族（不支持 dual 跨栈）", p.name));
                 }
             }
-            // 用户态引擎监听本机端口 -> 走 WAN INPUT，需要受保护端口校验
-            if p.engine == "userspace_splice" && p.open_wan_firewall {
-                crate::firewall::validate_wan_input_port(p.listen_port, admin_port, "wan")?;
+            // 用户态放行 WAN 或 kernel_dnat（始终下发 WAN 规则）均受 WAN 端口安全基线校验
+            if p.open_wan_firewall || p.engine == "kernel_dnat" {
+                crate::firewall::validate_wan_input_ports(p.listen_port, &admin_ports, "wan")?;
             }
             if !p.bind_interface.is_empty() {
                 crate::firewall::validate_iface_name(&p.bind_interface)?;
@@ -1209,12 +1318,12 @@ impl Config {
                 validate_stun_server(srv).map_err(|e| format!("stun.{}: {}", s.name, e))?;
             }
             range("stun.keepalive_secs", s.keepalive_secs, 5, 3600)?;
-            if !s.webhook_url.is_empty()
-                && !s.webhook_url.starts_with("http://")
-                && !s.webhook_url.starts_with("https://")
-                && !s.webhook_url.starts_with("enc:v1:")
-            {
-                return Err(format!("stun.{}.webhook_url 非法", s.name));
+            if !s.webhook_url.is_empty() {
+                if let Some(u) = reveal_for_validation(vault, &format!("stun.{}.webhook_url", s.name), &s.webhook_url)? {
+                    if !u.is_empty() && !is_http_or_https_url(&u) {
+                        return Err(format!("stun.{}.webhook_url 非法", s.name));
+                    }
+                }
             }
             if let Some(ref cf) = s.on_change_cloudflare_redirect {
                 for (field, val) in [("zone_id", &cf.zone_id), ("ruleset_id", &cf.ruleset_id), ("rule_id", &cf.rule_id)] {
@@ -1240,9 +1349,10 @@ impl Config {
             crate::daemon::cron::CronSchedule::parse(&c.schedule).map_err(|e| format!("cron.{}: {}", c.name, e))?;
             range("cron.timeout_secs", c.timeout_secs, 1, 86_400)?;
             match &c.action {
-                CronAction::Exec { program, .. } => {
-                    if !program.starts_with('/') {
-                        return Err(format!("cron.{}: exec.program 必须为绝对路径", c.name));
+                CronAction::Exec { program, cwd, .. } => {
+                    validate_safe_abs_path(&format!("cron.{}.exec.program", c.name), program)?;
+                    if !cwd.is_empty() {
+                        validate_safe_abs_path(&format!("cron.{}.exec.cwd", c.name), cwd)?;
                     }
                 }
                 CronAction::RuleToggle { target_kind, .. } => {
@@ -1250,9 +1360,21 @@ impl Config {
                         return Err(format!("cron.{}: rule_toggle.target_kind 非法", c.name));
                     }
                 }
-                CronAction::HttpRequest { url, .. } => {
-                    if !url.starts_with("http://") && !url.starts_with("https://") && !url.starts_with("enc:v1:") {
-                        return Err(format!("cron.{}: http_request.url 非法", c.name));
+                CronAction::HttpRequest { method, url, headers, .. } => {
+                    let m = method.trim();
+                    if !m.is_empty() && !matches!(m.to_ascii_uppercase().as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD") {
+                        return Err(format!("cron.{}: http_request.method 非法", c.name));
+                    }
+                    if let Some(u) = reveal_for_validation(vault, &format!("cron.{}.action.url", c.name), url)? {
+                        if !is_http_or_https_url(&u) {
+                            return Err(format!("cron.{}: http_request.url 非法", c.name));
+                        }
+                    }
+                    for (hk, hv) in headers {
+                        http::HeaderName::from_bytes(hk.as_bytes()).map_err(|_| format!("cron.{}: Header 名非法", c.name))?;
+                        if let Some(pv) = reveal_for_validation(vault, &format!("cron.{}.action.headers.{}", c.name, hk), hv)? {
+                            http::HeaderValue::from_str(&pv).map_err(|_| format!("cron.{}: Header 值非法", c.name))?;
+                        }
                     }
                 }
                 _ => {}
@@ -1275,12 +1397,25 @@ impl Config {
             if !n.method.is_empty() && !matches!(n.method.as_str(), "GET" | "POST" | "PUT" | "PATCH") {
                 return Err(format!("notifications.{}.method 非法: {}", n.name, n.method));
             }
-            if !n.body_template.is_empty()
-                && !n.body_template.starts_with("enc:v1:")
-                && n.body_template != UNCHANGED_SENTINEL
-                && serde_json::from_str::<serde_json::Value>(&n.body_template).is_err()
-            {
-                return Err(format!("notifications.{}.body_template 必须是合法 JSON", n.name));
+            if !n.url.is_empty() {
+                if let Some(u) = reveal_for_validation(vault, &format!("notifications.{}.url", n.name), &n.url)? {
+                    if !u.is_empty() && !is_http_or_https_url(&u) {
+                        return Err(format!("notifications.{}.url 非法", n.name));
+                    }
+                }
+            }
+            for (hk, hv) in &n.headers {
+                http::HeaderName::from_bytes(hk.as_bytes()).map_err(|_| format!("notifications.{}.headers 名非法", n.name))?;
+                if let Some(pv) = reveal_for_validation(vault, &format!("notifications.{}.headers.{}", n.name, hk), hv)? {
+                    http::HeaderValue::from_str(&pv).map_err(|_| format!("notifications.{}.headers 值非法", n.name))?;
+                }
+            }
+            if !n.body_template.is_empty() && n.body_template != UNCHANGED_SENTINEL {
+                if let Some(plain_tpl) = reveal_for_validation(vault, &format!("notifications.{}.body_template", n.name), &n.body_template)? {
+                    if !plain_tpl.is_empty() && serde_json::from_str::<serde_json::Value>(&plain_tpl).is_err() {
+                        return Err(format!("notifications.{}.body_template 必须是合法 JSON", n.name));
+                    }
+                }
             }
         }
         Ok(())
@@ -1295,9 +1430,56 @@ fn proto_kinds(p: &str) -> Vec<&'static str> {
     }
 }
 
+fn reveal_for_validation(
+    vault: Option<&crate::security::vault::Vault>,
+    field_path: &str,
+    raw: &str,
+) -> Result<Option<String>, String> {
+    if !raw.starts_with(crate::security::vault::ENC_PREFIX) {
+        return Ok(Some(raw.to_string()));
+    }
+    match vault {
+        Some(v) => v.open(field_path, raw).map(|sb| Some(sb.expose_str().to_string())),
+        None => Ok(None),
+    }
+}
+
+fn is_http_or_https_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+fn validate_safe_abs_path(field: &str, p: &str) -> Result<(), String> {
+    if !p.starts_with('/') || p.contains('\0') || p.split('/').any(|seg| seg == "..") {
+        return Err(format!("{} 必须为不含 .. 的绝对路径", field));
+    }
+    Ok(())
+}
+
+fn validate_safe_abs_dir(field: &str, p: &str) -> Result<(), String> {
+    validate_safe_abs_path(field, p)?;
+    let trimmed = p.trim_end_matches('/');
+    if trimmed.is_empty()
+        || matches!(trimmed, "/etc" | "/usr" | "/bin" | "/sbin" | "/proc" | "/sys" | "/dev" | "/lib")
+    {
+        return Err(format!("{} 不能指向系统关键根目录: {}", field, p));
+    }
+    Ok(())
+}
+
+fn validate_thermal_path(p: &str) -> Result<(), String> {
+    validate_safe_abs_path("monitor.thermal_path", p)?;
+    if !(p.starts_with("/sys/class/thermal/")
+        || p.starts_with("/sys/class/hwmon/")
+        || p.starts_with("/sys/devices/"))
+    {
+        return Err("monitor.thermal_path 必须位于 /sys/class/thermal/、/sys/class/hwmon/ 或 /sys/devices/ 下".into());
+    }
+    Ok(())
+}
+
 fn validate_stun_server(s: &str) -> Result<(), String> {
     if let Ok(sock) = s.parse::<SocketAddr>() {
-        if sock.port() == 0 || sock.ip().is_unspecified() {
+        if sock.port() == 0 || sock.ip().is_unspecified() || sock.ip().is_loopback() {
             return Err(format!("STUN 服务器地址非法: {}", s));
         }
         return Ok(());
@@ -1310,28 +1492,80 @@ fn validate_stun_server(s: &str) -> Result<(), String> {
         return Err(format!("STUN 服务器端口不能为 0: {}", s));
     }
     let clean_host = host.trim_matches(['[', ']']);
-    if clean_host.parse::<IpAddr>().is_ok() {
+    if let Ok(ip) = clean_host.parse::<IpAddr>() {
+        if ip.is_unspecified() || ip.is_loopback() {
+            return Err(format!("STUN 服务器地址非法: {}", s));
+        }
         return Ok(());
+    }
+    if clean_host.contains('*') {
+        return Err(format!("STUN 服务器不允许通配域名: {}", s));
     }
     validate_domain(clean_host)
 }
 
-fn validate_rule(r: &ReverseProxyRule) -> Result<(), String> {
+fn validate_rule(
+    rp_name: &str,
+    rule_idx: usize,
+    r: &ReverseProxyRule,
+    vault: Option<&crate::security::vault::Vault>,
+    admin_ports: &[u16],
+    admin_listeners: &[String],
+) -> Result<(), String> {
     validate_domain(&r.host)?;
-    if !r.path_prefix.starts_with('/') {
-        return Err("path_prefix 必须以 / 开头".into());
+    if !r.path_prefix.starts_with('/')
+        || r.path_prefix.contains("//")
+        || r.path_prefix.contains('\\')
+        || r.path_prefix.contains('?')
+        || r.path_prefix.contains('#')
+        || r.path_prefix.bytes().any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        || r.path_prefix.split('/').any(|seg| seg == ".." || seg == ".")
+    {
+        return Err("path_prefix 必须为以 / 开头的规范路径（禁止 .. / // / 查询串 / 空白）".into());
     }
     match r.mode.as_str() {
         "proxy" => {
-            let uri:http::Uri=r.upstream.parse().map_err(|_|"upstream URL 无效")?;
-            if !matches!(uri.scheme_str(),Some("http")|Some("https"))||uri.authority().is_none_or(|value|value.as_str().contains('@'))||r.upstream.contains('#')||uri.port_u16()==Some(0){
+            let uri: http::Uri = r.upstream.parse().map_err(|_| "upstream URL 无效")?;
+            if !matches!(uri.scheme_str(), Some("http") | Some("https"))
+                || uri.authority().is_none_or(|value| value.as_str().contains('@'))
+                || r.upstream.contains('#')
+                || uri.port_u16() == Some(0)
+            {
                 return Err("upstream 必须为有效 HTTP/HTTPS URL，不能包含用户信息、fragment 或 0 端口".into());
+            }
+            if let Some(auth) = uri.authority() {
+                let default_port = if uri.scheme_str() == Some("https") { 443 } else { 80 };
+                let target_sock = auth.as_str().parse::<SocketAddr>().ok().or_else(|| {
+                    let h = auth.host().trim_matches(['[', ']']);
+                    let port = auth.port_u16().unwrap_or(default_port);
+                    if h.eq_ignore_ascii_case("localhost") {
+                        Some(SocketAddr::from(([127, 0, 0, 1], port)))
+                    } else {
+                        h.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, port))
+                    }
+                });
+                if let Some(sock) = target_sock {
+                    crate::firewall::validate_forward_target_safety_multi(
+                        sock,
+                        "userspace_splice",
+                        true,
+                        admin_ports,
+                        admin_listeners,
+                    )?;
+                }
             }
         }
         "redirect" => {
             if r.redirect_url.is_empty() {
                 return Err("redirect 模式需要 redirect_url".into());
             }
+            let ok_scheme = r.redirect_url.starts_with("http://")
+                || r.redirect_url.starts_with("https://")
+                || (r.redirect_url.starts_with('/') && !r.redirect_url.starts_with("//"));
+            if !ok_scheme {
+                return Err("redirect_url 必须以 http://、https:// 或单斜杠 / 开头".into());
+            }
+            http::HeaderValue::from_str(&r.redirect_url).map_err(|_| "redirect_url 包含非法 Header 字符")?;
             if !matches!(r.redirect_code, 301 | 302 | 307 | 308) {
                 return Err("redirect_code 仅支持 301/302/307/308".into());
             }
@@ -1355,16 +1589,39 @@ fn validate_rule(r: &ReverseProxyRule) -> Result<(), String> {
     for c in r.allowed_cidrs.iter().chain(r.denied_cidrs.iter()) {
         parse_cidr(c)?;
     }
-    for (k, v) in r.request_headers_set.iter().chain(r.response_headers_set.iter()) {
+    for (k, v) in &r.request_headers_set {
         http::HeaderName::from_bytes(k.as_bytes()).map_err(|_| format!("Header 名非法: {}", k))?;
-        if crate::net::reverse_proxy::HOP_BY_HOP_HEADERS.contains(&k.to_ascii_lowercase().as_str()) || k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("host") {return Err("自定义 Header 不能覆盖协议控制字段，Host 请使用 upstream_host_header".into());}
+        if crate::net::reverse_proxy::HOP_BY_HOP_HEADERS.contains(&k.to_ascii_lowercase().as_str())
+            || k.eq_ignore_ascii_case("content-length")
+            || k.eq_ignore_ascii_case("host")
+        {
+            return Err("自定义 Header 不能覆盖协议控制字段，Host 请使用 upstream_host_header".into());
+        }
+        let field_path = format!("reverse_proxy.{}.rules.{}.request_headers_set.{}", rp_name, rule_idx, k);
+        if let Some(plain) = reveal_for_validation(vault, &field_path, v)? {
+            http::HeaderValue::from_str(&plain).map_err(|_| format!("Header 值非法: {}", k))?;
+        }
+    }
+    for (k, v) in &r.response_headers_set {
+        http::HeaderName::from_bytes(k.as_bytes()).map_err(|_| format!("Header 名非法: {}", k))?;
+        if crate::net::reverse_proxy::HOP_BY_HOP_HEADERS.contains(&k.to_ascii_lowercase().as_str())
+            || k.eq_ignore_ascii_case("content-length")
+            || k.eq_ignore_ascii_case("host")
+        {
+            return Err("自定义 Header 不能覆盖协议控制字段，Host 请使用 upstream_host_header".into());
+        }
         http::HeaderValue::from_str(v).map_err(|_| format!("Header 值非法: {}", k))?;
     }
     for key in r.request_headers_remove.iter().chain(r.response_headers_remove.iter()) {
-        http::HeaderName::from_bytes(key.as_bytes()).map_err(|_|"待移除 Header 名非法")?;
+        http::HeaderName::from_bytes(key.as_bytes()).map_err(|_| "待移除 Header 名非法")?;
+        if key.eq_ignore_ascii_case("host") || key.eq_ignore_ascii_case("content-length") {
+            return Err("禁止移除 Host 或 Content-Length 协议关键头".into());
+        }
     }
-    if !r.upstream_host_header.is_empty(){http::HeaderValue::from_str(&r.upstream_host_header).map_err(|_|"upstream_host_header 非法")?;}
-    http::HeaderValue::from_str(&r.static_content_type).map_err(|_|"static_content_type 非法")?;
+    if !r.upstream_host_header.is_empty() {
+        http::HeaderValue::from_str(&r.upstream_host_header).map_err(|_| "upstream_host_header 非法")?;
+    }
+    http::HeaderValue::from_str(&r.static_content_type).map_err(|_| "static_content_type 非法")?;
     if r.read_timeout_secs == 0 || r.read_timeout_secs > 86_400 {
         return Err("read_timeout_secs 范围 1 ~ 86400".into());
     }
@@ -1522,7 +1779,7 @@ pub fn parse_tz_offset(s: &str) -> Option<i64> {
     };
     let (h, m) = if let Some((h, m)) = rest.split_once(':') {
         (h, m)
-    } else if rest.len() == 4 {
+    } else if rest.len() == 4 && rest.is_ascii() {
         (&rest[..2], &rest[2..])
     } else {
         (rest, "0")
@@ -1564,6 +1821,9 @@ pub fn parse_posix_tz(tz: &str) -> Option<i64> {
     let (h, m) = num.split_once(':').unwrap_or((num, "0"));
     let h: i64 = h.parse().ok()?;
     let m: i64 = m.parse().ok()?;
+    if h > 24 || m > 59 {
+        return None;
+    }
     Some(sign * (h * 3600 + m * 60))
 }
 
@@ -1573,6 +1833,16 @@ pub fn parse_posix_tz(tz: &str) -> Option<i64> {
 
 /// 掉电安全原子写：0600 临时文件 (O_CREAT|O_EXCL) -> sync_all -> .bak 备份 -> rename -> 父目录 sync_all
 pub fn crash_safe_atomic_write(target: &Path, data: &[u8], pid_nonce: u64) -> std::io::Result<()> {
+    crash_safe_atomic_write_with_mode(target, data, pid_nonce, 0o600, true)
+}
+
+pub fn crash_safe_atomic_write_with_mode(
+    target: &Path,
+    data: &[u8],
+    pid_nonce: u64,
+    mode: u32,
+    write_bak: bool,
+) -> std::io::Result<()> {
     let parent = match target.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
@@ -1587,8 +1857,23 @@ pub fn crash_safe_atomic_write(target: &Path, data: &[u8], pid_nonce: u64) -> st
     bak_name.push(".bak");
     let bak_path = PathBuf::from(bak_name);
 
+    let existing_meta = match fs::symlink_metadata(target) {
+        Ok(m) => {
+            if m.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "拒绝向符号链接目标执行原子写入",
+                ));
+            }
+            Some(m)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+
     let write_res = (|| -> std::io::Result<()> {
-        let mut tmp_file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp_path)?;
+        let mut tmp_file = OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp_path)?;
+        tmp_file.set_permissions(fs::Permissions::from_mode(mode))?;
         tmp_file.write_all(data)?;
         tmp_file.sync_all()?; // 1. 刷入文件内容与 inode
         Ok(())
@@ -1599,17 +1884,22 @@ pub fn crash_safe_atomic_write(target: &Path, data: &[u8], pid_nonce: u64) -> st
         return Err(e);
     }
 
-    if target.exists() {
-        if let Ok(old) = fs::read(target) {
-            let bak_tmp = parent.join(format!(".{}.{:016x}.baktmp", file_name, pid_nonce));
-            let ok = (|| -> std::io::Result<()> {
-                let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&bak_tmp)?;
-                f.write_all(&old)?;
-                f.sync_all()?;
-                fs::rename(&bak_tmp, &bak_path)
-            })();
-            if ok.is_err() {
-                let _ = fs::remove_file(&bak_tmp);
+    if write_bak {
+        if let Some(m) = existing_meta {
+            if m.is_file() && m.len() <= 16 * 1024 * 1024 {
+                if let Ok(old) = fs::read(target) {
+                    let bak_tmp = parent.join(format!(".{}.{:016x}.baktmp", file_name, pid_nonce));
+                    let ok = (|| -> std::io::Result<()> {
+                        let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&bak_tmp)?;
+                        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+                        f.write_all(&old)?;
+                        f.sync_all()?;
+                        fs::rename(&bak_tmp, &bak_path)
+                    })();
+                    if ok.is_err() {
+                        let _ = fs::remove_file(&bak_tmp);
+                    }
+                }
             }
         }
     }
@@ -1618,7 +1908,6 @@ pub fn crash_safe_atomic_write(target: &Path, data: &[u8], pid_nonce: u64) -> st
         let _ = fs::remove_file(&tmp_path);
         return Err(e);
     }
-    fs::set_permissions(target, fs::Permissions::from_mode(0o600))?;
 
     // 3. 对父目录执行 fsync，确保 rename 后的目录项持久写入闪存
     if let Ok(dir_fd) = File::open(&parent) {
@@ -1816,5 +2105,52 @@ mod tests {
         let again = load_or_init(&p).unwrap();
         assert!(!again.dirty);
         fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn vault_aware_validation_and_utf8_tz_safety() {
+        assert_eq!(parse_tz_offset("+😀"), None);
+        assert_eq!(parse_tz_offset("+中a"), None);
+        assert_eq!(parse_posix_tz("FOO-9999999999999"), None);
+
+        let vault = crate::security::vault::Vault::from_master(&[5u8; 32]);
+        let mut c = Config::default();
+        c.admin.totp_enabled = true;
+        c.admin.totp_secret = vault.seal("admin.totp_secret", b"INVALID!").unwrap();
+        assert!(c.validate_with_vault(Some(&vault)).is_err());
+
+        c.admin.totp_enabled = false;
+        c.admin.totp_secret.clear();
+        c.reverse_proxy.push(ReverseProxyConfig {
+            name: "rp1".into(),
+            listen_port: 8443,
+            rules: vec![ReverseProxyRule {
+                host: "app.example.com".into(),
+                upstream: "http://192.168.1.50:3000".into(),
+                request_headers_set: [(
+                    "Authorization".into(),
+                    vault
+                        .seal("reverse_proxy.rp1.rules.0.request_headers_set.Authorization", b"Bearer secret-tok")
+                        .unwrap(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        c.validate_with_vault(Some(&vault)).unwrap();
+
+        c.reverse_proxy[0].rules[0].request_headers_set.insert(
+            "X-Bad".into(),
+            vault
+                .seal("reverse_proxy.rp1.rules.0.request_headers_set.X-Bad", b"line1\r\nEvil: 1")
+                .unwrap(),
+        );
+        assert!(c.validate_with_vault(Some(&vault)).is_err());
+
+        c.reverse_proxy[0].rules[0].request_headers_set.remove("X-Bad");
+        c.reverse_proxy[0].rules[0].upstream = "https://192.168.1.1:23456".into();
+        assert!(c.validate_with_vault(Some(&vault)).is_err());
     }
 }

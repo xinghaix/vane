@@ -344,7 +344,7 @@ export function encodeQrMatrix(text) {
 
 export function renderQrSvgDataUri(text) {
   const { size, matrix } = encodeQrMatrix(text);
-  const q = 2; // quiet zone modules
+  const q = 4; // ISO/IEC 18004 standard quiet zone (4 modules)
   const dim = size + q * 2;
   let path = '';
   for (let r = 0; r < size; r++) {

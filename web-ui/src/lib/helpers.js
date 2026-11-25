@@ -34,7 +34,93 @@ export function localizeError(rawMsg, lang = 'zh', code = '') {
   if (code && dict[code]) return dict[code];
   const msg = String(rawMsg || '').trim();
   if (dict[msg]) return dict[msg];
+  if (lang === 'en' && msg) {
+    const zhFallback = [
+      ['认证繁忙', 'Authentication queue busy, please retry shortly.'],
+      ['繁忙', 'Server busy, please retry shortly.'],
+      ['原密码错误', 'Current password is incorrect.'],
+      ['备份密码错误或文件已损坏', 'Incorrect backup password or corrupted archive.'],
+      ['不是有效的 .vane.bak 备份文件', 'Invalid .vane.bak backup archive.'],
+      ['备份文件超过 16 MiB 大小上限', 'Backup file exceeds the 16 MiB limit.'],
+      ['Docker 模块已关闭', 'Docker module is disabled.'],
+      ['已达到最大并发 Web 终端会话数上限', 'Maximum concurrent Web Terminal sessions reached.'],
+      ['端口冲突', 'Listen port conflict detected.'],
+      ['安全底线拦截', 'Blocked by gateway security guardrail.'],
+      ['配置格式错误', 'Invalid configuration payload.'],
+      ['转发规则不存在', 'Port-forward rule not found.'],
+      ['DDNS 规则不存在', 'DDNS rule not found.'],
+    ];
+    for (const [needle, enText] of zhFallback) {
+      if (msg.includes(needle)) return enText;
+    }
+  }
   return msg || (lang === 'en' ? 'Operation failed' : '操作失败');
+}
+
+export function translateRuntimeStatus(status, t) {
+  const s = String(status || '').toLowerCase();
+  const map = t?.statuses || {};
+  return map[s] || status || map.unknown || '—';
+}
+
+export function formatDurationSecs(secs) {
+  const n = Math.max(0, Math.floor(Number(secs) || 0));
+  if (n < 60) return `${n}s`;
+  const h = Math.floor(n / 3600);
+  const m = Math.floor((n % 3600) / 60);
+  const s = n % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  return s > 0 ? `${m}m ${s}s` : `${m}m`;
+}
+
+export function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export function downloadTextFile(filename, content) {
+  const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+  downloadBlob(blob, filename);
+}
+
+export function uint8ToBase64(u8) {
+  let chunks = [];
+  const step = 0x8000;
+  for (let i = 0; i < u8.length; i += step) {
+    chunks.push(String.fromCharCode.apply(null, u8.subarray(i, i + step)));
+  }
+  return btoa(chunks.join(''));
+}
+
+export function kvObjectToRows(obj) {
+  if (!obj || typeof obj !== 'object') return [];
+  return Object.entries(obj).map(([key, val]) => ({
+    key,
+    value: isMaskedSecret(val) ? '' : String(val ?? ''),
+    original: isMaskedSecret(val) ? val : null,
+    origKey: key,
+  }));
+}
+
+export function rowsToKvObject(rows, secret = false) {
+  const out = {};
+  for (const row of rows || []) {
+    const k = String(row.key || '').trim();
+    if (!k) continue;
+    const v = String(row.value || '').trim();
+    if (secret && !v && row.original && isMaskedSecret(row.original) && row.original.configured && row.origKey === k) {
+      out[k] = UNCHANGED_SENTINEL;
+    } else if (v) {
+      out[k] = v;
+    }
+  }
+  return out;
 }
 
 export function domainMatchesCert(host, acmeRules = [], certStatuses = []) {
@@ -136,7 +222,10 @@ export function textToKvObject(text, prevObj = {}) {
     if (!t) continue;
     const idx = t.indexOf(':');
     const eq = t.indexOf('=');
-    const sep = idx >= 0 ? idx : eq;
+    let sep = -1;
+    if (idx > 0 && eq > 0) sep = Math.min(idx, eq);
+    else if (idx > 0) sep = idx;
+    else if (eq > 0) sep = eq;
     if (sep <= 0) continue;
     const k = t.slice(0, sep).trim();
     let v = t.slice(sep + 1).trim();
@@ -150,9 +239,27 @@ export function textToKvObject(text, prevObj = {}) {
 
 export async function copyText(text) {
   if (!text) return false;
+  const str = String(text);
   try {
-    await navigator.clipboard.writeText(String(text));
-    return true;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(str);
+      return true;
+    }
+  } catch {
+    // fall through to textarea fallback
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = str;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    ta.style.pointerEvents = 'none';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return Boolean(ok);
   } catch {
     return false;
   }

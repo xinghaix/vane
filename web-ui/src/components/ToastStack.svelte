@@ -1,7 +1,7 @@
 <script>
   import Icons from './Icons.svelte';
 
-  let { toasts = [], onDismiss } = $props();
+  let { toasts = [], onDismiss, onPause, onResume, dismissLabel = 'Dismiss' } = $props();
 
   function iconName(type) {
     if (type === 'success') return 'check';
@@ -11,9 +11,16 @@
 </script>
 
 {#if toasts.length > 0}
-  <div class="toast-stack" role="status" aria-live="polite">
+  <div class="toast-stack" aria-live="polite">
     {#each toasts as item (item.id)}
-      <div class="toast-item toast-{item.type || 'info'}">
+      <div
+        class="toast-item toast-{item.type || 'info'}"
+        role={item.type === 'error' ? 'alert' : 'status'}
+        onmouseenter={() => onPause?.(item.id)}
+        onmouseleave={() => onResume?.(item.id)}
+        onfocusin={() => onPause?.(item.id)}
+        onfocusout={() => onResume?.(item.id)}
+      >
         <span class="toast-icon">
           <Icons name={iconName(item.type)} size={16} />
         </span>
@@ -21,7 +28,7 @@
         <button
           type="button"
           class="toast-close"
-          aria-label="Dismiss"
+          aria-label={dismissLabel}
           onclick={() => onDismiss?.(item.id)}
         >
           <Icons name="x" size={14} />

@@ -55,6 +55,9 @@
       type={reveal ? 'text' : 'password'}
       class="mono"
       style="padding-right:40px;"
+      autocomplete="new-password"
+      spellcheck="false"
+      autocapitalize="off"
       placeholder={effectivePlaceholder}
       disabled={clear}
       required={required && !configured}
@@ -70,7 +73,7 @@
       style="position:absolute;right:5px;min-height:28px;padding:0 6px;"
       disabled={clear}
       onclick={() => reveal = !reveal}
-      aria-label="Toggle secret visibility"
+      aria-label={t?.common?.toggleSecret || 'Toggle visibility'}
     >
       <Icons name={reveal ? 'eye_off' : 'eye'} size={14} />
     </button>

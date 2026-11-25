@@ -1,30 +1,46 @@
 <script>
+  import { untrack } from 'svelte';
   import Icons from './Icons.svelte';
-  import { formatKB, formatBytes, formatRate, formatUptime, copyText } from '../lib/helpers.js';
+  import {
+    formatKB,
+    formatBytes,
+    formatRate,
+    formatUptime,
+    formatDurationSecs,
+    translateRuntimeStatus,
+    copyText,
+  } from '../lib/helpers.js';
 
-  let { t, lang, dashboard, settingsJson, onRefresh, apiFetch, showToast } = $props();
+  let { t, lang, dashboard, settingsJson, onRefresh, onNavigate, apiFetch, showToast } = $props();
 
   let cpuHistory = $state([]);
   let netHistory = $state([]);
+  let lastSampleTs = 0;
   let cpuHoverIdx = $state(-1);
   let netHoverIdx = $state(-1);
   let showFwRules = $state(false);
+  let unbanBusy = $state('');
 
   let tempThreshold = $derived(Number(settingsJson?.monitor?.temp_alert_celsius || 85));
+  let memLowMb = $derived(Number(settingsJson?.monitor?.mem_low_mb || 32));
   let pollIntervalMs = $derived(
     Math.max(1000, Math.min(60000, Number(settingsJson?.monitor?.sample_interval_secs || 2) * 1000))
   );
 
-  // 记录实时折线序列（上限 24 个点）
+  // 记录实时折线序列（按 timestamp_unix 去重，上限 24 个点）
   $effect(() => {
-    if (!dashboard?.system) return;
-    const cpu = Number(dashboard.system.cpu_usage_percent || 0);
-    const totalBps = (dashboard.system.interfaces || []).reduce(
-      (acc, i) => acc + Number(i.rx_bps || 0) + Number(i.tx_bps || 0),
-      0
-    );
-    cpuHistory = [...cpuHistory.slice(-23), cpu];
-    netHistory = [...netHistory.slice(-23), totalBps];
+    const sys = dashboard?.system;
+    if (!sys) return;
+    const ts = Number(sys.timestamp_unix || 0);
+    if (ts > 0 && ts === lastSampleTs) return;
+    lastSampleTs = ts;
+    const cpu = Number(sys.cpu_usage_percent || 0);
+    const rxBps = (sys.interfaces || []).reduce((acc, i) => acc + Number(i.rx_bps || 0), 0);
+    const txBps = (sys.interfaces || []).reduce((acc, i) => acc + Number(i.tx_bps || 0), 0);
+    untrack(() => {
+      cpuHistory = [...cpuHistory.slice(-23), cpu];
+      netHistory = [...netHistory.slice(-23), { total: rxBps + txBps, rx: rxBps, tx: txBps }];
+    });
   });
 
   // 按需唤醒采样：仅当看板挂载且页面处于前台可见时按配置间隔轮询
@@ -75,24 +91,36 @@
   }
 
   async function unbanCidr(cidr) {
+    if (unbanBusy) return;
+    unbanBusy = cidr;
     try {
-      await apiFetch(`/api/security/bans/${encodeURIComponent(cidr)}`, { method: 'DELETE' });
-      showToast(`${t.dash.unban}: ${cidr}`, 'success');
+      const r = await apiFetch(`/api/security/bans/${encodeURIComponent(cidr)}`, { method: 'DELETE' });
+      if (r?.unbanned === false) {
+        showToast(t.dash.unbanNotFound, 'info');
+      } else {
+        showToast(`${t.dash.unban}: ${cidr}`, 'success');
+      }
       await onRefresh(true);
     } catch (err) {
       showToast(err.message, 'error');
+    } finally {
+      unbanBusy = '';
     }
   }
 
   async function handleCopy(val) {
     if (await copyText(val)) showToast(`${t.copied}: ${val}`, 'success');
+    else showToast(t.copyFailed, 'error');
   }
 
   function healthBadge(h) {
     const st = h?.state || 'disabled';
     if (st === 'running') return { cls: 'badge-ok', dot: 'ok', text: t.common.statusRunning };
     if (st === 'degraded') return { cls: 'badge-warn', dot: 'warn', text: `${t.common.statusFailed} (${h.recent_failures || 1})` };
-    if (st === 'circuit_open') return { cls: 'badge-danger', dot: 'danger', text: 'CIRCUIT OPEN' };
+    if (st === 'circuit_open') {
+      const retry = h?.retry_in_secs ? ` (${h.retry_in_secs}s)` : '';
+      return { cls: 'badge-danger', dot: 'danger', text: `${t.dash.circuitOpen}${retry}` };
+    }
     return { cls: 'badge-muted', dot: 'muted', text: t.common.statusDisabled };
   }
 
@@ -135,8 +163,17 @@
       ? Math.min(100, (dashboard.active_connections / Math.max(1, dashboard.max_connections)) * 100)
       : 0
   );
+  let availMb = $derived((dashboard?.system?.memory?.available_kb || 0) / 1024);
+  let availBadgeClass = $derived(
+    availMb > 0 && availMb < memLowMb
+      ? 'badge-danger'
+      : availMb > 0 && availMb < memLowMb * 1.5
+        ? 'badge-warn'
+        : 'badge-info'
+  );
   let cpuSpark = $derived(buildSpark(cpuHistory, 100));
-  let netSpark = $derived(buildSpark(netHistory, 102400));
+  let netSpark = $derived(buildSpark(netHistory.map((p) => p.total), 102400));
+  let latestNet = $derived(netHistory[netHistory.length - 1] || { total: 0, rx: 0, tx: 0 });
 </script>
 
 {#if !dashboard}
@@ -166,7 +203,7 @@
             {dashboard.system.soc_temp_celsius.toFixed(1)} °C
           </span>
         {:else}
-          <span class="badge badge-muted">Temp N/A</span>
+          <span class="badge badge-muted">{t.dash.tempNa}</span>
         {/if}
       </div>
       <div class="num" style="font-size:28px;font-weight:700;margin-bottom:4px;">
@@ -202,7 +239,7 @@
     <div class="card">
       <div class="card-header">
         <span class="card-title">{t.dash.memTitle}</span>
-        <span class="badge badge-info num">Avail {formatKB(dashboard.system.memory.available_kb)}</span>
+        <span class="badge {availBadgeClass} num">{t.dash.avail} {formatKB(dashboard.system.memory.available_kb)}</span>
       </div>
       <div class="num" style="font-size:25px;font-weight:700;margin-bottom:4px;">
         {formatKB(dashboard.system.memory.used_kb)}
@@ -223,7 +260,7 @@
         </div>
       {/if}
       <div class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:8px;">
-        Cached: {formatKB(dashboard.system.memory.cached_kb)} · Slab SUnreclaim: {formatKB(dashboard.system.memory.slab_unreclaim_kb)}
+        {t.dash.cached}: {formatKB(dashboard.system.memory.cached_kb)} · {t.dash.slabUnreclaim}: {formatKB(dashboard.system.memory.slab_unreclaim_kb)}
       </div>
     </div>
 
@@ -232,7 +269,7 @@
       <div class="card-header">
         <span class="card-title"><Icons name="shield" size={16} />{t.dash.fwTitle}</span>
         <span class="badge {dashboard.firewall.lockdown ? 'badge-danger' : 'badge-ok'}">
-          {dashboard.firewall.lockdown ? 'LOCKDOWN' : dashboard.firewall.backend}
+          {dashboard.firewall.lockdown ? t.dash.lockdownTag : dashboard.firewall.backend}
         </span>
       </div>
       <div class="num" style="font-size:28px;font-weight:700;margin-bottom:4px;">
@@ -275,7 +312,7 @@
           </div>
         </div>
         <span class="mono" style="font-size:12px;color:var(--info);font-weight:600;">
-          {formatRate(netHistory[netHistory.length - 1] || 0)}
+          ↓ {formatRate(latestNet.rx)} · ↑ {formatRate(latestNet.tx)}
         </span>
       </div>
       <div style="display:grid;gap:10px;">
@@ -292,15 +329,20 @@
           {#if cpuSpark}
             <svg
               viewBox="0 0 340 74"
-              style="width:100%;height:68px;display:block;"
+              style="width:100%;height:68px;display:block;touch-action:pan-y;"
               role="img"
               aria-label="CPU usage trend"
-              onmousemove={(e) => {
+              onpointerdown={(e) => {
                 const rect = e.currentTarget.getBoundingClientRect();
                 const idx = Math.round(((e.clientX - rect.left) / rect.width) * (cpuSpark.pts.length - 1));
                 cpuHoverIdx = Math.max(0, Math.min(cpuSpark.pts.length - 1, idx));
               }}
-              onmouseleave={() => cpuHoverIdx = -1}
+              onpointermove={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const idx = Math.round(((e.clientX - rect.left) / rect.width) * (cpuSpark.pts.length - 1));
+                cpuHoverIdx = Math.max(0, Math.min(cpuSpark.pts.length - 1, idx));
+              }}
+              onpointerleave={() => cpuHoverIdx = -1}
             >
               <defs>
                 <linearGradient id="cpuAreaGrad" x1="0" y1="0" x2="0" y2="1">
@@ -311,6 +353,8 @@
               {#each [21, 37, 53] as gy}
                 <line x1="0" y1={gy} x2="340" y2={gy} stroke="var(--border-subtle)" stroke-dasharray="3 3" />
               {/each}
+              <text x="2" y="13" fill="var(--text-muted)" font-size="9">100%</text>
+              <text x="2" y="68" fill="var(--text-muted)" font-size="9">0%</text>
               <path d={cpuSpark.areaPath} fill="url(#cpuAreaGrad)" />
               <path d={cpuSpark.linePath} fill="none" stroke="var(--accent)" stroke-width="2.2" />
               {#if cpuHoverIdx >= 0 && cpuSpark.pts[cpuHoverIdx]}
@@ -329,11 +373,11 @@
         <!-- Throughput Sparkline -->
         <div class="subcard" style="padding:10px 12px;">
           <div class="row-between" style="font-size:12px;color:var(--text-secondary);margin-bottom:4px;">
-            <span>WAN+LAN Throughput</span>
+            <span>{t.dash.throughputLabel}</span>
             <span class="mono" style="color:var(--info);font-weight:600;">
-              {netHoverIdx >= 0 && netSpark?.pts[netHoverIdx]
-                ? formatRate(netSpark.pts[netHoverIdx].val)
-                : formatRate(netHistory[netHistory.length - 1] || 0)}
+              {netHoverIdx >= 0 && netHistory[netHoverIdx]
+                ? `↓ ${formatRate(netHistory[netHoverIdx].rx)} · ↑ ${formatRate(netHistory[netHoverIdx].tx)}`
+                : formatRate(latestNet.total)}
               {#if netSpark}
                 <span style="color:var(--text-muted);font-weight:400;"> · max {formatRate(netSpark.ceil)}</span>
               {/if}
@@ -342,15 +386,20 @@
           {#if netSpark}
             <svg
               viewBox="0 0 340 74"
-              style="width:100%;height:68px;display:block;"
+              style="width:100%;height:68px;display:block;touch-action:pan-y;"
               role="img"
               aria-label="Network throughput trend"
-              onmousemove={(e) => {
+              onpointerdown={(e) => {
                 const rect = e.currentTarget.getBoundingClientRect();
                 const idx = Math.round(((e.clientX - rect.left) / rect.width) * (netSpark.pts.length - 1));
                 netHoverIdx = Math.max(0, Math.min(netSpark.pts.length - 1, idx));
               }}
-              onmouseleave={() => netHoverIdx = -1}
+              onpointermove={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                const idx = Math.round(((e.clientX - rect.left) / rect.width) * (netSpark.pts.length - 1));
+                netHoverIdx = Math.max(0, Math.min(netSpark.pts.length - 1, idx));
+              }}
+              onpointerleave={() => netHoverIdx = -1}
             >
               <defs>
                 <linearGradient id="netAreaGrad" x1="0" y1="0" x2="0" y2="1">
@@ -361,6 +410,8 @@
               {#each [21, 37, 53] as gy}
                 <line x1="0" y1={gy} x2="340" y2={gy} stroke="var(--border-subtle)" stroke-dasharray="3 3" />
               {/each}
+              <text x="2" y="13" fill="var(--text-muted)" font-size="9">{formatRate(netSpark.ceil)}</text>
+              <text x="2" y="68" fill="var(--text-muted)" font-size="9">0</text>
               <path d={netSpark.areaPath} fill="url(#netAreaGrad)" />
               <path d={netSpark.linePath} fill="none" stroke="var(--info)" stroke-width="2.2" />
               {#if netHoverIdx >= 0 && netSpark.pts[netHoverIdx]}
@@ -383,9 +434,16 @@
         <span class="card-title">{t.dash.healthTitle}</span>
       </div>
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:8px;">
-        {#each Object.entries(dashboard.module_health || {}) as [modName, h]}
+        {#each Object.entries(dashboard.module_health || {}) as [modName, h] (modName)}
           {@const b = healthBadge(h)}
-          <div class="subcard" style="padding:10px 12px;">
+          {@const canJump = h?.state !== 'disabled' && t.nav[modName]}
+          <button
+            type="button"
+            class="subcard {canJump ? 'clickable-card' : ''}"
+            style="padding:10px 12px;text-align:left;width:100%;font-family:inherit;color:inherit;"
+            disabled={!canJump}
+            onclick={() => canJump && onNavigate?.(modName)}
+          >
             <div class="row-between">
               <span style="display:inline-flex;align-items:center;gap:7px;font-size:13px;font-weight:600;">
                 <span class="status-dot {b.dot}"></span>
@@ -398,7 +456,7 @@
                 {h.last_error || h.reason}
               </div>
             {/if}
-          </div>
+          </button>
         {/each}
       </div>
     </div>
@@ -439,7 +497,7 @@
               {#if iface.ipv6.length > 0}
                 <div style="display:flex;flex-wrap:wrap;gap:6px;">
                   {#each iface.ipv6 as ip6}
-                    <button type="button" class="btn btn-xs mono" style="color:var(--info);word-break:break-all;" onclick={() => handleCopy(ip6)}>
+                    <button type="button" class="btn btn-xs mono ip-copy-btn" style="color:var(--info);" onclick={() => handleCopy(ip6)}>
                       IPv6 {ip6}
                     </button>
                   {/each}
@@ -456,64 +514,80 @@
         <span class="card-title">{t.dash.quickStatus}</span>
       </div>
       <div style="display:grid;gap:8px;">
-        {#each dashboard.reverse_proxy_status || [] as rp}
-          <div class="subcard row-between">
-            <div>
-              <div style="font-weight:600;font-size:13px;">Proxy · {rp.name}</div>
+        {#each dashboard.reverse_proxy_status || [] as rp (rp.name)}
+          {@const famLabel = [rp.bound_v4 ? 'v4' : '', rp.bound_v6 ? 'v6' : ''].filter(Boolean).join('+')}
+          <div class="subcard row-between clickable-card" role="button" tabindex="0" onclick={() => onNavigate?.('reverse_proxy')} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onNavigate?.('reverse_proxy'); } }}>
+            <div style="min-width:0;flex:1;">
+              <div style="font-weight:600;font-size:13px;word-break:break-word;">{t.nav.reverse_proxy} · {rp.name}</div>
               <div class="mono" style="font-size:11px;color:var(--text-secondary);">
-                :{rp.listen_port} ({rp.bound_v4 ? 'v4' : ''}{rp.bound_v4 && rp.bound_v6 ? '+' : ''}{rp.bound_v6 ? 'v6' : ''}) · conns={rp.active_conns}
+                :{rp.listen_port}{famLabel ? ` (${famLabel})` : ''} · conns={rp.active_conns}
               </div>
             </div>
-            <span class="badge {rp.status === 'running' ? 'badge-ok' : rp.status === 'failed' ? 'badge-danger' : 'badge-muted'}">{rp.status}</span>
+            <span class="badge {rp.status === 'running' ? 'badge-ok' : rp.status === 'failed' ? 'badge-danger' : 'badge-muted'}">{translateRuntimeStatus(rp.status, t)}</span>
           </div>
         {/each}
-        {#each dashboard.port_forward_status || [] as pf}
-          <div class="subcard row-between">
-            <div>
-              <div style="font-weight:600;font-size:13px;">Forward · {pf.name}</div>
+        {#each dashboard.port_forward_status || [] as pf (pf.name)}
+          <div class="subcard row-between clickable-card" role="button" tabindex="0" onclick={() => onNavigate?.('port_forward')} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onNavigate?.('port_forward'); } }}>
+            <div style="min-width:0;flex:1;">
+              <div style="font-weight:600;font-size:13px;word-break:break-word;">{t.nav.port_forward} · {pf.name}</div>
               <div class="mono" style="font-size:11px;color:var(--text-secondary);">
                 :{pf.listen_port}/{pf.proto} · conns={pf.active_conns}
               </div>
             </div>
-            <span class="badge {pf.status === 'running' ? 'badge-ok' : pf.status === 'failed' ? 'badge-danger' : 'badge-warn'}">{pf.status}</span>
+            <span class="badge {pf.status === 'running' ? 'badge-ok' : pf.status === 'failed' ? 'badge-danger' : 'badge-warn'}">{translateRuntimeStatus(pf.status, t)}</span>
           </div>
         {/each}
-        {#each dashboard.ddns || [] as d}
-          <div class="subcard row-between">
-            <div>
-              <div style="font-weight:600;font-size:13px;">DDNS · {d.domain}</div>
-              <div class="mono" style="font-size:11px;color:var(--text-secondary);">
+        {#each dashboard.ddns || [] as d (d.name || d.domain)}
+          <div class="subcard row-between clickable-card" role="button" tabindex="0" onclick={() => onNavigate?.('ddns')} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onNavigate?.('ddns'); } }}>
+            <div style="min-width:0;flex:1;">
+              <div style="font-weight:600;font-size:13px;word-break:break-word;">DDNS · {d.domain}</div>
+              <div class="mono" style="font-size:11px;color:var(--text-secondary);word-break:break-all;">
                 v4: {d.last_ipv4 || '—'} · v6: {d.last_ipv6 || '—'}
               </div>
             </div>
-            <span class="badge {d.status === 'synced' ? 'badge-ok' : d.status === 'failed' ? 'badge-danger' : 'badge-warn'}">{d.status}</span>
+            <span class="badge {d.status === 'synced' ? 'badge-ok' : d.status === 'failed' ? 'badge-danger' : 'badge-warn'}">{translateRuntimeStatus(d.status, t)}</span>
           </div>
         {/each}
-        {#each dashboard.certs || [] as c}
+        {#each dashboard.certs || [] as c (c.domain)}
           {@const days = certExpiryDays(c.expires_at_unix)}
-          <div class="subcard row-between">
-            <div>
-              <div style="font-weight:600;font-size:13px;">TLS · {c.domain}</div>
+          <div class="subcard row-between clickable-card" role="button" tabindex="0" onclick={() => onNavigate?.('acme')} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onNavigate?.('acme'); } }}>
+            <div style="min-width:0;flex:1;">
+              <div style="font-weight:600;font-size:13px;word-break:break-word;">TLS · {c.domain}</div>
               <div class="mono" style="font-size:11px;color:var(--text-secondary);">
                 {t.dash.expires}: {c.expires_at_unix ? new Date(c.expires_at_unix * 1000).toLocaleDateString() : '—'}
                 {#if days !== null} ({days}d){/if}
               </div>
             </div>
-            <span class="badge {c.status === 'active' && (days === null || days > 14) ? 'badge-ok' : 'badge-warn'}">{c.status}</span>
+            <span class="badge {c.status === 'failed' || (days !== null && days <= 0) ? 'badge-danger' : c.status === 'active' && (days === null || days > 14) ? 'badge-ok' : 'badge-warn'}">
+              {translateRuntimeStatus(c.status, t)}
+            </span>
           </div>
         {/each}
-        {#each Object.entries(dashboard.stun_public_addrs || {}) as [name, pubAddr]}
+        {#each Object.entries(dashboard.stun_public_addrs || {}) as [name, pubAddr] (name)}
           <div class="subcard row-between">
-            <div>
+            <div style="min-width:0;flex:1;">
               <div style="font-weight:600;font-size:13px;">STUN · {name}</div>
-              <div class="mono" style="font-size:12px;color:var(--info);">{pubAddr}</div>
+              <div class="mono" style="font-size:12px;color:var(--info);word-break:break-all;">{pubAddr}</div>
             </div>
             <button type="button" class="btn btn-xs" onclick={() => handleCopy(pubAddr)}>{t.copy}</button>
           </div>
         {/each}
-        {#if !(dashboard.reverse_proxy_status?.length || dashboard.port_forward_status?.length || dashboard.ddns?.length || dashboard.certs?.length || Object.keys(dashboard.stun_public_addrs || {}).length)}
+        {#each dashboard.cron || [] as cj (cj.name)}
+          <div class="subcard row-between clickable-card" role="button" tabindex="0" onclick={() => onNavigate?.('cron')} onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onNavigate?.('cron'); } }}>
+            <div style="min-width:0;flex:1;">
+              <div style="font-weight:600;font-size:13px;word-break:break-word;">{t.dash.cronSummary} · {cj.name}</div>
+              <div class="mono" style="font-size:11px;color:var(--text-secondary);">
+                {cj.last_duration_ms ? `${cj.last_duration_ms}ms` : '—'}
+              </div>
+            </div>
+            <span class="badge {cj.running ? 'badge-info' : cj.status === 'ok' ? 'badge-ok' : cj.status === 'failed' ? 'badge-danger' : 'badge-muted'}">
+              {cj.running ? t.common.statusRunning : translateRuntimeStatus(cj.status, t)}
+            </span>
+          </div>
+        {/each}
+        {#if !(dashboard.reverse_proxy_status?.length || dashboard.port_forward_status?.length || dashboard.ddns?.length || dashboard.certs?.length || dashboard.cron?.length || Object.keys(dashboard.stun_public_addrs || {}).length)}
           <div class="empty-state" style="padding:20px;">
-            {lang === 'en' ? 'No active gateway rules or runtime tasks yet.' : '暂未配置活跃的代理、转发、DDNS、证书或 STUN 任务'}
+            {lang === 'en' ? 'No active gateway rules or runtime tasks yet.' : '暂未配置活跃的代理、转发、DDNS、证书、STUN 或计划任务'}
           </div>
         {/if}
       </div>
@@ -531,15 +605,17 @@
         <div class="empty-state" style="padding:20px;">{t.dash.noBans}</div>
       {:else}
         <div style="display:grid;gap:8px;">
-          {#each dashboard.bans as ban}
+          {#each dashboard.bans as ban (ban.cidr)}
             <div class="subcard row-between">
-              <div>
-                <div class="mono" style="font-weight:700;color:var(--danger);">{ban.cidr}</div>
+              <div style="min-width:0;flex:1;">
+                <div class="mono" style="font-weight:700;color:var(--danger);word-break:break-all;">{ban.cidr}</div>
                 <div class="mono" style="font-size:11px;color:var(--text-secondary);">
-                  {ban.reason} · fails={ban.failures} · {ban.remaining_secs}s
+                  {ban.reason} · fails={ban.failures} · {formatDurationSecs(ban.remaining_secs)}
                 </div>
               </div>
-              <button type="button" class="btn btn-sm" onclick={() => unbanCidr(ban.cidr)}>{t.dash.unban}</button>
+              <button type="button" class="btn btn-sm" disabled={unbanBusy === ban.cidr} onclick={() => unbanCidr(ban.cidr)}>
+                {unbanBusy === ban.cidr ? '...' : t.dash.unban}
+              </button>
             </div>
           {/each}
         </div>

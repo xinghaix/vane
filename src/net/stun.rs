@@ -245,15 +245,19 @@ async fn probe_udp_on_socket(sock: &UdpSocket, target: SocketAddr) -> Result<Soc
         if now >= deadline {
             return Err("STUN UDP 响应超时".into());
         }
-        let (n, _) = tokio::time::timeout(deadline - now, sock.recv_from(&mut buf))
+        let (n, src) = tokio::time::timeout(deadline - now, sock.recv_from(&mut buf))
             .await
             .map_err(|_| "STUN UDP 响应超时".to_string())?
             .map_err(|e| format!("UDP 接收失败: {}", e))?;
-        if n >= 20 && &buf[8..20] != &tx_id {
-            // 忽略共享端口或残留重传的非本事务报文，继续等待匹配的 tx_id
+        if src != target || n < 20 || &buf[8..20] != &tx_id {
+            // 忽略来自非目标地址、长度不足或非本事务 ID 的无关包，继续等待
             continue;
         }
-        return parse_binding_response(&buf[..n], &tx_id).map_err(str::to_string);
+        let mapped = parse_binding_response(&buf[..n], &tx_id).map_err(str::to_string)?;
+        if mapped.port() == 0 || mapped.ip().is_unspecified() {
+            return Err("STUN 服务器返回无效映射地址".into());
+        }
+        return Ok(mapped);
     }
 }
 
@@ -279,13 +283,21 @@ async fn read_stun_tcp_response(stream: &mut TcpStream, tx_id: &[u8; 12]) -> Res
     parse_binding_response(&full, tx_id).map_err(str::to_string)
 }
 
-async fn probe_tcp_target(target: SocketAddr, local_port: u16, persistent: &mut Option<TcpStream>) -> Result<(SocketAddr, SocketAddr), String> {
-    if let Some(ref mut existing) = persistent {
-        let (req, tx_id) = build_binding_request();
-        if existing.write_all(&req).await.is_ok() {
-            if let Ok(mapped) = read_stun_tcp_response(existing, &tx_id).await {
-                let local = existing.local_addr().unwrap_or_else(|_| SocketAddr::new(target.ip(), local_port));
-                return Ok((mapped, local));
+async fn probe_tcp_target(
+    target: SocketAddr,
+    local_port: u16,
+    persistent: &mut Option<(SocketAddr, TcpStream)>,
+) -> Result<(SocketAddr, SocketAddr), String> {
+    if let Some((bound_target, ref mut existing)) = persistent {
+        if *bound_target == target {
+            let (req, tx_id) = build_binding_request();
+            if existing.write_all(&req).await.is_ok() {
+                if let Ok(mapped) = read_stun_tcp_response(existing, &tx_id).await {
+                    if mapped.port() != 0 && !mapped.ip().is_unspecified() {
+                        let local = existing.local_addr().unwrap_or_else(|_| SocketAddr::new(target.ip(), local_port));
+                        return Ok((mapped, local));
+                    }
+                }
             }
         }
         *persistent = None;
@@ -308,7 +320,10 @@ async fn probe_tcp_target(target: SocketAddr, local_port: u16, persistent: &mut 
         .await
         .map_err(|e| format!("STUN TCP 发送失败: {}", e))?;
     let mapped = read_stun_tcp_response(&mut stream, &tx_id).await?;
-    *persistent = Some(stream);
+    if mapped.port() == 0 || mapped.ip().is_unspecified() {
+        return Err("STUN 服务器返回无效映射地址".into());
+    }
+    *persistent = Some((target, stream));
     Ok((mapped, local))
 }
 
@@ -316,7 +331,7 @@ async fn probe_with_session(
     entry: &StunConfig,
     local_port: u16,
     udp_socks: &mut PersistentUdpSockets,
-    tcp_conn: &mut Option<TcpStream>,
+    tcp_conn: &mut Option<(SocketAddr, TcpStream)>,
 ) -> Result<ProbeOutcome, String> {
     let servers = entry.servers();
     if servers.is_empty() {
@@ -668,6 +683,7 @@ pub async fn run_stun_rule(
                 );
             }
             Err(e) => {
+                logger::log(Level::Warn, "stun", &format!("STUN {} 本轮探测失败（将退避重试）: {}", entry.name, e));
                 let prev = runtime.read().ok().and_then(|g| g.get(&entry.name).cloned());
                 update_status(
                     &runtime,
@@ -681,10 +697,9 @@ pub async fn run_stun_rule(
                         status: "error".into(),
                         last_probe_unix: now,
                         last_change_unix: prev.as_ref().map(|p| p.last_change_unix).unwrap_or(0),
-                        error: e.clone(),
+                        error: e,
                     },
                 );
-                return Err(e);
             }
         }
 

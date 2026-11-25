@@ -9,6 +9,64 @@ use tokio::{io::{AsyncRead, AsyncWrite}, sync::Semaphore};
 #[derive(Clone, Copy, Default)]
 pub enum AddressFamily { #[default] Any, Ipv4, Ipv6 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SsrfPolicy {
+    /// 生产默认：阻止回环、未指定与链路本地地址（云元数据 169.254.169.254 / fe80::/10）
+    BlockLoopbackAndLinkLocal,
+    /// 仅允许公网单播 IP（阻止私有网段、CGNAT、回环、链路本地、多播）
+    PublicOnly,
+    /// 允许回环地址（仅用于本地测试模拟服务）
+    AllowLoopback,
+}
+
+impl Default for SsrfPolicy {
+    fn default() -> Self {
+        if cfg!(test) {
+            Self::AllowLoopback
+        } else {
+            Self::BlockLoopbackAndLinkLocal
+        }
+    }
+}
+
+fn is_ip_allowed(ip: std::net::IpAddr, policy: SsrfPolicy) -> bool {
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(std::net::IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    match policy {
+        SsrfPolicy::AllowLoopback => match ip {
+            std::net::IpAddr::V4(v4) => !v4.is_unspecified() && !v4.is_link_local() && !v4.is_multicast(),
+            std::net::IpAddr::V6(v6) => !v6.is_unspecified() && !v6.is_unicast_link_local() && !v6.is_multicast(),
+        },
+        SsrfPolicy::BlockLoopbackAndLinkLocal => match ip {
+            std::net::IpAddr::V4(v4) => {
+                !v4.is_loopback() && !v4.is_unspecified() && !v4.is_link_local() && !v4.is_multicast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                !v6.is_loopback() && !v6.is_unspecified() && !v6.is_unicast_link_local() && !v6.is_multicast()
+            }
+        },
+        SsrfPolicy::PublicOnly => match ip {
+            std::net::IpAddr::V4(v4) => {
+                !v4.is_loopback()
+                    && !v4.is_unspecified()
+                    && !v4.is_link_local()
+                    && !v4.is_private()
+                    && !v4.is_multicast()
+                    && !(v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64)
+            }
+            std::net::IpAddr::V6(v6) => {
+                !v6.is_loopback()
+                    && !v6.is_unspecified()
+                    && !v6.is_unicast_link_local()
+                    && !v6.is_unique_local()
+                    && !v6.is_multicast()
+            }
+        },
+    }
+}
+
 #[derive(Clone)]
 pub struct HttpClient { tls: Arc<rustls::ClientConfig>, slots: Arc<Semaphore> }
 
@@ -29,6 +87,7 @@ pub struct HttpRequest {
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
     pub family: AddressFamily,
+    pub ssrf_policy: SsrfPolicy,
     pub timeout: Duration,
     pub response_limit: usize,
     pub happy_eyeballs_delay_ms: u64,
@@ -36,7 +95,7 @@ pub struct HttpRequest {
 impl HttpRequest {
     pub fn new(method: &str, url: &str) -> Self {
         Self { method: method.into(), url: url.into(), headers: BTreeMap::new(), body: Vec::new(),
-            family: AddressFamily::Any, timeout: Duration::from_secs(20), response_limit: 1024 * 1024,
+            family: AddressFamily::Any, ssrf_policy: SsrfPolicy::default(), timeout: Duration::from_secs(20), response_limit: 1024 * 1024,
             happy_eyeballs_delay_ms: 250 }
     }
     pub fn json(mut self, value: &serde_json::Value) -> Self {
@@ -106,8 +165,18 @@ impl HttpClient {
         let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await.map_err(|_| "DNS 解析失败")?
             .filter(|addr| match spec.family { AddressFamily::Any => true, AddressFamily::Ipv4 => addr.is_ipv4(), AddressFamily::Ipv6 => addr.is_ipv6() })
             .take(32).collect();
+        if addresses.is_empty() {
+            return Err("DNS 解析无可用地址".into());
+        }
+        let filtered: Vec<SocketAddr> = addresses
+            .into_iter()
+            .filter(|addr| is_ip_allowed(addr.ip(), spec.ssrf_policy))
+            .collect();
+        if filtered.is_empty() {
+            return Err("安全拦截：目标地址命中 SSRF 禁连地址段".into());
+        }
         // 交错排列地址族，避免一个地址族的长列表阻塞另一个地址族。
-        let (v6, v4): (Vec<_>, Vec<_>) = addresses.into_iter().partition(SocketAddr::is_ipv6);
+        let (v6, v4): (Vec<_>, Vec<_>) = filtered.into_iter().partition(SocketAddr::is_ipv6);
         let mut ordered = Vec::new();
         for index in 0..v6.len().max(v4.len()) {
             if let Some(addr) = v6.get(index) { ordered.push(*addr); }

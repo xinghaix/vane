@@ -25,12 +25,65 @@ pub fn path_matches_prefix(path: &str, prefix: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
+pub fn normalize_unreserved_percent(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = String::with_capacity(path.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                let b = ((h << 4) | l) as u8;
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                    out.push(b as char);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        let ch = path[i..].chars().next().unwrap_or('/');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+pub fn is_canonical_request_path(path: &str) -> bool {
+    if !path.starts_with('/') || path.contains("//") || path.contains('\\') || path.contains('\0') {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("%2f") || lower.contains("%5c") || lower.contains("%2e") || lower.contains("%00") {
+        return false;
+    }
+    let decoded = normalize_unreserved_percent(path);
+    !decoded.split('/').any(|seg| seg == "." || seg == "..")
+}
+
 pub fn match_rule<'a>(rules: &'a [ReverseProxyRule], host: &str, path: &str) -> Option<&'a ReverseProxyRule> {
-    let clean_host = host.parse::<http::uri::Authority>().map(|value|value.host().trim_matches(['[',']']).to_ascii_lowercase()).unwrap_or_else(|_|host.to_ascii_lowercase());
+    let clean_host = host
+        .parse::<http::uri::Authority>()
+        .map(|value| value.host().trim_matches(['[', ']']).to_ascii_lowercase())
+        .unwrap_or_else(|_| host.to_ascii_lowercase());
+    let norm_path = normalize_unreserved_percent(path);
     rules
         .iter()
-        .filter(|r| r.enabled && (r.host.eq_ignore_ascii_case(&clean_host) || r.host.strip_prefix("*.").is_some_and(|suffix|clean_host.split_once('.').is_some_and(|(_,tail)|tail.eq_ignore_ascii_case(suffix)))) && path_matches_prefix(path, &r.path_prefix))
-        .max_by_key(|r| (r.path_prefix.len(), !r.host.starts_with("*.")))
+        .filter(|r| {
+            r.enabled
+                && (r.host.eq_ignore_ascii_case(&clean_host)
+                    || r.host.strip_prefix("*.").is_some_and(|suffix| {
+                        clean_host
+                            .split_once('.')
+                            .is_some_and(|(head, tail)| !head.is_empty() && tail.eq_ignore_ascii_case(suffix))
+                    }))
+                && path_matches_prefix(&norm_path, &r.path_prefix)
+        })
+        .max_by_key(|r| {
+            let clean_len = r.path_prefix.trim_end_matches('/').len();
+            (clean_len, !r.host.starts_with("*."))
+        })
 }
 
 pub fn check_rule_cidr_access(rule: &ReverseProxyRule, client_ip: IpAddr) -> bool {
@@ -55,10 +108,11 @@ pub fn check_rule_cidr_access(rule: &ReverseProxyRule, client_ip: IpAddr) -> boo
 }
 
 pub fn rewrite_request_path(path: &str, rule: &ReverseProxyRule) -> String {
-    if !rule.strip_prefix || rule.path_prefix == "/" {
+    let clean_prefix = rule.path_prefix.trim_end_matches('/');
+    if !rule.strip_prefix || clean_prefix.is_empty() {
         return path.to_string();
     }
-    let stripped = path.strip_prefix(&rule.path_prefix).unwrap_or(path);
+    let stripped = path.strip_prefix(clean_prefix).unwrap_or(path);
     if stripped.is_empty() {
         "/".to_string()
     } else if stripped.starts_with('/') {
@@ -73,12 +127,24 @@ pub fn render_redirect_location(
     path: &str,
     stun_addrs: &BTreeMap<String, String>,
 ) -> String {
-    let mut out = template.replace("{{path}}", path);
+    render_redirect_location_safe(template, path, stun_addrs).unwrap_or_else(|| template.to_string())
+}
+
+pub fn render_redirect_location_safe(
+    template: &str,
+    path: &str,
+    stun_addrs: &BTreeMap<String, String>,
+) -> Option<String> {
+    // 先在服务端模板上展开 STUN 变量并检查是否未就绪，再插入请求 {{path}}，杜绝请求路径模板注入泄露 STUN 端点
+    let mut out = template.to_string();
     for (name, addr) in stun_addrs {
         let token = format!("{{{{stun.{}.public_addr}}}}", name);
         out = out.replace(&token, addr);
     }
-    out
+    if out.contains("{{stun.") {
+        return None;
+    }
+    Some(out.replace("{{path}}", path))
 }
 
 /// 授权策略由管理面实现；数据面不会接触密码或哈希。
@@ -220,15 +286,30 @@ async fn accept_loop(listener:TcpListener,port:u16,acceptor:TlsAcceptor,rules:Ar
                         if !sniff(&mut stream,port,&rules,timeouts.http_header).await?{return Ok(());}
                         let tls=tokio::time::timeout(timeouts.tls_handshake,acceptor.accept(stream)).await.map_err(|_|"反代 TLS 握手超时".to_string())?.map_err(|e|format!("反代 TLS 握手失败: {e}"))?;
                         let sni=tls.get_ref().1.server_name().map(str::to_owned);
+                        let is_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
                         let write_timeout=Duration::from_secs(rules.iter().map(|rule|rule.read_timeout_secs).max().unwrap_or(120).clamp(1,86400));
+                        let idle_timeout = write_timeout.min(Duration::from_secs(300));
                         let executor=TrackedExecutor{tasks:tasks.clone(),cancel:cancel.clone()};
                         let context=Arc::new(Context{rules,stun,peer,sni,auth,executor:executor.clone()});
                         let service=service_fn(move |request|{let context=context.clone();async move{Ok::<_,Infallible>(handle(request,context).await)}});
-                        let mut builder=hyper_util::server::conn::auto::Builder::new(executor);
-                        builder.http1().timer(TokioTimer::new()).header_read_timeout(timeouts.http_header).max_buf_size(32768).half_close(true);
-                        builder.http2().max_concurrent_streams(64).max_send_buf_size(65536).initial_stream_window_size(65535);
-                        let io=TimedIo::new(tls,write_timeout).without_read_deadline();
-                        let _=builder.serve_connection_with_upgrades(TokioIo::new(io),service).await;
+                        let io = TimedIo::new(tls, idle_timeout);
+                        if is_h2 {
+                            let mut h2 = hyper::server::conn::http2::Builder::new(executor);
+                            h2.timer(TokioTimer::new())
+                                .keep_alive_interval(Some(Duration::from_secs(30)))
+                                .keep_alive_timeout(Duration::from_secs(15))
+                                .max_concurrent_streams(16)
+                                .max_send_buf_size(65536)
+                                .initial_stream_window_size(65535);
+                            let _ = h2.serve_connection(TokioIo::new(io), service).await;
+                        } else {
+                            let mut h1 = hyper::server::conn::http1::Builder::new();
+                            h1.timer(TokioTimer::new())
+                                .header_read_timeout(timeouts.http_header)
+                                .max_buf_size(32768)
+                                .half_close(true);
+                            let _ = h1.serve_connection(TokioIo::new(io), service).with_upgrades().await;
+                        }
                         tasks.close();tasks.wait().await;Ok::<(),String>(())
                     };
                     tokio::select!{_=cancel.cancelled()=>{},res=work=>{
@@ -288,47 +369,135 @@ fn authority(request:&Request<Incoming>)->Result<String,StatusCode>{
     if crate::web::boundary::origin_authority(&format!("https://{value}")).is_none(){return Err(StatusCode::BAD_REQUEST);}
     Ok(value.into())
 }
-fn remove_gateway_cookie(headers:&mut HeaderMap){
-    let cookies=headers.get_all(header::COOKIE).iter().filter_map(|v|v.to_str().ok()).flat_map(|v|v.split(';')).map(str::trim)
-        .filter(|cookie|cookie.split_once('=').is_none_or(|(key,_)|key!="vane_session")).map(str::to_owned).collect::<Vec<_>>().join("; ");
-    headers.remove(header::COOKIE);if !cookies.is_empty(){if let Ok(value)=HeaderValue::from_str(&cookies){headers.insert(header::COOKIE,value);}}
-}
-fn response_headers(headers:&mut HeaderMap,rule:&ReverseProxyRule)->Result<(),String>{
-    clean_headers(headers);custom_headers(headers,&rule.response_headers_remove,&rule.response_headers_set)?;
-    let cookies:Vec<_>=headers.get_all(header::SET_COOKIE).iter().filter(|v|v.to_str().ok().is_some_and(|v|!v.trim_start().starts_with("vane_session="))).cloned().collect();
-    headers.remove(header::SET_COOKIE);for cookie in cookies{headers.append(header::SET_COOKIE,cookie);}Ok(())
+fn is_gateway_cookie_name(name: &str) -> bool {
+    let clean = name.trim();
+    clean == "vane_session" || clean == "vane_entry"
 }
 
-async fn handle(mut request:Request<Incoming>,context:Arc<Context>)->Response<Body>{
-    let authority=match authority(&request){Ok(value)=>value,Err(status)=>return empty(status)};
-    let parsed: http::uri::Authority=match authority.parse(){Ok(value)=>value,Err(_)=>return empty(StatusCode::BAD_REQUEST)};
-    let host=parsed.host().trim_matches(['[',']']);
-    if context.sni.as_ref().is_some_and(|sni|!sni.eq_ignore_ascii_case(host)){return empty(StatusCode::MISDIRECTED_REQUEST);}
-    let Some(rule)=match_rule(&context.rules,host,request.uri().path())else{return empty(StatusCode::NOT_FOUND)};
-    if !check_rule_cidr_access(rule,context.peer.ip()){return empty(StatusCode::FORBIDDEN)};
-    let session=context.auth.session(request.headers(),context.peer.ip());
-    let upgrade=request.headers().get(header::UPGRADE).and_then(|v|v.to_str().ok()).is_some_and(|value|value.eq_ignore_ascii_case("websocket"));
-    if rule.auth_gate&&session.is_none()&&!upgrade{return empty(StatusCode::UNAUTHORIZED);}
-    if rule.auth_gate&&!matches!(*request.method(),Method::GET|Method::HEAD|Method::OPTIONS){
-        if request.headers().get_all(header::ORIGIN).iter().count()!=1 || request.headers().get(header::ORIGIN).and_then(|v|v.to_str().ok()).is_none_or(|origin|!context.auth.trusted_origin(origin,&authority)){return empty(StatusCode::FORBIDDEN);}
-    }
-    let is_head=request.method()==Method::HEAD;
-    if rule.mode=="static"{
-        let mut response=Response::builder().status(rule.static_status).header(header::CONTENT_TYPE,&rule.static_content_type).header(header::CONTENT_LENGTH,rule.static_body.len())
-            .body(if is_head{Body::empty()}else{Body::from(rule.static_body.clone())}).unwrap_or_else(|_|empty(StatusCode::INTERNAL_SERVER_ERROR));
-        if response_headers(response.headers_mut(),rule).is_err(){return empty(StatusCode::INTERNAL_SERVER_ERROR);}return response;
-    }
-    if rule.mode=="redirect"{
-        let location=render_redirect_location(&rule.redirect_url,request.uri().path_and_query().map(|v|v.as_str()).unwrap_or("/"),&context.stun.load());
-        if location.contains("{{stun.") {
-            return empty(StatusCode::SERVICE_UNAVAILABLE);
+fn remove_gateway_cookie(headers: &mut HeaderMap) {
+    let cookies = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .map(str::trim)
+        .filter(|cookie| !cookie.is_empty() && cookie.split_once('=').is_none_or(|(key, _)| !is_gateway_cookie_name(key)))
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+        .join("; ");
+    headers.remove(header::COOKIE);
+    if !cookies.is_empty() {
+        if let Ok(value) = HeaderValue::from_str(&cookies) {
+            headers.insert(header::COOKIE, value);
         }
-        let mut response=Response::builder().status(rule.redirect_code).header(header::LOCATION,location).body(Body::empty()).unwrap_or_else(|_|empty(StatusCode::BAD_GATEWAY));
-        if response_headers(response.headers_mut(),rule).is_err(){return empty(StatusCode::INTERNAL_SERVER_ERROR);}return response;
     }
-    if request.method()==Method::CONNECT{return empty(StatusCode::METHOD_NOT_ALLOWED);}
-    if upgrade && rule.mode!="proxy" {return empty(StatusCode::BAD_REQUEST);}
-    if upgrade&&!rule.websocket{return empty(StatusCode::FORBIDDEN);}
+}
+fn response_headers(headers: &mut HeaderMap, rule: &ReverseProxyRule) -> Result<(), String> {
+    clean_headers(headers);
+    custom_headers(headers, &rule.response_headers_remove, &rule.response_headers_set)?;
+    let cookies: Vec<_> = headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter(|v| {
+            v.to_str().ok().is_some_and(|raw| {
+                raw.split_once('=').is_none_or(|(name, _)| !is_gateway_cookie_name(name))
+            })
+        })
+        .cloned()
+        .collect();
+    headers.remove(header::SET_COOKIE);
+    for cookie in cookies {
+        headers.append(header::SET_COOKIE, cookie);
+    }
+    Ok(())
+}
+
+async fn handle(mut request: Request<Incoming>, context: Arc<Context>) -> Response<Body> {
+    let authority = match authority(&request) {
+        Ok(value) => value,
+        Err(status) => return empty(status),
+    };
+    let parsed: http::uri::Authority = match authority.parse() {
+        Ok(value) => value,
+        Err(_) => return empty(StatusCode::BAD_REQUEST),
+    };
+    let host = parsed.host().trim_matches(['[', ']']);
+    if context.sni.as_ref().is_some_and(|sni| !sni.eq_ignore_ascii_case(host)) {
+        return empty(StatusCode::MISDIRECTED_REQUEST);
+    }
+    if !is_canonical_request_path(request.uri().path()) {
+        return empty(StatusCode::BAD_REQUEST);
+    }
+    let Some(rule) = match_rule(&context.rules, host, request.uri().path()) else {
+        return empty(StatusCode::NOT_FOUND);
+    };
+    if !check_rule_cidr_access(rule, context.peer.ip()) {
+        return empty(StatusCode::FORBIDDEN);
+    }
+    let upgrade = request
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    if upgrade && rule.mode != "proxy" {
+        return empty(StatusCode::BAD_REQUEST);
+    }
+    let session = if rule.auth_gate {
+        context.auth.session(request.headers(), context.peer.ip())
+    } else {
+        None
+    };
+    if rule.auth_gate && session.is_none() && !(upgrade && rule.mode == "proxy") {
+        return empty(StatusCode::UNAUTHORIZED);
+    }
+    if rule.auth_gate && !matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
+        if request.headers().get_all(header::ORIGIN).iter().count() != 1
+            || request
+                .headers()
+                .get(header::ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .is_none_or(|origin| !context.auth.trusted_origin(origin, &authority))
+        {
+            return empty(StatusCode::FORBIDDEN);
+        }
+    }
+    let is_head = request.method() == Method::HEAD;
+    if rule.mode == "static" {
+        let mut response = Response::builder()
+            .status(rule.static_status)
+            .header(header::CONTENT_TYPE, &rule.static_content_type)
+            .header(header::CONTENT_LENGTH, rule.static_body.len())
+            .body(if is_head { Body::empty() } else { Body::from(rule.static_body.clone()) })
+            .unwrap_or_else(|_| empty(StatusCode::INTERNAL_SERVER_ERROR));
+        if response_headers(response.headers_mut(), rule).is_err() {
+            return empty(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        return response;
+    }
+    if rule.mode == "redirect" {
+        let Some(location) = render_redirect_location_safe(
+            &rule.redirect_url,
+            request.uri().path_and_query().map(|v| v.as_str()).unwrap_or("/"),
+            &context.stun.load(),
+        ) else {
+            return empty(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        let mut response = Response::builder()
+            .status(rule.redirect_code)
+            .header(header::LOCATION, location)
+            .body(Body::empty())
+            .unwrap_or_else(|_| empty(StatusCode::BAD_GATEWAY));
+        if response_headers(response.headers_mut(), rule).is_err() {
+            return empty(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        return response;
+    }
+    if request.method() == Method::CONNECT {
+        return empty(StatusCode::METHOD_NOT_ALLOWED);
+    }
+    if upgrade && !rule.websocket {
+        return empty(StatusCode::FORBIDDEN);
+    }
     let mut websocket_session=None;
     let original_path = if rule.auth_gate {
         let mut clean_query=Vec::new();let mut ticket=None;

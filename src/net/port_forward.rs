@@ -771,10 +771,11 @@ async fn splice_one_way(
             let n = tokio::time::timeout(idle, write_step)
                 .await
                 .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP splice 写入空闲超时"))??;
-            in_pipe -= n;
-            if n > 0 {
-                last_active_ms.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "TCP splice 写入 0 字节"));
             }
+            in_pipe -= n;
+            last_active_ms.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
     }
 
@@ -795,8 +796,12 @@ async fn splice_bidirectional(a: &TcpStream, b: &TcpStream, idle: Duration) -> i
 
 struct UdpSessionEntry {
     sock: Arc<UdpSocket>,
-    last_active: Instant,
+    last_active_secs: Arc<std::sync::atomic::AtomicU64>,
 }
+
+#[cfg(target_os = "linux")]
+#[repr(C, align(8))]
+struct AlignedCmsgBuf([u8; 128]);
 
 async fn run_udp_proxy(
     inbound: Arc<UdpSocket>,
@@ -807,18 +812,24 @@ async fn run_udp_proxy(
     rule_quota: ConnectionQuota,
     cancel: CancellationToken,
 ) -> Result<(), String> {
-    let sessions: Arc<Mutex<HashMap<(SocketAddr, Option<IpAddr>), UdpSessionEntry>>> =
+    let sessions: Arc<Mutex<HashMap<(SocketAddr, Option<(IpAddr, u32)>), UdpSessionEntry>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let mut session_tasks = tokio::task::JoinSet::new();
     let mut buf = vec![0u8; MAX_UDP_PACKET];
-    let idle = Duration::from_secs(cfg.udp_session_timeout_secs.clamp(10, 600));
+    let idle_secs = cfg.udp_session_timeout_secs.clamp(10, 600);
+    let idle = Duration::from_secs(idle_secs);
+    // 单条 UDP 规则最多占用共享全局配额的一半（至少 16），避免伪造源端口泛洪打死所有 TCP 转发与反代
+    let max_udp_sessions = cfg
+        .max_concurrent_conns
+        .min((global_quota.capacity() / 2).max(16));
+    let mut last_sweep = Instant::now();
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = session_tasks.join_next(), if !session_tasks.is_empty() => {},
             recv_res = recv_udp_pkt(&inbound, &mut buf) => {
-                let Ok((n, peer, local_dst_ip)) = recv_res else {
+                let Ok((n, peer, local_dst)) = recv_res else {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 };
@@ -828,12 +839,18 @@ async fn run_udp_proxy(
                     continue;
                 }
 
-                let key = (peer, local_dst_ip);
+                let now_unix = logger::unix_now();
+                let key = (peer, local_dst);
                 let existing = {
                     let mut map = sessions.lock().await;
-                    map.retain(|_, entry| entry.last_active.elapsed() < idle);
-                    if let Some(entry) = map.get_mut(&key) {
-                        entry.last_active = Instant::now();
+                    if last_sweep.elapsed() >= Duration::from_secs(5) {
+                        map.retain(|_, entry| {
+                            now_unix.saturating_sub(entry.last_active_secs.load(std::sync::atomic::Ordering::Relaxed)) < idle_secs
+                        });
+                        last_sweep = Instant::now();
+                    }
+                    if let Some(entry) = map.get(&key) {
+                        entry.last_active_secs.store(now_unix, std::sync::atomic::Ordering::Relaxed);
                         Some(entry.sock.clone())
                     } else {
                         None
@@ -843,17 +860,24 @@ async fn run_udp_proxy(
                 let upstream_sock = if let Some(s) = existing {
                     s
                 } else {
+                    {
+                        let map = sessions.lock().await;
+                        if map.len() >= max_udp_sessions {
+                            continue;
+                        }
+                    }
                     let Some(gp) = global_quota.try_acquire() else { continue };
                     let Some(rp) = rule_quota.try_acquire() else { continue };
                     let permit = DualPermit { _global: gp, _local: rp };
                     let Some(s) = pool.connect_udp().await else { continue };
                     let s = Arc::new(s);
+                    let last_active_secs = Arc::new(std::sync::atomic::AtomicU64::new(now_unix));
                     {
                         let mut map = sessions.lock().await;
-                        if map.len() >= cfg.max_concurrent_conns {
+                        if map.len() >= max_udp_sessions {
                             continue;
                         }
-                        map.insert(key, UdpSessionEntry { sock: s.clone(), last_active: Instant::now() });
+                        map.insert(key, UdpSessionEntry { sock: s.clone(), last_active_secs: last_active_secs.clone() });
                     }
 
                     let s_clone = s.clone();
@@ -869,13 +893,25 @@ async fn run_udp_proxy(
                                 _ = sess_cancel.cancelled() => break,
                                 r = recv_fut => r,
                             };
-                            let Ok(Ok(rn)) = res else { break };
-                            let _ = send_udp_pkt(&in_clone, &rbuf[..rn], peer, local_dst_ip).await;
-                            if let Some(entry) = sessions_clone.lock().await.get_mut(&key) {
-                                entry.last_active = Instant::now();
+                            match res {
+                                Ok(Ok(rn)) => {
+                                    last_active_secs.store(logger::unix_now(), std::sync::atomic::Ordering::Relaxed);
+                                    let _ = send_udp_pkt(&in_clone, &rbuf[..rn], peer, local_dst).await;
+                                }
+                                Ok(Err(_)) => break,
+                                Err(_) => {
+                                    // 客户端仍持续发包保活但上游静默时，不误断会话
+                                    let elapsed = logger::unix_now().saturating_sub(last_active_secs.load(std::sync::atomic::Ordering::Relaxed));
+                                    if elapsed >= idle_secs {
+                                        break;
+                                    }
+                                }
                             }
                         }
-                        sessions_clone.lock().await.remove(&key);
+                        let mut map = sessions_clone.lock().await;
+                        if map.get(&key).is_some_and(|e| Arc::ptr_eq(&e.sock, &s_clone)) {
+                            map.remove(&key);
+                        }
                     });
                     s
                 };
@@ -890,7 +926,7 @@ async fn run_udp_proxy(
 }
 
 #[cfg(target_os = "linux")]
-async fn recv_udp_pkt(sock: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, Option<IpAddr>)> {
+async fn recv_udp_pkt(sock: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, Option<(IpAddr, u32)>)> {
     use std::os::fd::AsRawFd;
     use tokio::io::Interest;
 
@@ -900,14 +936,14 @@ async fn recv_udp_pkt(sock: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, So
             iov_base: buf.as_mut_ptr().cast(),
             iov_len: buf.len(),
         };
-        let mut cmsg_buf = [0u8; 128];
+        let mut cmsg_buf = AlignedCmsgBuf([0u8; 128]);
         let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
         hdr.msg_name = (&mut peer_storage as *mut libc::sockaddr_storage).cast();
         hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
         hdr.msg_iov = &mut iov;
         hdr.msg_iovlen = 1;
-        hdr.msg_control = cmsg_buf.as_mut_ptr().cast();
-        hdr.msg_controllen = cmsg_buf.len() as _;
+        hdr.msg_control = cmsg_buf.0.as_mut_ptr().cast();
+        hdr.msg_controllen = cmsg_buf.0.len() as _;
 
         let n = unsafe { libc::recvmsg(sock.as_raw_fd(), &mut hdr, 0) };
         if n < 0 {
@@ -922,29 +958,46 @@ async fn recv_udp_pkt(sock: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, So
             .as_socket()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "UDP 对端地址无效"))?;
 
-        let mut local_ip = None;
-        unsafe {
-            let mut cmsg = libc::CMSG_FIRSTHDR(&hdr);
-            while !cmsg.is_null() {
-                if (*cmsg).cmsg_level == libc::IPPROTO_IP && (*cmsg).cmsg_type == libc::IP_PKTINFO {
-                    let info: libc::in_pktinfo = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast());
-                    local_ip = Some(IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(info.ipi_addr.s_addr))));
-                    break;
-                } else if (*cmsg).cmsg_level == libc::IPPROTO_IPV6 && (*cmsg).cmsg_type == libc::IPV6_PKTINFO {
-                    let info: libc::in6_pktinfo = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast());
-                    local_ip = Some(IpAddr::V6(std::net::Ipv6Addr::from(info.ipi6_addr.s6_addr)));
-                    break;
+        let mut local_dst = None;
+        if (hdr.msg_flags & libc::MSG_CTRUNC) == 0 {
+            unsafe {
+                let mut cmsg = libc::CMSG_FIRSTHDR(&hdr);
+                while !cmsg.is_null() {
+                    let level = (*cmsg).cmsg_level;
+                    let ty = (*cmsg).cmsg_type;
+                    let len = (*cmsg).cmsg_len as usize;
+                    if level == libc::IPPROTO_IP
+                        && ty == libc::IP_PKTINFO
+                        && len >= libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize
+                    {
+                        let info: libc::in_pktinfo = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast());
+                        local_dst = Some((
+                            IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(info.ipi_spec_dst.s_addr))),
+                            info.ipi_ifindex as u32,
+                        ));
+                        break;
+                    } else if level == libc::IPPROTO_IPV6
+                        && ty == libc::IPV6_PKTINFO
+                        && len >= libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize
+                    {
+                        let info: libc::in6_pktinfo = std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast());
+                        local_dst = Some((
+                            IpAddr::V6(std::net::Ipv6Addr::from(info.ipi6_addr.s6_addr)),
+                            info.ipi6_ifindex as u32,
+                        ));
+                        break;
+                    }
+                    cmsg = libc::CMSG_NXTHDR(&hdr, cmsg);
                 }
-                cmsg = libc::CMSG_NXTHDR(&hdr, cmsg);
             }
         }
-        Ok((n as usize, peer, local_ip))
+        Ok((n as usize, peer, local_dst))
     })
     .await
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn recv_udp_pkt(sock: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, Option<IpAddr>)> {
+async fn recv_udp_pkt(sock: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, SocketAddr, Option<(IpAddr, u32)>)> {
     let (n, peer) = sock.recv_from(buf).await?;
     Ok((n, peer, None))
 }
@@ -954,12 +1007,12 @@ async fn send_udp_pkt(
     sock: &UdpSocket,
     buf: &[u8],
     peer: SocketAddr,
-    local_src: Option<IpAddr>,
+    local_src: Option<(IpAddr, u32)>,
 ) -> io::Result<usize> {
     use std::os::fd::AsRawFd;
     use tokio::io::Interest;
 
-    let Some(src_ip) = local_src else {
+    let Some((src_ip, ifindex)) = local_src else {
         return sock.send_to(buf, peer).await;
     };
     let dst_sa = socket2::SockAddr::from(peer);
@@ -968,7 +1021,7 @@ async fn send_udp_pkt(
             iov_base: buf.as_ptr() as *mut libc::c_void,
             iov_len: buf.len(),
         };
-        let mut cmsg_space = [0u8; 128];
+        let mut cmsg_space = AlignedCmsgBuf([0u8; 128]);
         let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
         hdr.msg_name = dst_sa.as_ptr() as *mut libc::c_void;
         hdr.msg_namelen = dst_sa.len();
@@ -979,14 +1032,20 @@ async fn send_udp_pkt(
             match src_ip {
                 IpAddr::V4(v4) => {
                     let space = libc::CMSG_SPACE(std::mem::size_of::<libc::in_pktinfo>() as u32) as usize;
-                    hdr.msg_control = cmsg_space.as_mut_ptr().cast();
+                    if space > cmsg_space.0.len() {
+                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "CMSG 缓冲区不足"));
+                    }
+                    hdr.msg_control = cmsg_space.0.as_mut_ptr().cast();
                     hdr.msg_controllen = space as _;
                     let cmsg = libc::CMSG_FIRSTHDR(&hdr);
+                    if cmsg.is_null() {
+                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "无效 CMSG 头"));
+                    }
                     (*cmsg).cmsg_level = libc::IPPROTO_IP;
                     (*cmsg).cmsg_type = libc::IP_PKTINFO;
                     (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in_pktinfo>() as u32) as _;
                     let info = libc::in_pktinfo {
-                        ipi_ifindex: 0,
+                        ipi_ifindex: ifindex as _,
                         ipi_spec_dst: libc::in_addr { s_addr: u32::from(v4).to_be() },
                         ipi_addr: libc::in_addr { s_addr: 0 },
                     };
@@ -994,15 +1053,21 @@ async fn send_udp_pkt(
                 }
                 IpAddr::V6(v6) => {
                     let space = libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize;
-                    hdr.msg_control = cmsg_space.as_mut_ptr().cast();
+                    if space > cmsg_space.0.len() {
+                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "CMSG 缓冲区不足"));
+                    }
+                    hdr.msg_control = cmsg_space.0.as_mut_ptr().cast();
                     hdr.msg_controllen = space as _;
                     let cmsg = libc::CMSG_FIRSTHDR(&hdr);
+                    if cmsg.is_null() {
+                        return Err(io::Error::new(io::ErrorKind::InvalidInput, "无效 CMSG 头"));
+                    }
                     (*cmsg).cmsg_level = libc::IPPROTO_IPV6;
                     (*cmsg).cmsg_type = libc::IPV6_PKTINFO;
                     (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::in6_pktinfo>() as u32) as _;
                     let info = libc::in6_pktinfo {
                         ipi6_addr: libc::in6_addr { s6_addr: v6.octets() },
-                        ipi6_ifindex: 0,
+                        ipi6_ifindex: ifindex as _,
                     };
                     std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast(), info);
                 }
@@ -1023,7 +1088,7 @@ async fn send_udp_pkt(
     sock: &UdpSocket,
     buf: &[u8],
     peer: SocketAddr,
-    _local_src: Option<IpAddr>,
+    _local_src: Option<(IpAddr, u32)>,
 ) -> io::Result<usize> {
     sock.send_to(buf, peer).await
 }

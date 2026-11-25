@@ -669,3 +669,100 @@ async fn websocket_works_without_ticket_when_auth_gate_disabled() {
     task.abort();
     let _ = task.await;
 }
+
+#[tokio::test]
+async fn security_regressions_upgrade_bypass_traversal_template_and_cookies_blocked() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = axum::Router::new().fallback(axum::routing::any(|req: axum::extract::Request| async move {
+        let has_entry_cookie = req
+            .headers()
+            .get(header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|c| c.contains("vane_entry"));
+        assert!(!has_entry_cookie, "vane_entry cookie leaked to upstream!");
+        let resp = axum::response::Response::builder()
+            .header(header::SET_COOKIE, "vane_session =hijack; Path=/")
+            .header(header::SET_COOKIE, "vane_entry=hijack2; Path=/")
+            .header(header::SET_COOKIE, "app=ok; Path=/")
+            .body(axum::body::Body::from(format!("path={}", req.uri().path())))
+            .unwrap();
+        resp
+    }));
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let mut static_rule = rule(&format!("http://{address}"));
+    static_rule.path_prefix = "/secret".into();
+    static_rule.mode = "static".into();
+    static_rule.auth_gate = true;
+    static_rule.static_body = "top-secret".into();
+
+    let mut redirect_rule = rule(&format!("http://{address}"));
+    redirect_rule.path_prefix = "/redir".into();
+    redirect_rule.mode = "redirect".into();
+    redirect_rule.auth_gate = false;
+    redirect_rule.redirect_url = "https://target.example/{{path}}".into();
+
+    let mut admin_sub = rule(&format!("http://{address}"));
+    admin_sub.path_prefix = "/admin".into();
+    admin_sub.auth_gate = true;
+
+    let mut root_open = rule(&format!("http://{address}"));
+    root_open.path_prefix = "/".into();
+    root_open.auth_gate = false;
+
+    let proxy = TestProxy::start(
+        vec![static_rule, redirect_rule, admin_sub, root_open],
+        Arc::new(NoAuthorization),
+    )
+    .await;
+
+    // 1. Upgrade: websocket 不能绕过 static 规则的 auth_gate
+    let mut upg_sock = proxy.tls(false).await;
+    upg_sock
+        .write_all(b"GET /secret HTTP/1.1\r\nHost: proxy.example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+        .await
+        .unwrap();
+    assert!(response_head(&mut upg_sock).await.starts_with(b"HTTP/1.1 400"));
+    drop(upg_sock);
+
+    // 2. 非规范路径（/x/../admin、%2f、/%61dmin/panel）不能穿透到公开兜底规则
+    for (bad_path, expect_prefix) in [
+        ("/x/../admin", "HTTP/1.1 400"),
+        ("/%2fadmin", "HTTP/1.1 400"),
+        ("/%61dmin/panel", "HTTP/1.1 401"),
+    ] {
+        let req = format!("GET {bad_path} HTTP/1.1\r\nHost: proxy.example.com\r\nConnection: close\r\n\r\n");
+        let resp = proxy.raw(req.as_bytes(), false).await;
+        let head = String::from_utf8_lossy(&resp);
+        assert!(head.starts_with(expect_prefix), "{bad_path} -> {head}");
+    }
+
+    // 3. redirect {{path}} 中包含 {{stun.hidden.public_addr}} 时不可触发 STUN 模板展开
+    let stun_map = [("hidden".to_string(), "203.0.113.10:51820".to_string())]
+        .into_iter()
+        .collect();
+    let rendered = render_redirect_location_safe(
+        "https://target.example{{path}}",
+        "/?q={{stun.hidden.public_addr}}",
+        &stun_map,
+    )
+    .unwrap();
+    assert!(!rendered.contains("203.0.113.10"));
+
+    // 4. vane_entry 不透传到上游，且带空格的 Set-Cookie: vane_session =hijack 被过滤
+    let resp = proxy
+        .raw(
+            b"GET /public HTTP/1.1\r\nHost: proxy.example.com\r\nCookie: vane_entry=secret; app_c=1\r\nConnection: close\r\n\r\n",
+            false,
+        )
+        .await;
+    let text = String::from_utf8_lossy(&resp);
+    assert!(text.starts_with("HTTP/1.1 200"));
+    assert!(!text.contains("hijack"));
+    assert!(text.contains("app=ok"));
+
+    proxy.shutdown().await;
+    task.abort();
+    let _ = task.await;
+}

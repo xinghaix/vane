@@ -84,3 +84,16 @@ async fn failed_candidate_does_not_cancel_successful_candidate() {
     let connected = super::super::dual_stack::connect_candidates(&[unavailable, listener.local_addr().unwrap()], 10).await.unwrap();
     assert_eq!(connected.peer_addr().unwrap(), listener.local_addr().unwrap());
 }
+
+#[tokio::test]
+async fn ssrf_policy_blocks_loopback_and_link_local_metadata() {
+    let mut req = HttpRequest::new("GET", "http://127.0.0.1:8080/secret");
+    req.ssrf_policy = SsrfPolicy::BlockLoopbackAndLinkLocal;
+    let err = shared().execute(req).await.err().unwrap();
+    assert!(err.contains("SSRF"));
+
+    let mut meta = HttpRequest::new("GET", "http://169.254.169.254/latest/meta-data/");
+    meta.ssrf_policy = SsrfPolicy::BlockLoopbackAndLinkLocal;
+    let err2 = shared().execute(meta).await.err().unwrap();
+    assert!(err2.contains("SSRF"));
+}

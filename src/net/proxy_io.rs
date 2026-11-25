@@ -36,11 +36,6 @@ impl<T> TimedIo<T> {
             read_deadline: true,
         }
     }
-
-    pub fn without_read_deadline(mut self) -> Self {
-        self.read_deadline = false;
-        self
-    }
 }
 
 impl<T: AsyncRead + Unpin> AsyncRead for TimedIo<T> {
@@ -52,7 +47,6 @@ impl<T: AsyncRead + Unpin> AsyncRead for TimedIo<T> {
                 if result.is_ok() && buf.filled().len() > before {
                     let next = tokio::time::Instant::now() + timeout;
                     self.read.as_mut().reset(next);
-                    self.write.as_mut().reset(next);
                 }
                 Poll::Ready(result)
             }
@@ -75,7 +69,6 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for TimedIo<T> {
                 if result.as_ref().is_ok_and(|n| *n > 0) {
                     let next = tokio::time::Instant::now() + timeout;
                     self.write.as_mut().reset(next);
-                    self.read.as_mut().reset(next);
                 }
                 Poll::Ready(result)
             }

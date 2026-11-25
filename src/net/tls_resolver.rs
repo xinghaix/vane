@@ -101,6 +101,18 @@ pub fn generate_self_signed_cert(sans: &[String]) -> Result<(String, String, Arc
     Ok((cert_pem, key_pem, ck))
 }
 
+/// 生成独立的中性反代回退证书（不包含内网管理 IP 或 canonical_origin SAN），防止 strict_sni=false 泄露管理面拓扑
+pub fn generate_neutral_fallback_cert() -> Result<Arc<CertifiedKey>, String> {
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "vane-proxy-fallback");
+    params.distinguished_name = dn;
+    params.subject_alt_names = vec![SanType::DnsName("localhost".try_into().map_err(|e| format!("{:?}", e))?)];
+    let key_pair = KeyPair::generate().map_err(|e| format!("生成回退 ECDSA 密钥对失败: {}", e))?;
+    let cert = params.self_signed(&key_pair).map_err(|e| format!("签发回退自签名证书失败: {}", e))?;
+    certified_key_from_pem(cert.pem().as_bytes(), key_pair.serialize_pem().as_bytes())
+}
+
 pub fn certified_key_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<Arc<CertifiedKey>, String> {
     let mut cert_reader = BufReader::new(cert_pem);
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)

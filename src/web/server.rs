@@ -1,9 +1,10 @@
 //! 独立管理面 HTTPS 服务：连接配额覆盖嗅探、握手与 WebSocket 生命周期。
+use crate::net::dual_stack::BanKey;
 use axum::{extract::ConnectInfo, Router};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rustls::{server::{ClientHello, ResolvesServerCert}, sign::CertifiedKey};
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, io, net::SocketAddr, sync::{Arc, Mutex}, time::Duration};
 use tokio::{io::AsyncWriteExt, net::TcpListener, sync::Semaphore, task::JoinSet};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
@@ -41,21 +42,52 @@ pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
     TcpListener::from_std(socket.into())
 }
 
+struct PeerConnGuard {
+    map: Arc<Mutex<HashMap<BanKey, usize>>>,
+    key: BanKey,
+}
+
+impl Drop for PeerConnGuard {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.map.lock() {
+            if let Some(cnt) = g.get_mut(&self.key) {
+                if *cnt <= 1 {
+                    g.remove(&self.key);
+                } else {
+                    *cnt -= 1;
+                }
+            }
+        }
+    }
+}
+
 pub async fn serve(listener: TcpListener, app: Router, tls: Arc<rustls::ServerConfig>,
     canonical_origin: String, quota: Arc<Semaphore>, handshake_timeout: Duration,
     header_timeout: Duration) -> io::Result<()> {
     let acceptor = TlsAcceptor::from(tls);
     let mut connections = JoinSet::new();
+    let per_peer: Arc<Mutex<HashMap<BanKey, usize>>> = Arc::new(Mutex::new(HashMap::new()));
     loop {
         tokio::select! {
             Some(_) = connections.join_next(), if !connections.is_empty() => {},
             incoming = listener.accept() => {
                 let (mut stream, peer) = incoming?;
                 let Ok(permit) = quota.clone().try_acquire_owned() else { continue };
+                let peer_key = BanKey::from_peer(peer.ip());
+                let peer_guard = {
+                    let Ok(mut g) = per_peer.lock() else { continue };
+                    let cnt = g.entry(peer_key).or_insert(0);
+                    if *cnt >= 6 {
+                        continue;
+                    }
+                    *cnt += 1;
+                    PeerConnGuard { map: per_peer.clone(), key: peer_key }
+                };
                 let acceptor = acceptor.clone();
                 let app = app.clone();
                 let redirect = format!("HTTP/1.1 308 Permanent Redirect\r\nLocation: {}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", canonical_origin.trim_end_matches('/'));
                 connections.spawn(async move {
+                    let _peer_guard = peer_guard;
                     // Arc 克隆交给升级请求，WebSocket 断开之前不释放连接配额。
                     let permit = Arc::new(permit);
                     let mut first = [0u8; 1];

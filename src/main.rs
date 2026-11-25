@@ -116,13 +116,15 @@ fn main() {
                 .unwrap_or_else(|| Path::new("."));
             let verify_secrets = args.iter().any(|a| a == "--verify-secrets");
             match load_or_init(&config_path).and_then(|o| {
-                o.config.validate()?;
                 if verify_secrets {
                     let v = Vault::load_or_create(data_dir)?;
+                    o.config.validate_with_vault(Some(&v))?;
                     let bad = v.verify_all(&o.config);
                     if !bad.is_empty() {
                         return Err(format!("以下加密机密字段无法以当前主密钥解密: {:?}", bad));
                     }
+                } else {
+                    o.config.validate()?;
                 }
                 Ok(o.config)
             }) {
@@ -310,7 +312,7 @@ async fn run_gateway(config_path: PathBuf, listen_override: Option<String>) -> R
     if vault.auto_seal(&mut outcome.config)? {
         outcome.dirty = true;
     }
-    outcome.config.validate()?;
+    outcome.config.validate_with_vault(Some(&vault))?;
     if outcome.dirty {
         save_config(&config_path, &outcome.config)?;
     }
@@ -329,10 +331,10 @@ async fn run_gateway(config_path: PathBuf, listen_override: Option<String>) -> R
     let firewall = FirewallManager::detect_and_init(outcome.config.firewall.clone()).await;
     let health_registry = new_health_registry();
     let admin_ck = load_admin_tls_cert(&data_dir, &outcome.config)?;
-    let admin_cert = Arc::new(ArcSwap::from(admin_ck.clone()));
+    let admin_cert = Arc::new(ArcSwap::from(admin_ck));
     let admin_tls = Arc::new(web::server::tls_config_dynamic(admin_cert.clone()));
     let mut init_cert_table = CertTable::default();
-    init_cert_table.fallback = Some(admin_ck);
+    init_cert_table.fallback = Some(net::tls_resolver::generate_neutral_fallback_cert()?);
     let cert_table = Arc::new(ArcSwap::from_pointee(init_cert_table));
 
     let state = Arc::new(AppState {
@@ -792,11 +794,14 @@ async fn orchestrate_modules(
             }
         }
 
-        // 2. ACME：先从磁盘预加载已有合法证书到反代与管理面
+        // 2. ACME：先修剪已删域名并从磁盘预加载已有合法证书到反代与管理面
         if last_acme_preload_fp != fp_acme_preload {
             last_acme_preload_fp = fp_acme_preload;
-            for entry in cfg.acme.iter().filter(|entry| entry.enabled) {
-                preload_cached_cert(entry, &cfg, &state.cert_table, &state.cert_status, &state.admin_cert).await;
+            daemon::acme::prune_cert_table(&cfg, &state.cert_table);
+            if cfg.modules.acme {
+                for entry in cfg.acme.iter().filter(|entry| entry.enabled) {
+                    preload_cached_cert(entry, &cfg, &state.cert_table, &state.cert_status, &state.admin_cert).await;
+                }
             }
         }
         if ch_acme {
@@ -847,6 +852,37 @@ async fn orchestrate_modules(
                     http_header: Duration::from_secs(cfg.security.http_header_timeout_secs),
                 };
                 for rp in cfg.reverse_proxy.iter().filter(|r| r.enabled).cloned() {
+                    let revealed_rp = match reveal_reverse_proxy_config(&rp, &state.vault) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            logger::log(Level::Error, "reverse_proxy", &format!("反代 {} 请求头解密失败: {}", rp.name, e));
+                            net::update_rule_status(
+                                &Some(state.reverse_proxy_status.clone()),
+                                net::RuleRuntimeStatus {
+                                    name: rp.name.clone(),
+                                    enabled: rp.enabled,
+                                    listen_port: rp.listen_port,
+                                    stack: rp.stack.clone(),
+                                    proto: "tcp".into(),
+                                    status: "failed".into(),
+                                    last_error: e.clone(),
+                                    ..Default::default()
+                                },
+                            );
+                            update_task_health(
+                                &task_health,
+                                reg,
+                                true,
+                                "reverse_proxy",
+                                &rp.name,
+                                Some(ModuleHealth::Degraded {
+                                    recent_failures: 1,
+                                    last_error: e,
+                                }),
+                            );
+                            continue;
+                        }
+                    };
                     let (stop_tx, stop_rx) = watch::channel(false);
                     rp_runner.stops.push(stop_tx);
                     let st = state.clone();
@@ -858,7 +894,7 @@ async fn orchestrate_modules(
                         htx,
                         None,
                         move |rx| {
-                            let rp = rp.clone();
+                            let rp = revealed_rp.clone();
                             let st = st.clone();
                             async move {
                                 run_reverse_proxy_with_status(
@@ -1038,4 +1074,18 @@ async fn orchestrate_modules(
     pf_runner.finish_stop().await;
     stun_runner.finish_stop().await;
     cron_runner.finish_stop().await;
+}
+
+fn reveal_reverse_proxy_config(
+    rp: &crate::config::ReverseProxyConfig,
+    vault: &Vault,
+) -> Result<crate::config::ReverseProxyConfig, String> {
+    let mut out = rp.clone();
+    for (i, rule) in out.rules.iter_mut().enumerate() {
+        for (header, val) in rule.request_headers_set.iter_mut() {
+            let path = format!("reverse_proxy.{}.rules.{}.request_headers_set.{}", rp.name, i, header);
+            *val = vault.reveal_string(&path, val)?;
+        }
+    }
+    Ok(out)
 }

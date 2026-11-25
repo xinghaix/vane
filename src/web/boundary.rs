@@ -109,12 +109,40 @@ pub fn has_valid_entry_cookie(headers: &HeaderMap, mac_key: &[u8; 32], secret_pa
     false
 }
 
-fn reject(code: &'static str) -> Response {
-    (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": code}))).into_response()
+fn apply_security_headers(resp: &mut Response, is_api: bool) {
+    let headers = resp.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' wss:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(
+        header::HeaderName::from_static("permissions-policy"),
+        "camera=(), microphone=(), geolocation=()".parse().unwrap(),
+    );
+    headers.insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        "max-age=31536000".parse().unwrap(),
+    );
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    headers.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
+    headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
+    if is_api {
+        headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    }
+}
+
+fn reject(code: &'static str, is_api: bool) -> Response {
+    let mut resp = (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": code}))).into_response();
+    apply_security_headers(&mut resp, is_api);
+    resp
 }
 
 pub async fn guard(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
     let cfg = state.config.load_full();
+    let path = request.uri().path().to_string();
+    let is_api = path.starts_with("/api/");
     let headers = request.headers();
     let host = headers.get(header::HOST).and_then(|h| h.to_str().ok());
     let authority = request.uri().authority().map(|a| a.as_str());
@@ -123,10 +151,9 @@ pub async fn guard(State(state): State<Arc<AppState>>, request: Request, next: N
         || host.is_some_and(|h| !trusted_authority(h, &cfg))
         || authority.is_some_and(|h| !trusted_authority(h, &cfg))
     {
-        return reject("UNTRUSTED_HOST");
+        return reject("UNTRUSTED_HOST", is_api);
     }
 
-    let path = request.uri().path().to_string();
     let unsafe_method = !matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS);
     let websocket = path == "/api/pty/ws";
     let origin = headers.get(header::ORIGIN);
@@ -140,13 +167,15 @@ pub async fn guard(State(state): State<Arc<AppState>>, request: Request, next: N
                 .is_none_or(|a| !trusted_origin_authority(&a, &cfg))
         })
     {
-        return reject("UNTRUSTED_ORIGIN");
+        return reject("UNTRUSTED_ORIGIN", is_api);
     }
     if (unsafe_method || websocket) && headers.get("sec-fetch-site").is_some_and(|v| v == "cross-site") {
-        return reject("CROSS_SITE_REQUEST");
+        return reject("CROSS_SITE_REQUEST", is_api);
     }
 
-    // 安全入口路径守卫：启用非 "/" 的 secret_path 时，未命中入口路径且无有效入口/会话凭据的请求统一返回 404
+    let session_scope = super::current_session_scope(&state, headers);
+
+    // 安全入口路径守卫：启用非 "/" 的 secret_path 时，未命中入口路径且无有效入口/会话凭据的请求统一返回 404，并计入 Fail2Ban 防爆破扫描
     let mut issue_entry_cookie: Option<HeaderValue> = None;
     if let Some(sp) = active_secret_path(&cfg) {
         let hit_secret_path = path == sp
@@ -156,43 +185,60 @@ pub async fn guard(State(state): State<Arc<AppState>>, request: Request, next: N
         if hit_secret_path {
             issue_entry_cookie = build_entry_set_cookie(state.vault.mac_key(), sp);
         } else {
-            let authorized = has_valid_entry_cookie(headers, state.vault.mac_key(), sp)
-                || super::current_session_scope(&state, headers).is_some();
+            let authorized = has_valid_entry_cookie(headers, state.vault.mac_key(), sp) || session_scope.is_some();
             if !authorized {
-                return StatusCode::NOT_FOUND.into_response();
+                if let Some(axum::extract::ConnectInfo(peer)) = request.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>() {
+                    let ban_key = crate::net::dual_stack::BanKey::from_peer(peer.ip());
+                    if state.fail2ban.is_key_banned(ban_key) {
+                        let mut resp = StatusCode::TOO_MANY_REQUESTS.into_response();
+                        apply_security_headers(&mut resp, is_api);
+                        return resp;
+                    }
+                    if state.fail2ban.record_failure(
+                        ban_key,
+                        cfg.security.max_login_failures.saturating_mul(2),
+                        cfg.security.ban_duration_secs,
+                        "secret_path_probe",
+                    ) && cfg.security.kernel_ban_offload
+                    {
+                        let _ = state
+                            .firewall
+                            .ban_source_cidr(&ban_key.display_cidr(), cfg.security.ban_duration_secs)
+                            .await;
+                    }
+                }
+                let mut resp = StatusCode::NOT_FOUND.into_response();
+                apply_security_headers(&mut resp, is_api);
+                return resp;
             }
         }
     }
 
-    let module = [
-        ("/api/proxy/", "reverse_proxy"),
-        ("/api/port-forwards/", "port_forward"),
-        ("/api/ddns/", "ddns"),
-        ("/api/acme/", "acme"),
-        ("/api/stun/", "stun"),
-        ("/api/cron/", "cron"),
-        ("/api/docker/", "docker"),
-        ("/api/pty/", "web_terminal"),
-    ]
-    .into_iter()
-    .find(|(prefix, _)| path.starts_with(prefix))
-    .map(|(_, name)| name);
-    if module.is_some_and(|name| cfg.modules.get(name) != Some(true)) {
-        return reject("MODULE_DISABLED");
+    // 仅在已建立有效会话后检查模块启用状态，防止未认证调用者探测已启用子模块
+    if session_scope.is_some() {
+        let module = [
+            ("/api/proxy/", "reverse_proxy"),
+            ("/api/port-forwards/", "port_forward"),
+            ("/api/ddns/", "ddns"),
+            ("/api/acme/", "acme"),
+            ("/api/stun/", "stun"),
+            ("/api/cron/", "cron"),
+            ("/api/docker/", "docker"),
+            ("/api/pty/", "web_terminal"),
+        ]
+        .into_iter()
+        .find(|(prefix, _)| path.starts_with(prefix))
+        .map(|(_, name)| name);
+        if module.is_some_and(|name| cfg.modules.get(name) != Some(true)) {
+            return reject("MODULE_DISABLED", is_api);
+        }
     }
 
-    let is_api = path.starts_with("/api/");
     let mut response = next.run(request).await;
-    let resp_headers = response.headers_mut();
     if let Some(cookie) = issue_entry_cookie {
-        resp_headers.append(header::SET_COOKIE, cookie);
+        response.headers_mut().append(header::SET_COOKIE, cookie);
     }
-    resp_headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
-    resp_headers.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
-    resp_headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
-    if is_api {
-        resp_headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
-    }
+    apply_security_headers(&mut response, is_api);
     response
 }
 

@@ -32,7 +32,7 @@ use crate::web::ws_pty::{handle_pty_websocket, PtyManager};
 use arc_swap::ArcSwap;
 use axum::body::{Body, Bytes};
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{ConnectInfo, Path as AxumPath, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -144,6 +144,7 @@ impl AppState {
                 if !found {
                     return Err(format!("未找到目标规则 {}.{}", target_kind, rule_name));
                 }
+                next.validate_with_vault(Some(&st.vault))?;
                 save_config(&st.config_path, &next)?;
                 st.config.store(Arc::new(next));
                 st.reload_notify.notify_one();
@@ -214,15 +215,31 @@ async fn api_proxy_ticket(
         .iter()
         .find(|entry| entry.enabled && entry.name == body.listener)
     else {
-        return StatusCode::NOT_FOUND.into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "LISTENER_NOT_FOUND", "message": "未找到已启用的目标反代监听器" })),
+        )
+            .into_response();
     };
     let uri: http::Uri = match format!("https://{}{}", body.authority, body.path).parse() {
         Ok(uri) => uri,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "INVALID_PROXY_TARGET", "message": "目标 Authority 或路径格式非法" })),
+            )
+                .into_response();
+        }
     };
     let authority: http::uri::Authority = match body.authority.parse() {
         Ok(authority) => authority,
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "INVALID_PROXY_TARGET", "message": "目标 Authority 格式非法" })),
+            )
+                .into_response();
+        }
     };
     if !body.path.starts_with('/')
         || body.path.starts_with("//")
@@ -233,19 +250,41 @@ async fn api_proxy_ticket(
         || crate::net::reverse_proxy::match_rule(&listener.rules, authority.host(), uri.path())
             .is_none_or(|rule| !rule.websocket)
     {
-        return StatusCode::BAD_REQUEST.into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "INVALID_PROXY_TARGET", "message": "目标端口或路径未匹配到允许 WebSocket 的启用规则" })),
+        )
+            .into_response();
     }
     match state
         .proxy_tickets
         .issue(&token, format!("{}{}", body.authority, body.path), BanKey::from_peer(peer.ip()))
     {
         Ok(ticket) => Json(serde_json::json!({"ticket": ticket, "expires_in": 30})).into_response(),
-        Err(_) => StatusCode::TOO_MANY_REQUESTS.into_response(),
+        Err(msg) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "TICKET_BUSY", "message": msg })),
+        )
+            .into_response(),
+    }
+}
+
+async fn request_timeout_guard(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    if request.uri().path() == "/api/pty/ws" {
+        return next.run(request).await;
+    }
+    match tokio::time::timeout(Duration::from_secs(60), next.run(request)).await {
+        Ok(resp) => resp,
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            Json(serde_json::json!({ "error": "REQUEST_TIMEOUT", "message": "请求处理超时" })),
+        )
+            .into_response(),
     }
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let auth_routes = Router::new()
         .route("/api/auth/status", get(api_auth_status))
         .route("/api/auth/login", post(api_auth_login))
         .route("/api/auth/logout", post(api_auth_logout))
@@ -259,6 +298,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/ed25519/keys", post(api_add_ed25519_key))
         .route("/api/auth/ed25519/keys/{id}", delete(api_delete_ed25519_key))
         .route("/api/auth/ca-cert", get(api_export_admin_cert))
+        .layer(DefaultBodyLimit::max(8 * 1024));
+
+    Router::new()
+        .merge(auth_routes)
         .route("/api/dashboard", get(api_dashboard))
         .route("/api/system/network-info", get(api_system_network_info))
         .route("/api/logs", get(api_get_logs).delete(api_clear_logs))
@@ -279,7 +322,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/security/bans/{ip}", delete(api_unban_ip))
         .route("/api/firewall/lockdown", post(api_firewall_lockdown))
         .route("/api/backup/export", post(api_backup_export))
-        .route("/api/backup/import", post(api_backup_import))
+        .route(
+            "/api/backup/import",
+            post(api_backup_import).layer(DefaultBodyLimit::max(24 * 1024 * 1024)),
+        )
         .route("/api/backup/sanitized", post(api_backup_sanitized))
         .route("/api/proxy/ticket", post(api_proxy_ticket))
         .route("/api/pty/ticket", post(api_pty_ticket))
@@ -287,6 +333,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/manifest.webmanifest", get(serve_manifest))
         .route("/sw.js", get(serve_sw))
         .fallback(serve_static_or_spa)
+        .layer(axum::middleware::from_fn(request_timeout_guard))
         .layer(axum::middleware::from_fn_with_state(state.clone(), boundary::guard))
         .with_state(state)
 }
@@ -411,6 +458,17 @@ async fn api_auth_login(
             .into_response();
     }
     if req.username.trim() != cfg.admin.username {
+        let pw_bytes = req.password.into_bytes();
+        let dummy_iters = PasswordHash::parse(&cfg.admin.password_hash)
+            .map(|p| p.iters)
+            .unwrap_or(crate::security::auth::PBKDF2_ITERS);
+        let Ok(()) = state
+            .hash_gate
+            .run(move || AuthEngine::verify_dummy_password(&pw_bytes, dummy_iters))
+            .await
+        else {
+            return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "认证繁忙" }))).into_response();
+        };
         on_login_failed(&state, ban_key).await;
         return (
             StatusCode::UNAUTHORIZED,
@@ -433,7 +491,11 @@ async fn api_auth_login(
         .hash_gate
         .run(move || {
             let ok = ph_clone.verify(&pw_bytes);
-            let sc = AuthEngine::resolve_session_scope(must_change_flag, &ph_clone.salt, &ph_clone.hash, ph_clone.iters);
+            let sc = if ok {
+                AuthEngine::resolve_session_scope(must_change_flag, &ph_clone.salt, &ph_clone.hash, ph_clone.iters)
+            } else {
+                SessionScope::MustChangePassword
+            };
             (ok, sc)
         })
         .await
@@ -459,7 +521,13 @@ async fn api_auth_login(
             )
                 .into_response();
         };
-        let secret_bytes = base32_decode(&totp_plain).unwrap_or_default();
+        let Some(secret_bytes) = base32_decode(&totp_plain).filter(|b| b.len() >= 16) else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "TOTP 密钥无效，请核对配置后重试" })),
+            )
+                .into_response();
+        };
         let code_trim = req.totp_code.trim().to_string();
         if code_trim.is_empty() {
             on_login_failed(&state, ban_key).await;
@@ -473,7 +541,7 @@ async fn api_auth_login(
         if code_trim.len() == 6 && code_trim.bytes().all(|b| b.is_ascii_digit()) {
             let code_num = code_trim.parse::<u32>().unwrap_or(u32::MAX);
             let accepted_step = {
-                let mut auth = state.auth.lock().unwrap();
+                let mut auth = state.auth.lock().unwrap_or_else(|e| e.into_inner());
                 if auth.engine.verify_totp(&secret_bytes, code_num, logger::unix_now()) {
                     Some(auth.engine.totp_watermark())
                 } else {
@@ -553,7 +621,7 @@ async fn api_auth_login(
     state.fail2ban.record_success(ban_key);
     let ttl = Duration::from_secs(latest_cfg.admin.session_ttl_secs.clamp(300, 86_400));
     let token = {
-        let mut auth = state.auth.lock().unwrap();
+        let mut auth = state.auth.lock().unwrap_or_else(|e| e.into_inner());
         match auth.sessions.issue(scope, ban_key, ttl) {
             Ok(t) => t,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
@@ -652,9 +720,16 @@ async fn api_auth_change_password(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let _cfg_guard = state.config_lock.lock().await;
-    let cfg_snap = state.config.load();
-    let Some(ph) = PasswordHash::parse(&cfg_snap.admin.password_hash) else {
+    let ban_key = BanKey::from_peer(peer.ip());
+    if state.fail2ban.is_key_banned(ban_key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "IP_BANNED", "message": "认证失败次数过多，该网络已被临时封禁" })),
+        )
+            .into_response();
+    }
+    let cfg_snap_pre = state.config.load();
+    let Some(ph_pre) = PasswordHash::parse(&cfg_snap_pre.admin.password_hash) else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "密码未初始化" })),
@@ -663,7 +738,7 @@ async fn api_auth_change_password(
     };
 
     let target_username = if req.new_username.trim().is_empty() {
-        cfg_snap.admin.username.clone()
+        cfg_snap_pre.admin.username.clone()
     } else {
         req.new_username.trim().to_string()
     };
@@ -674,21 +749,30 @@ async fn api_auth_change_password(
     let cur_pw = req.current_password.into_bytes();
     let new_pw = req.new_password.into_bytes();
     let uname_bytes = target_username.clone().into_bytes();
-    let ph_clone = ph.clone();
+    let ph_clone = ph_pre.clone();
 
+    // 在持有 config_lock 之前执行 PBKDF2，避免阻塞其他配置写请求
     let res = state
         .hash_gate
-        .run(move || -> Result<PasswordHash, &'static str> {
+        .run(move || -> Result<(bool, PasswordHash), &'static str> {
             if !ph_clone.verify(&cur_pw) {
-                return Err("原密码错误");
+                return Ok((false, ph_clone));
             }
             AuthEngine::validate_new_password(&new_pw, &uname_bytes, &ph_clone.salt, &ph_clone.hash, ph_clone.iters)?;
-            PasswordHash::create(&new_pw)
+            Ok((true, PasswordHash::create(&new_pw)?))
         })
         .await;
 
     let new_hash = match res {
-        Ok(Ok(h)) => h,
+        Ok(Ok((false, _))) => {
+            on_login_failed(&state, ban_key).await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "INVALID_PASSWORD", "message": "原密码错误" })),
+            )
+                .into_response();
+        }
+        Ok(Ok((true, h))) => h,
         Ok(Err(msg)) => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -705,6 +789,15 @@ async fn api_auth_change_password(
         }
     };
 
+    let _cfg_guard = state.config_lock.lock().await;
+    let cfg_snap = state.config.load();
+    if cfg_snap.admin.password_hash != cfg_snap_pre.admin.password_hash {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "认证状态已并发变更，请重新输入" })),
+        )
+            .into_response();
+    }
     let mut next_cfg = (**cfg_snap).clone();
     next_cfg.admin.username = target_username;
     next_cfg.admin.password_hash = new_hash.encode();
@@ -717,16 +810,17 @@ async fn api_auth_change_password(
             .into_response();
     }
     state.config.store(Arc::new(next_cfg.clone()));
+    state.fail2ban.record_success(ban_key);
 
     // 密码变更后清空所有旧会话、终止遗留 PTY 终端并签发全新 FullAdmin 会话
-    let ban_key = BanKey::from_peer(peer.ip());
     let ttl = Duration::from_secs(next_cfg.admin.session_ttl_secs.clamp(300, 86_400));
     let new_token = {
-        let mut auth = state.auth.lock().unwrap();
+        let mut auth = state.auth.lock().unwrap_or_else(|e| e.into_inner());
         auth.sessions.revoke_all();
-        auth.sessions
-            .issue(SessionScope::FullAdmin, ban_key, ttl)
-            .unwrap_or_default()
+        match auth.sessions.issue(SessionScope::FullAdmin, ban_key, ttl) {
+            Ok(t) => t,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
+        }
     };
     state.pty_mgr.notify_revoke();
     logger::log(Level::Info, "auth", "管理员密码已成功修改并完成原子落盘，已解锁完整管理权限");
@@ -760,7 +854,7 @@ async fn api_auth_challenge(
             .into_response();
     }
     let rng = ring::rand::SystemRandom::new();
-    let mut auth = state.auth.lock().unwrap();
+    let mut auth = state.auth.lock().unwrap_or_else(|e| e.into_inner());
     match auth.engine.issue_challenge(&rng, req.key_id, client_key) {
         Ok(nonce) => Json(serde_json::json!({
             "nonce_b64": B64.encode(nonce),
@@ -800,6 +894,9 @@ async fn api_auth_login_ed25519(
         )
             .into_response();
     };
+    if req.nonce_b64.trim().len() > 256 || req.signature_b64.trim().len() > 256 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "挑战参数长度超限" }))).into_response();
+    }
     let Ok(nonce_vec) = B64.decode(req.nonce_b64.trim()) else {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "nonce 编码错误" }))).into_response();
     };
@@ -811,7 +908,7 @@ async fn api_auth_login_ed25519(
     };
 
     let verified = {
-        let mut auth = state.auth.lock().unwrap();
+        let mut auth = state.auth.lock().unwrap_or_else(|e| e.into_inner());
         auth.engine
             .verify_ed25519_challenge(&nonce, &req.key_id, client_key, &sig, &raw_pk)
     };
@@ -827,9 +924,12 @@ async fn api_auth_login_ed25519(
     state.fail2ban.record_success(client_key);
     let ttl = Duration::from_secs(cfg.admin.session_ttl_secs.clamp(300, 86_400));
     let (token, scope) = {
-        let mut auth = state.auth.lock().unwrap();
+        let mut auth = state.auth.lock().unwrap_or_else(|e| e.into_inner());
         let sc = auth.effective_scope(&cfg.admin, SessionScope::FullAdmin);
-        let tok = auth.sessions.issue(sc, client_key, ttl).unwrap_or_default();
+        let tok = match auth.sessions.issue(sc, client_key, ttl) {
+            Ok(t) => t,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
+        };
         (tok, sc)
     };
     logger::log(Level::Info, "auth", &format!("管理员通过 Ed25519 密钥 {} 登录成功", req.key_id));
@@ -908,7 +1008,7 @@ async fn api_totp_enable(
             .into_response();
     }
     let verified_opt = {
-        let mut auth = state.auth.lock().unwrap();
+        let mut auth = state.auth.lock().unwrap_or_else(|e| e.into_inner());
         match auth.pending_totp_secret.clone() {
             Some((sec, issued_at)) if issued_at.elapsed() <= PENDING_TOTP_TTL => {
                 let mut probe = AuthEngine::new(String::new());
@@ -1028,7 +1128,10 @@ async fn api_add_ed25519_key(
         .admin
         .authorized_ed25519_keys
         .push(Ed25519KeyEntry { id: entry.id, pubkey: norm_pub });
-    if let Err(e) = next_cfg.validate().and_then(|_| save_config(&state.config_path, &next_cfg)) {
+    if let Err(e) = next_cfg
+        .validate_with_vault(Some(&state.vault))
+        .and_then(|_| save_config(&state.config_path, &next_cfg))
+    {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response();
     }
     state.config.store(Arc::new(next_cfg.clone()));
@@ -1037,14 +1140,17 @@ async fn api_add_ed25519_key(
 
 async fn api_delete_ed25519_key(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Response {
-    if let Err(resp) = require_full_admin(&state, &headers) {
-        return resp;
-    }
+    let cur_tok = match require_full_admin(&state, &headers) {
+        Ok(tok) => tok,
+        Err(resp) => return resp,
+    };
     let _cfg_guard = state.config_lock.lock().await;
     let mut next_cfg = (**state.config.load()).clone();
+    let before = next_cfg.admin.authorized_ed25519_keys.len();
     next_cfg.admin.authorized_ed25519_keys.retain(|k| k.id != id);
     if next_cfg.admin.authorized_ed25519_keys.is_empty() {
         next_cfg.admin.password_login_enabled = true;
@@ -1053,7 +1159,21 @@ async fn api_delete_ed25519_key(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response();
     }
     state.config.store(Arc::new(next_cfg.clone()));
-    Json(serde_json::json!({ "keys": next_cfg.admin.authorized_ed25519_keys })).into_response()
+    let mut resp = Json(serde_json::json!({ "keys": next_cfg.admin.authorized_ed25519_keys })).into_response();
+    if next_cfg.admin.authorized_ed25519_keys.len() != before {
+        let ttl = Duration::from_secs(next_cfg.admin.session_ttl_secs.clamp(300, 86_400));
+        let peer_key = BanKey::from_peer(peer.ip());
+        if let Ok(mut auth) = state.auth.lock() {
+            if let Ok(fresh) = auth.sessions.revoke_all_and_reissue(&cur_tok, peer_key, SessionScope::FullAdmin, ttl) {
+                let cookie = format!("{SESSION_COOKIE_NAME}={fresh}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict", ttl.as_secs());
+                if let Ok(hv) = header::HeaderValue::from_str(&cookie) {
+                    resp.headers_mut().append(header::SET_COOKIE, hv);
+                }
+            }
+        }
+        state.pty_mgr.notify_revoke();
+    }
+    resp
 }
 
 async fn api_export_admin_cert(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1312,12 +1432,14 @@ async fn api_get_settings(State(state): State<Arc<AppState>>, headers: HeaderMap
 
 async fn api_put_settings(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(mut incoming_json): Json<serde_json::Value>,
 ) -> Response {
-    if let Err(resp) = require_full_admin(&state, &headers) {
-        return resp;
-    }
+    let cur_tok = match require_full_admin(&state, &headers) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
     let _cfg_guard = state.config_lock.lock().await;
     let mut renames: Vec<(String, String)> = Vec::new();
     if let Some(obj) = incoming_json.as_object_mut() {
@@ -1362,12 +1484,15 @@ async fn api_put_settings(
     if let Err(e) = state.vault.merge_secrets_many(&mut next_cfg, &current_cfg, &renames) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response();
     }
-    if let Err(e) = next_cfg.validate() {
+    if let Err(e) = next_cfg.validate_with_vault(Some(&state.vault)) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response();
     }
     if let Err(e) = save_config(&state.config_path, &next_cfg) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response();
     }
+    let security_identity_changed = next_cfg.admin.username != current_cfg.admin.username
+        || next_cfg.admin.secret_path != current_cfg.admin.secret_path
+        || next_cfg.admin.authorized_ed25519_keys != current_cfg.admin.authorized_ed25519_keys;
     let mut restart_fields: Vec<&'static str> = Vec::new();
     if next_cfg.admin.listen_lan != current_cfg.admin.listen_lan {
         restart_fields.push("admin.listen_lan");
@@ -1393,6 +1518,19 @@ async fn api_put_settings(
     logger::log(Level::Info, "config", "配置已在 Web 设置页更新并热生效");
 
     let mut resp = Json(state.vault.masked_config_json(&next_cfg)).into_response();
+    if security_identity_changed {
+        let ttl = Duration::from_secs(next_cfg.admin.session_ttl_secs.clamp(300, 86_400));
+        let peer_key = BanKey::from_peer(peer.ip());
+        if let Ok(mut auth) = state.auth.lock() {
+            if let Ok(fresh) = auth.sessions.revoke_all_and_reissue(&cur_tok, peer_key, SessionScope::FullAdmin, ttl) {
+                let cookie = format!("{SESSION_COOKIE_NAME}={fresh}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict", ttl.as_secs());
+                if let Ok(hv) = header::HeaderValue::from_str(&cookie) {
+                    resp.headers_mut().append(header::SET_COOKIE, hv);
+                }
+            }
+        }
+        state.pty_mgr.notify_revoke();
+    }
     if !restart_fields.is_empty() {
         if let Ok(hv) = header::HeaderValue::from_str(&restart_fields.join(",")) {
             resp.headers_mut()
@@ -1467,6 +1605,9 @@ async fn api_port_forward_lease(
         pf.expire_at_unix = logger::unix_now() + req.minutes.clamp(1, 1440) * 60;
     }
     let exp = pf.expire_at_unix;
+    if let Err(e) = next_cfg.validate_with_vault(Some(&state.vault)) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response();
+    }
     if let Err(e) = save_config(&state.config_path, &next_cfg) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response();
     }
@@ -1737,6 +1878,203 @@ struct BackupExportReq {
     password: String,
 }
 
+fn read_file_bounded(path: &std::path::Path, limit: usize) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Ok(None);
+            }
+            if meta.len() as usize > limit {
+                return Err(format!("文件 {} 超过备份大小上限", path.display()));
+            }
+            std::fs::read(path)
+                .map(Some)
+                .map_err(|e| format!("读取 {} 失败: {}", path.display(), e))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("读取 {} 元数据失败: {}", path.display(), e)),
+    }
+}
+
+fn collect_backup_files(
+    data_dir: &std::path::Path,
+    cfg: &Config,
+    vault: &Vault,
+) -> Result<(BTreeMap<String, Vec<u8>>, serde_json::Value), String> {
+    let mut files = BTreeMap::new();
+    let mut admin_tls = false;
+    let crt_path = data_dir.join("certs").join("admin.crt");
+    let key_path = data_dir.join("certs").join("admin.key");
+    if let (Ok(Some(crt)), Ok(Some(key))) = (
+        read_file_bounded(&crt_path, 256 * 1024),
+        read_file_bounded(&key_path, 256 * 1024),
+    ) {
+        files.insert("certs/admin.crt".into(), crt);
+        files.insert("certs/admin.key".into(), key);
+        admin_tls = true;
+    }
+
+    let mut acme_accounts = 0usize;
+    let acc_dir = data_dir.join("acme-accounts");
+    if let Ok(entries) = std::fs::read_dir(&acc_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(id) = name.strip_suffix(".json") else { continue };
+            if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            if let Some(raw) = read_file_bounded(&entry.path(), 128 * 1024)? {
+                let encoded = std::str::from_utf8(&raw).map_err(|_| "ACME 账户文件编码错误")?;
+                let plain = vault.reveal_string(&format!("acme.account.{id}"), encoded.trim())?;
+                files.insert(format!("acme-accounts/{id}.json"), plain.into_bytes());
+                acme_accounts += 1;
+            }
+        }
+    }
+
+    let mut acme_challenges = 0usize;
+    let chal_dir = data_dir.join("acme-challenges");
+    if let Ok(entries) = std::fs::read_dir(&chal_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let key = format!("acme-challenges/{name}");
+            if !crate::security::vault::validate_backup_file_key(&key) {
+                continue;
+            }
+            if let Some(raw) = read_file_bounded(&entry.path(), 128 * 1024)? {
+                files.insert(key, raw);
+                acme_challenges += 1;
+            }
+        }
+    }
+
+    let mut acme_certs = 0usize;
+    let mut seen_domains = std::collections::BTreeSet::new();
+    for a in &cfg.acme {
+        let safe = crate::daemon::acme_store::safe_name(&a.domain);
+        if !seen_domains.insert(safe.clone()) {
+            continue;
+        }
+        let bpath = crate::daemon::acme_store::bundle_path(std::path::Path::new(&a.cert_dir), &a.domain);
+        let key = format!("acme-certs/{safe}/bundle.json");
+        if crate::security::vault::validate_backup_file_key(&key) {
+            if let Some(raw) = read_file_bounded(&bpath, 256 * 1024)? {
+                files.insert(key, raw);
+                acme_certs += 1;
+            }
+        }
+    }
+
+    let summary = serde_json::json!({
+        "admin_tls": admin_tls,
+        "acme_accounts": acme_accounts,
+        "acme_certs": acme_certs,
+        "acme_challenges": acme_challenges,
+    });
+    Ok((files, summary))
+}
+
+async fn restore_backup_files(
+    data_dir: &std::path::Path,
+    cfg: &Config,
+    files: &BTreeMap<String, Vec<u8>>,
+    vault: &Vault,
+    cert_table: &Arc<ArcSwap<CertTable>>,
+    admin_cert: &Arc<ArcSwap<rustls::sign::CertifiedKey>>,
+) -> Result<serde_json::Value, String> {
+    let mut admin_tls = false;
+    let mut acme_accounts = 0usize;
+    let mut acme_certs = 0usize;
+    let mut acme_challenges = 0usize;
+
+    if let (Some(crt), Some(key)) = (files.get("certs/admin.crt"), files.get("certs/admin.key")) {
+        let ck = crate::net::tls_resolver::certified_key_from_pem(crt, key)?;
+        let certs_dir = data_dir.join("certs");
+        let crt_dst = certs_dir.join("admin.crt");
+        let key_dst = certs_dir.join("admin.key");
+        let crt_bytes = crt.clone();
+        let key_bytes = key.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&certs_dir).map_err(|e| format!("创建证书目录失败: {e}"))?;
+            let _ = std::fs::set_permissions(&certs_dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+            crate::config::crash_safe_atomic_write(&crt_dst, &crt_bytes, crate::config::random_nonce())
+                .map_err(|e| format!("写入管理证书失败: {e}"))?;
+            crate::config::crash_safe_atomic_write(&key_dst, &key_bytes, crate::config::random_nonce())
+                .map_err(|e| format!("写入管理私钥失败: {e}"))?;
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|_| "恢复管理证书任务失败")??;
+        admin_cert.store(ck);
+        admin_tls = true;
+    }
+
+    for (key, raw) in files {
+        if let Some(id_file) = key.strip_prefix("acme-accounts/") {
+            let id = id_file.strip_suffix(".json").unwrap_or("");
+            if serde_json::from_slice::<serde_json::Value>(raw).is_err() {
+                return Err(format!("备份内 ACME 账户 {} JSON 非法", id));
+            }
+            let sealed = vault.seal(&format!("acme.account.{id}"), raw)?;
+            let dst = data_dir.join("acme-accounts").join(id_file);
+            crate::daemon::acme_store::atomic(dst, sealed.into_bytes()).await?;
+            acme_accounts += 1;
+        } else if let Some(chal_file) = key.strip_prefix("acme-challenges/") {
+            if serde_json::from_slice::<serde_json::Value>(raw).is_err() {
+                return Err(format!("备份内挑战日志 {} JSON 非法", chal_file));
+            }
+            let dst = data_dir.join("acme-challenges").join(chal_file);
+            crate::daemon::acme_store::atomic(dst, raw.clone()).await?;
+            acme_challenges += 1;
+        } else if let Some(rest) = key.strip_prefix("acme-certs/") {
+            let safe_dir = rest.strip_suffix("/bundle.json").unwrap_or("");
+            let bundle: crate::daemon::acme_store::Bundle =
+                serde_json::from_slice(raw).map_err(|_| format!("备份内证书包 {} 格式非法", safe_dir))?;
+            let verified = crate::daemon::acme_store::verify(&bundle)?;
+            let now = logger::unix_now();
+            if verified.expires <= now || verified.issued > now + 300 {
+                logger::log(Level::Warn, "backup", &format!("备份证书 {} 已过期或未生效，跳过恢复", safe_dir));
+                continue;
+            }
+            let matching_acme = cfg
+                .acme
+                .iter()
+                .find(|a| crate::daemon::acme_store::safe_name(&a.domain) == safe_dir);
+            let target_dir = matching_acme
+                .map(|a| PathBuf::from(&a.cert_dir))
+                .unwrap_or_else(|| data_dir.join("certs"));
+            let target_domain = matching_acme
+                .map(|a| a.domain.as_str())
+                .or_else(|| bundle.domains.first().map(String::as_str))
+                .unwrap_or(safe_dir);
+            crate::daemon::acme_store::store(&target_dir, target_domain, &bundle).await?;
+            cert_table.rcu(|current| {
+                let mut next = CertTable {
+                    exact: current.exact.clone(),
+                    wildcard: current.wildcard.clone(),
+                    fallback: current.fallback.clone(),
+                };
+                for name in &bundle.domains {
+                    if let Some(suffix) = name.strip_prefix('*') {
+                        next.wildcard.insert(suffix.to_ascii_lowercase(), verified.key.clone());
+                    } else {
+                        next.exact.insert(name.to_ascii_lowercase(), verified.key.clone());
+                    }
+                }
+                Arc::new(next)
+            });
+            acme_certs += 1;
+        }
+    }
+
+    Ok(serde_json::json!({
+        "admin_tls": admin_tls,
+        "acme_accounts": acme_accounts,
+        "acme_certs": acme_certs,
+        "acme_challenges": acme_challenges,
+    }))
+}
+
 async fn api_backup_export(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1746,17 +2084,38 @@ async fn api_backup_export(
         return resp;
     }
     let cfg = state.config.load_full();
+    let data_dir = state
+        .config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let vault = state.vault.clone();
+    let cfg_read = cfg.clone();
+    let collect_res = tokio::task::spawn_blocking(move || collect_backup_files(&data_dir, &cfg_read, &vault))
+        .await
+        .map_err(|_| "收集备份文件任务失败".to_string())
+        .and_then(|r| r);
+    let (files, summary) = match collect_res {
+        Ok(pair) => pair,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
+    };
+
     let ph_gate = state.hash_gate.clone();
     let vault = state.vault.clone();
     let pw = req.password.into_bytes();
     let Ok(res) = ph_gate
-        .run(move || vault.export_backup(&cfg, &pw, BTreeMap::new()))
+        .run(move || vault.export_backup(&cfg, &pw, files))
         .await
     else {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "繁忙" }))).into_response();
     };
     match res {
-        Ok(bytes) => Json(serde_json::json!({ "backup_blob": B64.encode(bytes) })).into_response(),
+        Ok(bytes) => Json(serde_json::json!({
+            "backup_blob": B64.encode(bytes),
+            "summary": summary,
+        }))
+        .into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response(),
     }
 }
@@ -1776,9 +2135,6 @@ async fn api_backup_import(
     if let Err(resp) = require_full_admin(&state, &headers) {
         return resp;
     }
-    let _cfg_guard = state.config_lock.lock().await;
-    let ph_gate = state.hash_gate.clone();
-    let vault = state.vault.clone();
     let Ok(raw_bytes) = B64.decode(req.backup_blob.trim()) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -1786,20 +2142,71 @@ async fn api_backup_import(
         )
             .into_response();
     };
+    let ph_gate = state.hash_gate.clone();
+    let vault = state.vault.clone();
     let pw = req.password.into_bytes();
     let Ok(res) = ph_gate.run(move || vault.import_backup(&raw_bytes, &pw)).await else {
         return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({ "error": "繁忙" }))).into_response();
     };
-    let (restored_cfg, _) = match res {
+    let (restored_cfg, files) = match res {
         Ok(c) => c,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response(),
     };
-    if let Err(e) = restored_cfg.validate() {
+    if let Err(e) = restored_cfg.validate_with_vault(Some(&state.vault)) {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response();
     }
+    if restored_cfg.admin.password_login_enabled && PasswordHash::parse(&restored_cfg.admin.password_hash).is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "备份内管理员密码哈希无效，拒绝导入以防锁死" })),
+        )
+            .into_response();
+    }
+
+    let _cfg_guard = state.config_lock.lock().await;
+    let current_cfg = state.config.load();
+    let data_dir = state
+        .config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let restored_summary = match restore_backup_files(
+        &data_dir,
+        &restored_cfg,
+        &files,
+        &state.vault,
+        &state.cert_table,
+        &state.admin_cert,
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))).into_response(),
+    };
+
     if let Err(e) = save_config(&state.config_path, &restored_cfg) {
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response();
     }
+    let mut restart_fields: Vec<&'static str> = Vec::new();
+    if restored_cfg.admin.listen_lan != current_cfg.admin.listen_lan {
+        restart_fields.push("admin.listen_lan");
+    }
+    if restored_cfg.admin.canonical_origin != current_cfg.admin.canonical_origin {
+        restart_fields.push("admin.canonical_origin");
+    }
+    if restored_cfg.admin.tls_cert_path != current_cfg.admin.tls_cert_path
+        || restored_cfg.admin.tls_key_path != current_cfg.admin.tls_key_path
+    {
+        restart_fields.push("admin.tls_cert_path");
+    }
+    if restored_cfg.system.worker_threads != current_cfg.system.worker_threads {
+        restart_fields.push("system.worker_threads");
+    }
+    if restored_cfg.firewall.backend != current_cfg.firewall.backend {
+        restart_fields.push("firewall.backend");
+    }
+
     state.apply_runtime_settings(&restored_cfg).await;
     let ban_key = BanKey::from_peer(peer.ip());
     let ttl = Duration::from_secs(restored_cfg.admin.session_ttl_secs.clamp(300, 86_400));
@@ -1818,20 +2225,54 @@ async fn api_backup_import(
         auth.engine.restore_totp_watermark(restored_cfg.admin.totp_last_step);
         auth.pending_totp_secret = None;
         auth.sessions.revoke_all();
-        auth.sessions.issue(scope, ban_key, ttl).unwrap_or_default()
+        match auth.sessions.issue(scope, ban_key, ttl) {
+            Ok(t) => t,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({ "error": e }))).into_response(),
+        }
     };
     state.pty_mgr.notify_revoke();
     state.config.store(Arc::new(restored_cfg.clone()));
     state.reload_notify.notify_one();
     logger::log(Level::Info, "backup", "加密备份已成功导入并热重载生效");
 
-    build_session_response(
-        &new_token,
-        ttl.as_secs(),
-        scope == SessionScope::MustChangePassword,
-        &restored_cfg,
-        &state.vault,
-    )
+    let cookie = format!(
+        "{}={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict",
+        SESSION_COOKIE_NAME,
+        new_token,
+        ttl.as_secs()
+    );
+    let body = serde_json::json!({
+        "authenticated": true,
+        "username": restored_cfg.admin.username,
+        "must_change_password": scope == SessionScope::MustChangePassword,
+        "password_login_enabled": restored_cfg.admin.password_login_enabled,
+        "totp_enabled": restored_cfg.admin.totp_enabled,
+        "totp_recovery_remaining": restored_cfg.admin.totp_recovery_hashes.len(),
+        "has_ed25519_keys": !restored_cfg.admin.authorized_ed25519_keys.is_empty(),
+        "ed25519_key_ids": restored_cfg.admin.authorized_ed25519_keys.iter().map(|k| &k.id).collect::<Vec<_>>(),
+        "session_ttl_secs": restored_cfg.admin.session_ttl_secs,
+        "language": restored_cfg.system.language,
+        "modules": restored_cfg.modules,
+        "secret_path": boundary::active_secret_path(&restored_cfg).unwrap_or("/"),
+        "restored_summary": restored_summary,
+        "restart_required": restart_fields,
+    });
+    let mut resp = Json(body).into_response();
+    if let Ok(hv) = header::HeaderValue::from_str(&cookie) {
+        resp.headers_mut().append(header::SET_COOKIE, hv);
+    }
+    if let Some(sp) = boundary::active_secret_path(&restored_cfg) {
+        if let Some(entry_hv) = boundary::build_entry_set_cookie(state.vault.mac_key(), sp) {
+            resp.headers_mut().append(header::SET_COOKIE, entry_hv);
+        }
+    }
+    if !restart_fields.is_empty() {
+        if let Ok(hv) = header::HeaderValue::from_str(&restart_fields.join(",")) {
+            resp.headers_mut()
+                .insert(header::HeaderName::from_static("x-vane-restart-required"), hv);
+        }
+    }
+    resp
 }
 
 async fn api_backup_sanitized(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -1990,7 +2431,9 @@ async fn api_pty_ws(
     let docker_sock = cfg.admin.docker_socket.clone();
     let docker_cfg = cfg.docker.clone();
     let st_check = state.clone();
-    ws.on_upgrade(move |socket| async move {
+    ws.max_message_size(64 * 1024)
+        .max_frame_size(64 * 1024)
+        .on_upgrade(move |socket| async move {
         let _permit = permit;
         handle_pty_websocket(
             socket,
@@ -2032,7 +2475,7 @@ async fn serve_manifest(State(state): State<Arc<AppState>>) -> Response {
     (
         [
             (header::CONTENT_TYPE, "application/manifest+json; charset=utf-8"),
-            (header::CACHE_CONTROL, "no-cache"),
+            (header::CACHE_CONTROL, "no-store"),
         ],
         manifest.to_string(),
     )
@@ -2040,29 +2483,43 @@ async fn serve_manifest(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn serve_sw() -> Response {
-    let sw_code = r#"const CACHE_NAME = 'vane-shell-v2';
+    let sw_code = format!(
+        r#"const CACHE_NAME = 'vane-shell-{}';
 self.addEventListener('install', () => self.skipWaiting());
-self.addEventListener('activate', (e) => {
+self.addEventListener('activate', (e) => {{
   e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE_NAME).map(k => caches.delete(k)))));
   self.clients.claim();
-});
-self.addEventListener('fetch', (e) => {
+}});
+self.addEventListener('fetch', (e) => {{
   if (e.request.method !== 'GET') return;
   const url = new URL(e.request.url);
   if (url.origin !== self.location.origin || url.pathname.startsWith('/api/')) return;
-  const isImmutableAsset = url.pathname.startsWith('/assets/') || url.pathname === '/icon.svg';
-  if (!isImmutableAsset) return;
+  if (url.pathname === '/icon.svg') {{
+    e.respondWith(
+      fetch(e.request).then(async (resp) => {{
+        if (resp && resp.status === 200 && resp.type === 'basic') {{
+          const cache = await caches.open(CACHE_NAME);
+          cache.put(e.request, resp.clone()).catch(() => {{}});
+        }}
+        return resp;
+      }}).catch(() => caches.match(e.request))
+    );
+    return;
+  }}
+  if (!url.pathname.startsWith('/assets/')) return;
   e.respondWith(
-    caches.open(CACHE_NAME).then(async (cache) => {
+    caches.open(CACHE_NAME).then(async (cache) => {{
       const cached = await cache.match(e.request);
       if (cached) return cached;
       const resp = await fetch(e.request);
-      if (resp && resp.status === 200) cache.put(e.request, resp.clone());
+      if (resp && resp.status === 200 && resp.type === 'basic') cache.put(e.request, resp.clone()).catch(() => {{}});
       return resp;
-    })
+    }})
   );
-});
-"#;
+}});
+"#,
+        env!("CARGO_PKG_VERSION")
+    );
     (
         [
             (header::CONTENT_TYPE, "application/javascript; charset=utf-8"),
@@ -2256,10 +2713,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        // 未登录访问关闭模块的接口返回 401，防止未认证枚举已启用子模块
         for path in ["/api/cron/missing/run", "/api/stun/missing/probe", "/api/pty/ticket"] {
             let response = app
                 .clone()
                 .oneshot(trusted_request().method("POST").uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        // 登录完整管理员后访问关闭模块，由边界守卫返回 403 MODULE_DISABLED
+        let login_r = app
+            .clone()
+            .oneshot(
+                trusted_request()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"admin321"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let init_ck = login_r
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let ch_r = app
+            .clone()
+            .oneshot(
+                trusted_request()
+                    .method("POST")
+                    .uri("/api/auth/change-password")
+                    .header(header::COOKIE, &init_ck)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"current_password":"admin321","new_password":"Vane#GuardPass1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let admin_ck = ch_r
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        for path in ["/api/cron/missing/run", "/api/stun/missing/probe", "/api/pty/ticket"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    trusted_request()
+                        .method("POST")
+                        .uri(path)
+                        .header(header::COOKIE, &admin_ck)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
@@ -2819,5 +3338,257 @@ mod tests {
         assert!(restart_hdr.contains("system.worker_threads"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn cross_machine_backup_exports_and_restores_acme_accounts_certs_and_admin_tls() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir_a = std::env::temp_dir().join(format!("vane_bak_a_{}", crate::config::random_nonce()));
+        let dir_b = std::env::temp_dir().join(format!("vane_bak_b_{}", crate::config::random_nonce()));
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        let (app_a, state_a) = make_test_app_with_secret_path(&dir_a, "/").await;
+        // 完成机器 A 登录与改密
+        let login_resp = app_a
+            .clone()
+            .oneshot(
+                trusted_request()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"admin321"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let init_cookie = login_resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let ch_resp = app_a
+            .clone()
+            .oneshot(
+                trusted_request()
+                    .method("POST")
+                    .uri("/api/auth/change-password")
+                    .header(header::COOKIE, &init_cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"current_password":"admin321","new_password":"Vane#BackupPass1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie_a = ch_resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        // 在机器 A 写入管理证书、ACME 账户密文、挑战日志以及由测试 CA 签发的有效代际证书
+        let _ = crate::net::tls_resolver::load_or_create_admin_cert(&dir_a, &["192.168.1.1:23456".into()]).unwrap();
+        let cert_dir_b = dir_b.join("acme-certs");
+        let acc_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let sealed_acc = state_a
+            .vault
+            .seal(&format!("acme.account.{acc_id}"), br#"{"id":"https://ca/acct/1"}"#)
+            .unwrap();
+        crate::daemon::acme_store::atomic(
+            dir_a.join("acme-accounts").join(format!("{acc_id}.json")),
+            sealed_acc.into_bytes(),
+        )
+        .await
+        .unwrap();
+        crate::daemon::acme_store::atomic(
+            dir_a.join("acme-challenges").join("app.example.com.json"),
+            br#"{"provider":"cf","leases":[]}"#.to_vec(),
+        )
+        .await
+        .unwrap();
+
+        // 构造机器 A 上带有 ACME + 反代加密头的配置，并写入有效代际证书
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_kp = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
+        let issuer = rcgen::Issuer::from_params(&ca_params, &ca_kp);
+        let mut leaf_params = rcgen::CertificateParams::new(vec!["app.example.com".into()]).unwrap();
+        leaf_params.distinguished_name.push(rcgen::DnType::CommonName, "app.example.com");
+        let leaf_kp = rcgen::KeyPair::generate().unwrap();
+        let leaf_cert = leaf_params.signed_by(&leaf_kp, &issuer).unwrap();
+        let bundle = crate::daemon::acme_store::Bundle {
+            directory: "letsencrypt_staging".into(),
+            domains: vec!["app.example.com".into()],
+            certificate: format!("{}{}", leaf_cert.pem(), ca_cert.pem()),
+            private_key: leaf_kp.serialize_pem(),
+        };
+        let cert_dir_a = dir_a.join("acme-certs");
+        crate::daemon::acme_store::store(&cert_dir_a, "app.example.com", &bundle)
+            .await
+            .unwrap();
+
+        let mut cfg_a = (**state_a.config.load()).clone();
+        cfg_a.dns_providers.insert(
+            "cf".into(),
+            crate::config::DnsProviderConfig {
+                provider: "cloudflare".into(),
+                api_token: state_a.vault.seal("dns_providers.cf.api_token", b"cf-secret").unwrap(),
+                ..Default::default()
+            },
+        );
+        cfg_a.acme.push(crate::config::AcmeConfig {
+            domain: "app.example.com".into(),
+            dns_provider: "cf".into(),
+            cert_dir: cert_dir_a.to_string_lossy().into_owned(),
+            ..Default::default()
+        });
+        cfg_a.reverse_proxy.push(crate::config::ReverseProxyConfig {
+            name: "rp".into(),
+            listen_port: 8443,
+            rules: vec![crate::config::ReverseProxyRule {
+                host: "app.example.com".into(),
+                upstream: "http://192.168.1.50:8080".into(),
+                request_headers_set: [(
+                    "Authorization".into(),
+                    state_a
+                        .vault
+                        .seal("reverse_proxy.rp.rules.0.request_headers_set.Authorization", b"Bearer upstream-tok")
+                        .unwrap(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        state_a.config.store(Arc::new(cfg_a.clone()));
+        save_config(&state_a.config_path, &cfg_a).unwrap();
+
+        // 机器 A 导出全量加密备份
+        let exp_resp = app_a
+            .oneshot(
+                trusted_request()
+                    .method("POST")
+                    .uri("/api/backup/export")
+                    .header(header::COOKIE, &cookie_a)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"password":"migrate-pass-99"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exp_resp.status(), StatusCode::OK);
+        let exp_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(exp_resp.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+        assert_eq!(exp_json["summary"]["admin_tls"], true);
+        assert_eq!(exp_json["summary"]["acme_accounts"], 1);
+        assert_eq!(exp_json["summary"]["acme_certs"], 1);
+        assert_eq!(exp_json["summary"]["acme_challenges"], 1);
+        let blob = exp_json["backup_blob"].as_str().unwrap().to_string();
+
+        // 机器 B（拥有完全不同的主密钥）登录并导入备份
+        let (app_b, state_b) = make_test_app_with_secret_path(&dir_b, "/").await;
+        let login_b = app_b
+            .clone()
+            .oneshot(
+                trusted_request()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"admin321"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let init_cookie_b = login_b
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let ch_b = app_b
+            .clone()
+            .oneshot(
+                trusted_request()
+                    .method("POST")
+                    .uri("/api/auth/change-password")
+                    .header(header::COOKIE, &init_cookie_b)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"current_password":"admin321","new_password":"Vane#TempPassB1"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookie_b = ch_b
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        // 避免 dir_a 被清理前写回覆盖，测试导出后再删 dir_a，并验证机器 B 可导入
+        let _ = cert_dir_b;
+        let imp_resp = app_b
+            .oneshot(
+                trusted_request()
+                    .method("POST")
+                    .uri("/api/backup/import")
+                    .header(header::COOKIE, &cookie_b)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "backup_blob": blob, "password": "migrate-pass-99" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(imp_resp.status(), StatusCode::OK);
+        let imp_json: serde_json::Value =
+            serde_json::from_slice(&to_bytes(imp_resp.into_body(), 131_072).await.unwrap()).unwrap();
+        assert_eq!(imp_json["restored_summary"]["admin_tls"], true);
+        assert_eq!(imp_json["restored_summary"]["acme_accounts"], 1);
+        assert_eq!(imp_json["restored_summary"]["acme_certs"], 1);
+        assert_eq!(imp_json["restored_summary"]["acme_challenges"], 1);
+
+        // 验证机器 B 用自己的 Vault 成功重加密了 ACME 账户且 CertTable 已热加载该域名证书
+        let sealed_on_b = std::fs::read_to_string(dir_b.join("acme-accounts").join(format!("{acc_id}.json"))).unwrap();
+        assert_eq!(
+            state_b
+                .vault
+                .reveal_string(&format!("acme.account.{acc_id}"), &sealed_on_b)
+                .unwrap(),
+            r#"{"id":"https://ca/acct/1"}"#
+        );
+        assert!(state_b.cert_table.load().exact.contains_key("app.example.com"));
+        let rp_hdr = &state_b.config.load().reverse_proxy[0].rules[0].request_headers_set["Authorization"];
+        assert_eq!(
+            state_b
+                .vault
+                .reveal_string("reverse_proxy.rp.rules.0.request_headers_set.Authorization", rp_hdr)
+                .unwrap(),
+            "Bearer upstream-tok"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
     }
 }

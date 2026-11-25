@@ -242,7 +242,10 @@ fn parse_field_u64(s: &str, min: u32, max: u32) -> Result<u64, String> {
         let mut v = lo;
         while v <= hi {
             mask |= 1u64 << v;
-            v += step;
+            v = match v.checked_add(step) {
+                Some(next) => next,
+                None => break,
+            };
         }
         if extra_sun && (step == 1 || (7 - lo) % step == 0) {
             mask |= 1u64;
@@ -254,9 +257,41 @@ fn parse_field_u64(s: &str, min: u32, max: u32) -> Result<u64, String> {
     Ok(mask)
 }
 
+struct PgidGuard(i32);
+
+impl Drop for PgidGuard {
+    fn drop(&mut self) {
+        if self.0 > 1 {
+            // SAFETY: 子进程以 process_group(0) 创建独立进程组，Drop 仅在未解除前强杀残留进程组
+            unsafe {
+                let _ = libc::kill(-self.0, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+async fn read_bounded_and_drain<R: tokio::io::AsyncRead + Unpin>(mut reader: R, limit: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if out.len() < limit {
+                    let take = (limit - out.len()).min(n);
+                    out.extend_from_slice(&chunk[..take]);
+                }
+            }
+        }
+    }
+    out
+}
+
 async fn run_exec_isolated(job_name: &str, program: &str, args: &[String], cwd: &str, timeout: Duration) -> Result<String, String> {
     let mut cmd = Command::new(program);
     cmd.args(args)
+        .env_remove("VANE_MASTER_KEY")
+        .env_remove("VANE_MASTER_KEY_FILE")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -269,35 +304,37 @@ async fn run_exec_isolated(job_name: &str, program: &str, args: &[String], cwd: 
         .spawn()
         .map_err(|e| format!("启动外部程序 {} 失败: {}", program, e))?;
     let pgid = child.id().unwrap_or(0) as i32;
+    let mut pgid_guard = PgidGuard(pgid);
 
     let io_fut = async {
-        let mut out_buf = Vec::new();
-        let mut err_buf = Vec::new();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let r_out = async {
-            if let Some(s) = stdout {
-                let _ = s.take(64 * 1024).read_to_end(&mut out_buf).await;
+            match stdout {
+                Some(s) => read_bounded_and_drain(s, 64 * 1024).await,
+                None => Vec::new(),
             }
         };
         let r_err = async {
-            if let Some(s) = stderr {
-                let _ = s.take(16 * 1024).read_to_end(&mut err_buf).await;
+            match stderr {
+                Some(s) => read_bounded_and_drain(s, 16 * 1024).await,
+                None => Vec::new(),
             }
         };
-        tokio::join!(r_out, r_err);
+        let (out_buf, err_buf) = tokio::join!(r_out, r_err);
+        // 在 wait() 回收主进程 PID 前清扫进程组中仍未退出的后代进程，消除 PID 复用竞态
+        if pgid > 1 && matches!(child.try_wait(), Ok(None)) {
+            unsafe {
+                let _ = libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
         let st = child.wait().await.map_err(|e| format!("等待子进程退出失败: {}", e))?;
         Ok::<_, String>((st, out_buf, err_buf))
     };
 
     match tokio::time::timeout(timeout, io_fut).await {
         Ok(Ok((status, out_buf, err_buf))) => {
-            if pgid > 1 {
-                // 确保后台脱离标准输出的子孙进程也被清理
-                unsafe {
-                    let _ = libc::kill(-pgid, libc::SIGKILL);
-                }
-            }
+            pgid_guard.0 = 0;
             let stdout = logger::truncate_utf8(&String::from_utf8_lossy(&out_buf), 512);
             if status.success() {
                 logger::log(Level::Info, "cron", &format!("任务 {} 执行成功: {}", job_name, stdout.trim()));
@@ -315,6 +352,7 @@ async fn run_exec_isolated(job_name: &str, program: &str, args: &[String], cwd: 
             }
             let _ = child.kill().await;
             let _ = child.wait().await;
+            pgid_guard.0 = 0;
             Err(e)
         }
         Err(_) => {
@@ -325,123 +363,151 @@ async fn run_exec_isolated(job_name: &str, program: &str, args: &[String], cwd: 
             }
             let _ = child.kill().await;
             let _ = child.wait().await;
+            pgid_guard.0 = 0;
             Err(format!("任务 {} 超时 ({}s) 已强制终止整个进程组", job_name, timeout.as_secs()))
+        }
+    }
+}
+
+struct RunningResetGuard {
+    rt: Arc<CronRuntime>,
+    name: String,
+    finished: bool,
+}
+
+impl Drop for RunningResetGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.rt.set_running(&self.name, false);
         }
     }
 }
 
 /// 携带完整网关上下文执行单次计划任务（含任务级非重入锁、五类真实动作与失败告警通知）
 pub async fn execute_cron_job_with_ctx(job: &CronConfig, ctx: Option<&CronExecutionContext>) -> Result<String, String> {
-    let lock_guard = if let Some(c) = ctx {
+    let (_lock_guard, mut reset_guard) = if let Some(c) = ctx {
         let lock = c.runtime.job_lock(&job.name)?;
         match lock.try_lock_owned() {
             Ok(g) => {
                 c.runtime.set_running(&job.name, true);
-                Some((c.runtime.clone(), g))
+                (
+                    Some(g),
+                    Some(RunningResetGuard {
+                        rt: c.runtime.clone(),
+                        name: job.name.clone(),
+                        finished: false,
+                    }),
+                )
             }
             Err(_) => {
                 return Err(format!("任务 {} 上一轮仍在运行中，已跳过本次重入执行", job.name));
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     let started = std::time::Instant::now();
     let timeout = Duration::from_secs(job.timeout_secs.clamp(1, 86_400));
 
-    let res: Result<String, String> = match &job.action {
-        CronAction::DockerPruneImages { dangling_only } => {
-            let Some(c) = ctx else {
-                return Err("缺少 Docker 运行上下文".into());
-            };
-            if !c.config.modules.docker {
-                Err("Docker 模块已关闭，无法执行镜像清理".into())
-            } else {
-                tokio::time::timeout(timeout, prune_images(&c.config.admin.docker_socket, *dangling_only))
-                    .await
-                    .map_err(|_| format!("任务 {} 清理镜像超时", job.name))?
-                    .map(|raw| {
-                        let msg = format!("Docker 镜像清理完成 (dangling_only={}): {}", dangling_only, logger::truncate_utf8(&raw, 240));
-                        logger::log(Level::Info, "cron", &msg);
-                        msg
-                    })
+    let res: Result<String, String> = async {
+        match &job.action {
+            CronAction::DockerPruneImages { dangling_only } => {
+                let c = ctx.ok_or_else(|| "缺少 Docker 运行上下文".to_string())?;
+                if !c.config.modules.docker {
+                    Err("Docker 模块已关闭，无法执行镜像清理".into())
+                } else {
+                    tokio::time::timeout(timeout, prune_images(&c.config.admin.docker_socket, *dangling_only))
+                        .await
+                        .map_err(|_| format!("任务 {} 清理镜像超时", job.name))?
+                        .map(|raw| {
+                            let msg = format!(
+                                "Docker 镜像清理完成 (dangling_only={}): {}",
+                                dangling_only,
+                                logger::truncate_utf8(&raw, 240)
+                            );
+                            logger::log(Level::Info, "cron", &msg);
+                            msg
+                        })
+                }
             }
-        }
-        CronAction::DockerRestartContainer { container } => {
-            let Some(c) = ctx else {
-                return Err("缺少 Docker 运行上下文".into());
-            };
-            if !c.config.modules.docker {
-                Err("Docker 模块已关闭，无法重启容器".into())
-            } else {
-                tokio::time::timeout(
-                    timeout,
-                    container_action(&c.config.admin.docker_socket, &c.config.docker, container, "restart"),
-                )
-                .await
-                .map_err(|_| format!("任务 {} 重启容器 {} 超时", job.name, container))??;
-                let msg = format!("已成功重启容器 {}", container);
+            CronAction::DockerRestartContainer { container } => {
+                let c = ctx.ok_or_else(|| "缺少 Docker 运行上下文".to_string())?;
+                if !c.config.modules.docker {
+                    Err("Docker 模块已关闭，无法重启容器".into())
+                } else {
+                    tokio::time::timeout(
+                        timeout,
+                        container_action(&c.config.admin.docker_socket, &c.config.docker, container, "restart"),
+                    )
+                    .await
+                    .map_err(|_| format!("任务 {} 重启容器 {} 超时", job.name, container))??;
+                    let msg = format!("已成功重启容器 {}", container);
+                    logger::log(Level::Info, "cron", &msg);
+                    Ok(msg)
+                }
+            }
+            CronAction::RuleToggle {
+                target_kind,
+                rule,
+                enable,
+            } => {
+                let toggler = ctx
+                    .and_then(|c| c.rule_toggler.as_ref())
+                    .ok_or_else(|| "缺少规则状态切换器上下文".to_string())?;
+                let msg = tokio::time::timeout(timeout, toggler(target_kind.clone(), rule.clone(), *enable))
+                    .await
+                    .map_err(|_| format!("任务 {} 切换规则状态超时", job.name))??;
                 logger::log(Level::Info, "cron", &msg);
                 Ok(msg)
             }
+            CronAction::HttpRequest {
+                method,
+                url,
+                headers,
+                body,
+            } => {
+                let (plain_url, plain_body, plain_headers) = if let Some(c) = ctx {
+                    let u = c.vault.reveal_string(&format!("cron.{}.action.url", job.name), url)?;
+                    let b = c.vault.reveal_string(&format!("cron.{}.action.body", job.name), body)?;
+                    let mut h = BTreeMap::new();
+                    for (k, v) in headers {
+                        h.insert(
+                            k.clone(),
+                            c.vault
+                                .reveal_string(&format!("cron.{}.action.headers.{}", job.name, k), v)?,
+                        );
+                    }
+                    (u, b, h)
+                } else {
+                    (url.clone(), body.clone(), headers.clone())
+                };
+                let m = if method.trim().is_empty() { "GET" } else { method.trim() };
+                let mut req = HttpRequest::new(m, &plain_url);
+                req.headers = plain_headers;
+                req.body = plain_body.into_bytes();
+                req.response_limit = 64 * 1024;
+                req.timeout = timeout.min(Duration::from_secs(60));
+                let resp = tokio::time::timeout(timeout, http_shared().execute(req))
+                    .await
+                    .map_err(|_| format!("定时 HTTP 请求 {} 超时", job.name))??;
+                resp.ensure_success()?;
+                let snippet = logger::truncate_utf8(&String::from_utf8_lossy(&resp.body), 200);
+                let msg = format!("HTTP {} -> {} ({})", m, resp.status, snippet.trim());
+                logger::log(Level::Info, "cron", &format!("任务 {} 完成: {}", job.name, msg));
+                Ok(msg)
+            }
+            CronAction::Exec { program, args, cwd } => {
+                run_exec_isolated(&job.name, program, args, cwd, timeout).await
+            }
         }
-        CronAction::RuleToggle {
-            target_kind,
-            rule,
-            enable,
-        } => {
-            let Some(toggler) = ctx.and_then(|c| c.rule_toggler.as_ref()) else {
-                return Err("缺少规则状态切换器上下文".into());
-            };
-            let msg = toggler(target_kind.clone(), rule.clone(), *enable).await?;
-            logger::log(Level::Info, "cron", &msg);
-            Ok(msg)
-        }
-        CronAction::HttpRequest {
-            method,
-            url,
-            headers,
-            body,
-        } => {
-            let (plain_url, plain_body, plain_headers) = if let Some(c) = ctx {
-                let u = c.vault.reveal_string(&format!("cron.{}.action.url", job.name), url)?;
-                let b = c.vault.reveal_string(&format!("cron.{}.action.body", job.name), body)?;
-                let mut h = BTreeMap::new();
-                for (k, v) in headers {
-                    h.insert(
-                        k.clone(),
-                        c.vault
-                            .reveal_string(&format!("cron.{}.action.headers.{}", job.name, k), v)?,
-                    );
-                }
-                (u, b, h)
-            } else {
-                (url.clone(), body.clone(), headers.clone())
-            };
-            let m = if method.trim().is_empty() { "GET" } else { method.trim() };
-            let mut req = HttpRequest::new(m, &plain_url);
-            req.headers = plain_headers;
-            req.body = plain_body.into_bytes();
-            req.response_limit = 64 * 1024;
-            req.timeout = timeout.min(Duration::from_secs(60));
-            let resp = tokio::time::timeout(timeout, http_shared().execute(req))
-                .await
-                .map_err(|_| format!("定时 HTTP 请求 {} 超时", job.name))??;
-            resp.ensure_success()?;
-            let snippet = logger::truncate_utf8(&String::from_utf8_lossy(&resp.body), 200);
-            let msg = format!("HTTP {} -> {} ({})", m, resp.status, snippet.trim());
-            logger::log(Level::Info, "cron", &format!("任务 {} 完成: {}", job.name, msg));
-            Ok(msg)
-        }
-        CronAction::Exec { program, args, cwd } => {
-            run_exec_isolated(&job.name, program, args, cwd, timeout).await
-        }
-    };
+    }
+    .await;
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    if let Some((rt, _guard)) = lock_guard {
-        rt.record_finish(&job.name, elapsed_ms, &res);
+    if let Some(ref mut g) = reset_guard {
+        g.finished = true;
+        g.rt.record_finish(&job.name, elapsed_ms, &res);
     }
 
     if let (Err(ref err), Some(c)) = (&res, ctx) {

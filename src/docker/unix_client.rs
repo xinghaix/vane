@@ -51,6 +51,29 @@ pub fn is_protected_container(name_or_id: &str, cfg: &DockerConfig) -> bool {
     })
 }
 
+fn is_protected_id_or_names(id: &str, full_id: &str, names: &[String], cfg: &DockerConfig) -> bool {
+    if is_protected_container(id, cfg)
+        || is_protected_container(full_id, cfg)
+        || names.iter().any(|n| is_protected_container(n, cfg))
+    {
+        return true;
+    }
+    let full_low = full_id.to_ascii_lowercase();
+    cfg.protected_containers.iter().any(|p| {
+        let p_clean = p.trim().trim_start_matches('/').to_ascii_lowercase();
+        p_clean.len() >= 8
+            && p_clean.bytes().all(|b| b.is_ascii_hexdigit())
+            && full_low.starts_with(&p_clean)
+    })
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn docker_http_request(
     socket_path: &str,
     method: Method,
@@ -66,13 +89,6 @@ async fn docker_http_request(
         .map_err(|_| "连接 docker.sock 超时".to_string())?
         .map_err(|e| format!("连接 docker.sock 失败: {}", e))?;
 
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-        .await
-        .map_err(|e| format!("Docker HTTP 握手失败: {}", e))?;
-    let conn_task = tokio::spawn(async move {
-        let _ = conn.await;
-    });
-
     let req = Request::builder()
         .method(method)
         .uri(path_and_query)
@@ -83,6 +99,12 @@ async fn docker_http_request(
         .map_err(|e| format!("构造 Docker 请求失败: {}", e))?;
 
     let read_fut = async {
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .map_err(|e| format!("Docker HTTP 握手失败: {}", e))?;
+        let _conn_guard = AbortOnDrop(tokio::spawn(async move {
+            let _ = conn.await;
+        }));
         let resp = sender
             .send_request(req)
             .await
@@ -109,11 +131,9 @@ async fn docker_http_request(
         Ok::<_, String>((status, out, truncated))
     };
 
-    let res = tokio::time::timeout(Duration::from_secs(30), read_fut)
+    tokio::time::timeout(Duration::from_secs(30), read_fut)
         .await
-        .map_err(|_| "读取 docker.sock 响应超时".to_string())?;
-    conn_task.abort();
-    res
+        .map_err(|_| "读取 docker.sock 响应超时".to_string())?
 }
 
 pub async fn list_containers(socket_path: &str, cfg: &DockerConfig) -> Result<Vec<ContainerSummary>, String> {
@@ -146,9 +166,7 @@ pub async fn list_containers(socket_path: &str, cfg: &DockerConfig) -> Result<Ve
         let image = item.get("Image").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let state = item.get("State").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let status_s = item.get("Status").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let protected = is_protected_container(&id, cfg)
-            || is_protected_container(&full_id, cfg)
-            || all_names.iter().any(|n| is_protected_container(n, cfg));
+        let protected = is_protected_id_or_names(&id, &full_id, &all_names, cfg);
         out.push(ContainerSummary {
             id,
             full_id,
@@ -262,7 +280,7 @@ fn strip_docker_stream_headers(raw: &[u8]) -> Vec<u8> {
         if stream_type <= 2 && raw[pos + 1] == 0 && raw[pos + 2] == 0 && raw[pos + 3] == 0 {
             let frame_len = u32::from_be_bytes([raw[pos + 4], raw[pos + 5], raw[pos + 6], raw[pos + 7]]) as usize;
             pos += 8;
-            let end = (pos + frame_len).min(raw.len());
+            let end = pos.saturating_add(frame_len).min(raw.len());
             out.extend_from_slice(&raw[pos..end]);
             pos = end;
         } else {

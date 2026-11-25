@@ -132,12 +132,19 @@ async fn custom_update(cfg: &DdnsConfig, ip: IpAddr) -> Result<(), String> {
     let tpl = &cfg.custom_http;
     let mut request = HttpRequest::new(if tpl.method.is_empty(){"GET"}else{&tpl.method}, &template(&tpl.url,cfg,ip,true));
     for (name,value) in &tpl.headers { request.headers.insert(name.clone(),template(value,cfg,ip,false)); }
-    let content_type = tpl.headers.iter().find(|(key,_)|key.eq_ignore_ascii_case("content-type")).map(|(_,v)|v.as_str()).unwrap_or("");
+    let content_type = tpl
+        .headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.trim().to_ascii_lowercase())
+        .unwrap_or_default();
     if content_type.starts_with("application/json") && !tpl.body.is_empty() {
         let mut value = serde_json::from_str(&tpl.body).map_err(|_| "自定义 DDNS JSON 模板格式错误")?;
-        json_template(&mut value,cfg,ip);
+        json_template(&mut value, cfg, ip);
         request.body = serde_json::to_vec(&value).map_err(|_| "序列化 DDNS JSON 失败")?;
-    } else { request.body = template(&tpl.body,cfg,ip,content_type.starts_with("application/x-www-form-urlencoded")).into_bytes(); }
+    } else {
+        request.body = template(&tpl.body, cfg, ip, content_type.starts_with("application/x-www-form-urlencoded")).into_bytes();
+    }
     request.response_limit = 64 * 1024;
     let response = shared().execute(request).await?;
     response.ensure_success()?;

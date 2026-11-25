@@ -2,7 +2,7 @@
 pub mod acme;
 mod acme_transport;
 mod acme_dns;
-mod acme_store;
+pub mod acme_store;
 pub mod cron;
 pub mod ddns;
 pub mod dns_provider;

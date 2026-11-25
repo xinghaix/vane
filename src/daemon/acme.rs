@@ -325,7 +325,7 @@ async fn deploy(cfg: &AcmeConfig, vault: &Vault, bundle: &Bundle) -> Result<(), 
         }
         match hook {
             DeployHook::CopyToDir { dir } => {
-                acme_store::store(Path::new(dir), &cfg.domain, bundle).await?;
+                acme_store::store_copy_without_bundle(Path::new(dir), &cfg.domain, bundle).await?;
             }
             DeployHook::Webhook {
                 url,
@@ -419,6 +419,33 @@ fn activate(
         status: "active".into(),
         last_error: None,
     })
+}
+
+/// 从 CertTable 中移除已删除或已停用的 ACME 域名，保留仍在配置中的启用域名证书
+pub fn prune_cert_table(cfg: &Config, table: &Arc<ArcSwap<CertTable>>) {
+    let mut active_exact = std::collections::BTreeSet::new();
+    let mut active_wild = std::collections::BTreeSet::new();
+    if cfg.modules.acme {
+        for entry in cfg.acme.iter().filter(|a| a.enabled) {
+            for dom in std::iter::once(&entry.domain).chain(entry.extra_domains.iter()) {
+                if let Some(suffix) = dom.strip_prefix('*') {
+                    active_wild.insert(suffix.to_ascii_lowercase());
+                } else {
+                    active_exact.insert(dom.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    table.rcu(|current| {
+        let mut next = CertTable {
+            exact: current.exact.clone(),
+            wildcard: current.wildcard.clone(),
+            fallback: current.fallback.clone(),
+        };
+        next.exact.retain(|k, _| active_exact.contains(k));
+        next.wildcard.retain(|k, _| active_wild.contains(k));
+        Arc::new(next)
+    });
 }
 
 /// 仅从磁盘预加载有效本地证书到反代与管理面（不触发网络签发或部署钩子），

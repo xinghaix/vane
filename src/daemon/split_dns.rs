@@ -1,5 +1,5 @@
 //! 生成仅由 Vane 管理的 dnsmasq addn-hosts 文件，不覆盖系统 hosts。
-use crate::config::{Config,crash_safe_atomic_write,random_nonce};
+use crate::config::{Config, crash_safe_atomic_write_with_mode, random_nonce};
 use std::{collections::BTreeSet,path::Path};
 
 pub fn render(cfg:&Config) -> Result<String,String> {
@@ -21,7 +21,7 @@ pub async fn reconcile(cfg:&Config,data_dir:&Path) -> Result<bool,String> {
     let body=render(cfg)?;
     let path=data_dir.join("split-dns.hosts");
     if tokio::fs::read(&path).await.ok().as_deref()==Some(body.as_bytes()) {return Ok(false);}
-    tokio::task::spawn_blocking(move||crash_safe_atomic_write(&path,body.as_bytes(),random_nonce()))
+    tokio::task::spawn_blocking(move || crash_safe_atomic_write_with_mode(&path, body.as_bytes(), random_nonce(), 0o644, false))
         .await.map_err(|_|"Split DNS 写入任务失败")?.map_err(|_|"Split DNS 文件写入失败")?;
     Ok(true)
 }

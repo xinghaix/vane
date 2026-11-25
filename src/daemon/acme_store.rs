@@ -115,7 +115,18 @@ pub async fn atomic(path: PathBuf, bytes: Vec<u8>) -> Result<(), String> {
 }
 
 pub fn safe_name(domain: &str) -> String {
-    domain.replace("*.", "wildcard_.")
+    let lower = domain.trim().to_ascii_lowercase().replace("*.", "wildcard_.");
+    lower
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .replace("..", "_")
 }
 pub fn bundle_path(dir: &Path, domain: &str) -> PathBuf {
     dir.join(safe_name(domain))
@@ -123,7 +134,28 @@ pub fn bundle_path(dir: &Path, domain: &str) -> PathBuf {
         .join("bundle.json")
 }
 
+fn ensure_real_dir_not_symlink(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.is_dir() {
+                return Err("目标目录为符号链接或非目录，拒绝写入证书".into());
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("检查证书目录元数据失败".into()),
+    }
+}
+
 pub async fn store(dir: &Path, domain: &str, bundle: &Bundle) -> Result<PathBuf, String> {
+    store_inner(dir, domain, bundle, true).await
+}
+
+pub async fn store_copy_without_bundle(dir: &Path, domain: &str, bundle: &Bundle) -> Result<PathBuf, String> {
+    store_inner(dir, domain, bundle, false).await
+}
+
+async fn store_inner(dir: &Path, domain: &str, bundle: &Bundle, write_bundle: bool) -> Result<PathBuf, String> {
     let verified = verify(bundle)?;
     if verified.expires <= crate::logger::unix_now()
         || verified.issued > crate::logger::unix_now() + 300
@@ -131,6 +163,16 @@ pub async fn store(dir: &Path, domain: &str, bundle: &Bundle) -> Result<PathBuf,
         return Err("签发证书不在当前有效期内".into());
     }
     let root = dir.join(safe_name(domain));
+    let dir_check = dir.to_path_buf();
+    let root_check = root.clone();
+    tokio::task::spawn_blocking(move || {
+        ensure_real_dir_not_symlink(&dir_check)?;
+        ensure_real_dir_not_symlink(&root_check)?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|_| "检查证书目录失败")??;
+
     let generation = format!("generation-{:016x}", random_nonce());
     let destination = root.join(&generation);
     atomic(
@@ -143,11 +185,13 @@ pub async fn store(dir: &Path, domain: &str, bundle: &Bundle) -> Result<PathBuf,
         bundle.private_key.as_bytes().to_vec(),
     )
     .await?;
-    atomic(
-        destination.join("bundle.json"),
-        serde_json::to_vec(bundle).map_err(|_| "证书包序列化失败")?,
-    )
-    .await?;
+    if write_bundle {
+        atomic(
+            destination.join("bundle.json"),
+            serde_json::to_vec(bundle).map_err(|_| "证书包序列化失败")?,
+        )
+        .await?;
+    }
     let result = root.join("current").join("fullchain.pem");
     tokio::task::spawn_blocking(move || {
         use std::os::unix::fs::symlink;

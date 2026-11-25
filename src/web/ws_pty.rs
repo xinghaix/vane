@@ -95,13 +95,29 @@ fn resolve_shell(pref: &str) -> String {
 }
 
 pub struct PtyProcess {
-    pub master: AsyncFd<File>,
-    pub child: Child,
+    pub master: Option<AsyncFd<File>>,
+    pub child: Option<Child>,
     pub pgid: i32,
+}
+
+impl Drop for PtyProcess {
+    fn drop(&mut self) {
+        drop(self.master.take());
+        if let Some(mut child) = self.child.take() {
+            if self.pgid > 1 {
+                unsafe {
+                    let _ = libc::kill(-self.pgid, libc::SIGKILL);
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl PtyProcess {
     pub fn resize(&self, cols: u16, rows: u16) {
+        let Some(ref master) = self.master else { return };
         let wsz = libc::winsize {
             ws_row: rows.clamp(10, 300),
             ws_col: cols.clamp(20, 500),
@@ -110,38 +126,29 @@ impl PtyProcess {
         };
         // SAFETY: master 为有效打开的 PTY 主设备文件描述符。
         unsafe {
-            let _ = libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ, &wsz);
+            let _ = libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &wsz);
         }
     }
 
     pub async fn terminate_and_reap(mut self) {
         let pgid = self.pgid;
-        drop(self.master);
+        drop(self.master.take());
+        let Some(mut child) = self.child.take() else { return };
         tokio::task::spawn_blocking(move || {
             if pgid > 1 {
                 // SAFETY: 子进程通过 setsid 成为独立会话与进程组长，负号向整组发送信号。
+                // 在调用 child.wait() 回收组长 PID 之前先完成 SIGHUP -> 短等 -> SIGKILL，
+                // 组长即使已退出也仍保持僵尸占位，确保 pgid 不会被操作系统复用，同时彻底清理后台子孙进程。
                 unsafe {
                     let _ = libc::kill(-pgid, libc::SIGHUP);
                 }
-            }
-            for _ in 0..15 {
-                if let Ok(Some(_)) = self.child.try_wait() {
-                    if pgid > 1 {
-                        unsafe {
-                            let _ = libc::kill(-pgid, libc::SIGKILL);
-                        }
-                    }
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            if pgid > 1 {
+                std::thread::sleep(Duration::from_millis(60));
                 unsafe {
                     let _ = libc::kill(-pgid, libc::SIGKILL);
                 }
             }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            let _ = child.kill();
+            let _ = child.wait();
         })
         .await
         .ok();
@@ -189,20 +196,21 @@ pub fn spawn_pty_command(mut cmd: Command, cols: u16, rows: u16) -> Result<PtyPr
     let slave_in = slave_owned.try_clone().map_err(|e| format!("复制 PTY slave FD 失败: {e}"))?;
     let slave_out = slave_owned.try_clone().map_err(|e| format!("复制 PTY slave FD 失败: {e}"))?;
     let slave_err = slave_owned;
-    let tty_fd = slave_in.as_raw_fd();
 
-    cmd.stdin(Stdio::from(slave_in))
+    cmd.env_remove("VANE_MASTER_KEY")
+        .env_remove("VANE_MASTER_KEY_FILE")
+        .stdin(Stdio::from(slave_in))
         .stdout(Stdio::from(slave_out))
         .stderr(Stdio::from(slave_err))
         .env("TERM", "xterm-256color");
 
-    // SAFETY: pre_exec 仅调用 async-signal-safe 的 setsid 与 ioctl(TIOCSCTTY)。
+    // SAFETY: pre_exec 仅调用 async-signal-safe 的 setsid 与 ioctl(0, TIOCSCTTY)。
     unsafe {
         cmd.pre_exec(move || {
             if libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
-            let _ = libc::ioctl(tty_fd, libc::TIOCSCTTY as _, 0);
+            let _ = libc::ioctl(0, libc::TIOCSCTTY as _, 0);
             Ok(())
         });
     }
@@ -213,8 +221,8 @@ pub fn spawn_pty_command(mut cmd: Command, cols: u16, rows: u16) -> Result<PtyPr
     #[allow(deprecated)]
     let async_master = AsyncFd::new(master_file).map_err(|e| format!("注册异步 PTY FD 失败: {e}"))?;
     Ok(PtyProcess {
-        master: async_master,
-        child,
+        master: Some(async_master),
+        child: Some(child),
         pgid,
     })
 }
@@ -292,6 +300,8 @@ pub async fn handle_pty_websocket<F>(
             return;
         }
         let mut c = Command::new("docker");
+        c.env_remove("VANE_MASTER_KEY")
+            .env_remove("VANE_MASTER_KEY_FILE");
         if !docker_socket.is_empty() && docker_socket != "/var/run/docker.sock" {
             c.args(["-H", &format!("unix://{}", docker_socket)]);
         }
@@ -300,6 +310,8 @@ pub async fn handle_pty_websocket<F>(
     } else {
         let shell = resolve_shell(&cfg.shell);
         let mut c = Command::new(&shell);
+        c.env_remove("VANE_MASTER_KEY")
+            .env_remove("VANE_MASTER_KEY_FILE");
         if !cfg.default_cwd.is_empty() && Path::new(&cfg.default_cwd).exists() {
             c.current_dir(&cfg.default_cwd);
         }
@@ -346,7 +358,12 @@ pub async fn handle_pty_websocket<F>(
                     break;
                 }
             }
-            read_res = read_pty_chunk(&pty.master, &mut buf) => {
+            read_res = async {
+                match pty.master.as_ref() {
+                    Some(m) => read_pty_chunk(m, &mut buf).await,
+                    None => Err(io::Error::new(io::ErrorKind::BrokenPipe, "PTY closed")),
+                }
+            } => {
                 match read_res {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
@@ -378,14 +395,18 @@ pub async fn handle_pty_websocket<F>(
                         idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_limit);
                         if let Some((c, r)) = parse_resize_message(&txt) {
                             pty.resize(c, r);
-                        } else if write_pty_all(&pty.master, txt.as_bytes()).await.is_err() {
-                            break;
+                        } else if let Some(ref m) = pty.master {
+                            if write_pty_all(m, txt.as_bytes()).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     Some(Ok(Message::Binary(bin))) => {
                         idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_limit);
-                        if write_pty_all(&pty.master, &bin).await.is_err() {
-                            break;
+                        if let Some(ref m) = pty.master {
+                            if write_pty_all(m, &bin).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
@@ -411,19 +432,20 @@ mod tests {
         let pgid = pty.pgid;
         pty.resize(132, 40);
 
+        let master = pty.master.as_ref().unwrap();
         let mut buf = [0u8; 256];
-        let n = tokio::time::timeout(Duration::from_secs(2), read_pty_chunk(&pty.master, &mut buf))
+        let n = tokio::time::timeout(Duration::from_secs(2), read_pty_chunk(master, &mut buf))
             .await
             .unwrap()
             .unwrap();
         let out = String::from_utf8_lossy(&buf[..n]);
         assert!(out.contains("PROMPT> "), "expected unbuffered prompt, got {out:?}");
 
-        write_pty_all(&pty.master, b"hello\r").await.unwrap();
+        write_pty_all(master, b"hello\r").await.unwrap();
         let mut collected = String::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while tokio::time::Instant::now() < deadline && !collected.contains("GOT:hello!") {
-            if let Ok(Ok(k)) = tokio::time::timeout(Duration::from_millis(300), read_pty_chunk(&pty.master, &mut buf)).await {
+            if let Ok(Ok(k)) = tokio::time::timeout(Duration::from_millis(300), read_pty_chunk(master, &mut buf)).await {
                 if k == 0 {
                     break;
                 }

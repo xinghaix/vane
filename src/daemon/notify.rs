@@ -68,10 +68,14 @@ fn build_request(cfg: &NotificationConfig, event: &str, title: &str, message: &s
             json!({"device_key":cfg.token,"title":title,"body":message,"group":"Vane"})
         },
         "telegram" => {
+            let tok = cfg.token.trim();
+            if tok.is_empty() || !tok.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-')) {
+                return Err("Telegram Bot Token 格式非法".into());
+            }
             if url.is_empty() {
-                url = format!("https://api.telegram.org/bot{}/sendMessage", cfg.token);
+                url = format!("https://api.telegram.org/bot{}/sendMessage", tok);
             } else if !url.contains("/sendMessage") {
-                url = format!("{}/bot{}/sendMessage", url.trim_end_matches('/'), cfg.token);
+                url = format!("{}/bot{}/sendMessage", url.trim_end_matches('/'), tok);
             }
             // 使用纯文本避免用户输入被解析为 Markdown 控制字符。
             json!({"chat_id":cfg.chat_id,"text":format!("{title}\n{message}")})

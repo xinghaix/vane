@@ -57,6 +57,8 @@ pub fn parse_neighbors_text(text: &str, mac: &str) -> Result<Vec<Ipv6Addr>, Stri
 async fn run_ip_neigh(args: &[&str]) -> Result<Vec<u8>, String> {
     let mut child = tokio::process::Command::new("ip")
         .args(args)
+        .env_remove("VANE_MASTER_KEY")
+        .env_remove("VANE_MASTER_KEY_FILE")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

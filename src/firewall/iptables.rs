@@ -11,7 +11,7 @@ async fn ensure_chain_and_jump(
     chain: &str,
     parent: &str,
     position: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if let Err(e) = exec.run(bin, &["-w", "2", "-t", table, "-N", chain], None).await {
         if !e.contains("Chain already exists") {
             exec.run(bin, &["-w", "2", "-t", table, "-L", chain, "-n"], None)
@@ -27,8 +27,9 @@ async fn ensure_chain_and_jump(
     {
         exec.run(bin, &["-w", "2", "-t", table, "-I", parent, position, "-j", chain], None)
             .await?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 pub async fn apply_rules(
@@ -58,15 +59,23 @@ pub async fn apply_rules(
         .any(|r| matches!(r, FirewallRule::KernelDnat { target, .. } if target.is_ipv6()));
 
     for bin in [ipt4, ipt6] {
-        ensure_chain_and_jump(exec, bin, "filter", "VANE_INPUT", "zone_wan_input", "1").await?;
-        ensure_chain_and_jump(exec, bin, "filter", "VANE_FORWARD", "zone_wan_forward", "1").await?;
-        // VANE_BAN 始终插入到第 1 位，确保优先于 VANE_INPUT / VANE_FORWARD 放行规则执行 DROP
-        ensure_chain_and_jump(exec, bin, "filter", "VANE_BAN", "zone_wan_input", "1").await?;
-        if exec
+        let in_added = ensure_chain_and_jump(exec, bin, "filter", "VANE_INPUT", "zone_wan_input", "1").await?;
+        let fwd_added = ensure_chain_and_jump(exec, bin, "filter", "VANE_FORWARD", "zone_wan_forward", "1").await?;
+        // VANE_BAN 始终插入到第 1 位，若前面刚新插入了放行链则重新置顶以确保优先执行 DROP
+        let ban_in_added = ensure_chain_and_jump(exec, bin, "filter", "VANE_BAN", "zone_wan_input", "1").await?;
+        if in_added && !ban_in_added {
+            let _ = exec.run(bin, &["-w", "2", "-t", "filter", "-D", "zone_wan_input", "-j", "VANE_BAN"], None).await;
+            exec.run(bin, &["-w", "2", "-t", "filter", "-I", "zone_wan_input", "1", "-j", "VANE_BAN"], None)
+                .await?;
+        }
+        let ban_fwd_exists = exec
             .run(bin, &["-w", "2", "-t", "filter", "-C", "zone_wan_forward", "-j", "VANE_BAN"], None)
             .await
-            .is_err()
-        {
+            .is_ok();
+        if !ban_fwd_exists || fwd_added {
+            if ban_fwd_exists {
+                let _ = exec.run(bin, &["-w", "2", "-t", "filter", "-D", "zone_wan_forward", "-j", "VANE_BAN"], None).await;
+            }
             exec.run(
                 bin,
                 &["-w", "2", "-t", "filter", "-I", "zone_wan_forward", "1", "-j", "VANE_BAN"],
@@ -151,7 +160,26 @@ pub async fn apply_rules(
                     .await?;
                     exec.run(
                         bin,
-                        &["-w", "2", "-A", "VANE_FORWARD", "-i", wan, "-p", proto, "-d", &dip, "--dport", &dport, "-j", "ACCEPT"],
+                        &[
+                            "-w",
+                            "2",
+                            "-A",
+                            "VANE_FORWARD",
+                            "-i",
+                            wan,
+                            "-p",
+                            proto,
+                            "-d",
+                            &dip,
+                            "--dport",
+                            &dport,
+                            "-m",
+                            "conntrack",
+                            "--ctstate",
+                            "DNAT",
+                            "-j",
+                            "ACCEPT",
+                        ],
                         None,
                     )
                     .await?;

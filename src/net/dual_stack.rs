@@ -350,6 +350,16 @@ impl BanKey {
         let ip: IpAddr = base.parse().ok()?;
         Some(Self::from_peer(ip))
     }
+
+    pub fn is_loopback_or_link_local(&self) -> bool {
+        match self {
+            Self::V4(v4) => v4.is_loopback() || v4.is_link_local() || v4.is_unspecified(),
+            Self::V6Prefix64(p) => {
+                // ::/64（含 ::1 与 ::）以及 fe80::/10 链路本地前缀
+                *p == 0 || (*p & 0xffc0_0000_0000_0000) == 0xfe80_0000_0000_0000
+            }
+        }
+    }
 }
 
 /// RFC 8305 Happy Eyeballs 双栈 TCP 连接竞速器

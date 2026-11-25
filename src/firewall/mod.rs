@@ -21,8 +21,12 @@ pub const PROTECTED_LOCAL_INPUT_PORTS: &[u16] = &[
 ];
 
 pub fn validate_wan_input_port(port: u16, admin_port: u16, zone: &str) -> Result<(), String> {
+    validate_wan_input_ports(port, &[admin_port], zone)
+}
+
+pub fn validate_wan_input_ports(port: u16, admin_ports: &[u16], zone: &str) -> Result<(), String> {
     if zone.eq_ignore_ascii_case("wan") {
-        if port == admin_port {
+        if admin_ports.contains(&port) {
             return Err(format!("安全底线拦截：严禁在 WAN INPUT 直接放行管理后台端口 {}", port));
         }
         if PROTECTED_LOCAL_INPUT_PORTS.contains(&port) {
@@ -30,6 +34,13 @@ pub fn validate_wan_input_port(port: u16, admin_port: u16, zone: &str) -> Result
         }
     }
     Ok(())
+}
+
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        other => other,
+    }
 }
 
 /// 防止通过端口转发指向 127.0.0.1 / ::1 / 0.0.0.0 或管理监听地址绕过本机高危端口守卫
@@ -40,16 +51,30 @@ pub fn validate_forward_target_safety(
     admin_port: u16,
     admin_listeners: &[String],
 ) -> Result<(), String> {
-    let ip = match target.ip() {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
-        other => other,
-    };
+    validate_forward_target_safety_multi(target, engine, open_wan_firewall, &[admin_port], admin_listeners)
+}
+
+pub fn validate_forward_target_safety_multi(
+    target: SocketAddr,
+    engine: &str,
+    open_wan_firewall: bool,
+    admin_ports: &[u16],
+    admin_listeners: &[String],
+) -> Result<(), String> {
+    let ip = normalize_ip(target.ip());
     let is_local_special = ip.is_loopback() || ip.is_unspecified();
     if engine == "kernel_dnat" && is_local_special {
         return Err(format!("安全与协议拦截：kernel_dnat 目标不能为环回或未指定地址 ({})", target));
     }
+    let router_admin_ips: Vec<IpAddr> = admin_listeners
+        .iter()
+        .filter_map(|l| l.parse::<SocketAddr>().ok().map(|s| normalize_ip(s.ip())))
+        .collect();
+    let is_router_host_ip = is_local_special || router_admin_ips.contains(&ip);
     if open_wan_firewall || engine == "kernel_dnat" {
-        if is_local_special && (target.port() == admin_port || PROTECTED_LOCAL_INPUT_PORTS.contains(&target.port())) {
+        if is_router_host_ip
+            && (admin_ports.contains(&target.port()) || PROTECTED_LOCAL_INPUT_PORTS.contains(&target.port()))
+        {
             return Err(format!(
                 "安全底线拦截：禁止将公网端口转发指向本机受保护端口或管理端口 ({})",
                 target
@@ -57,7 +82,10 @@ pub fn validate_forward_target_safety(
         }
         for listen in admin_listeners {
             if let Ok(admin_sock) = listen.parse::<SocketAddr>() {
-                if admin_sock == target || (admin_sock.ip().is_unspecified() && admin_sock.port() == target.port() && is_local_special) {
+                let admin_ip = normalize_ip(admin_sock.ip());
+                if (admin_ip == ip && admin_sock.port() == target.port())
+                    || (admin_ip.is_unspecified() && admin_sock.port() == target.port() && is_local_special)
+                {
                     return Err(format!("安全底线拦截：禁止将公网端口转发指向管理后台监听地址 ({})", target));
                 }
             }
@@ -69,6 +97,9 @@ pub fn validate_forward_target_safety(
 pub fn validate_iface_name(iface: &str) -> Result<(), String> {
     if iface.is_empty() || iface.len() > 15 {
         return Err(format!("网卡名称长度非法: {}", iface));
+    }
+    if iface == "." || iface == ".." || !iface.as_bytes()[0].is_ascii_alphanumeric() {
+        return Err(format!("网卡名称必须以字母或数字开头: {}", iface));
     }
     if !iface.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') {
         return Err(format!("网卡名称包含非法字符: {}", iface));
@@ -113,6 +144,8 @@ pub async fn run_fw_cmd_with_stdin(
 ) -> Result<String, String> {
     let mut cmd = Command::new(program);
     cmd.args(args)
+        .env_remove("VANE_MASTER_KEY")
+        .env_remove("VANE_MASTER_KEY_FILE")
         .stdin(if stdin_data.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -364,39 +397,51 @@ impl FirewallManager {
         Ok(())
     }
 
-    /// 移除某个模块名下的全部防火墙放行规则（当子模块被关闭或停止时调用）并清理 conntrack
+    /// 移除某个模块名下的全部防火墙放行规则（当子模块被关闭或停止时调用）并清理 conntrack；若底层失败则回滚内存状态
     pub async fn remove_module_rules(&self, owner_module: &str) -> Result<(), String> {
         let _serial = self.op_lock.lock().await;
-        let removed: Vec<FirewallRule> = {
+        let (prev, removed): (Vec<FirewallRule>, Vec<FirewallRule>) = {
             let mut g = self.rules.lock().map_err(|_| "防火墙规则锁损坏")?;
+            let prev = g.clone();
             let (gone, keep): (Vec<_>, Vec<_>) = g.drain(..).partition(|r| r.owner() == owner_module);
             *g = keep;
-            gone
+            (prev, gone)
         };
         if removed.is_empty() {
             return Ok(());
         }
-        self.sync_all_locked().await?;
+        if let Err(e) = self.sync_all_locked().await {
+            if let Ok(mut g) = self.rules.lock() {
+                *g = prev;
+            }
+            return Err(e);
+        }
         for r in &removed {
             self.flush_conntrack_for_rule(r).await;
         }
         Ok(())
     }
 
-    /// 移除指定名称的规则并断流
+    /// 移除指定名称的规则并断流；若底层同步失败则回滚内存状态
     pub async fn remove_rule(&self, owner_module: &str, rule_name: &str) -> Result<(), String> {
         let _serial = self.op_lock.lock().await;
-        let removed: Vec<FirewallRule> = {
+        let (prev, removed): (Vec<FirewallRule>, Vec<FirewallRule>) = {
             let mut g = self.rules.lock().map_err(|_| "防火墙规则锁损坏")?;
+            let prev = g.clone();
             let (gone, keep): (Vec<_>, Vec<_>) =
                 g.drain(..).partition(|r| r.owner() == owner_module && r.name() == rule_name);
             *g = keep;
-            gone
+            (prev, gone)
         };
         if removed.is_empty() {
             return Ok(());
         }
-        self.sync_all_locked().await?;
+        if let Err(e) = self.sync_all_locked().await {
+            if let Ok(mut g) = self.rules.lock() {
+                *g = prev;
+            }
+            return Err(e);
+        }
         for r in &removed {
             self.flush_conntrack_for_rule(r).await;
         }
@@ -432,14 +477,18 @@ impl FirewallManager {
         Ok(())
     }
 
-    /// 封禁恶意源 IP 或 IPv6 /64 子网并立即切断其现有 conntrack 连接
+    /// 封禁恶意源 IP 或 IPv6 /64 子网并立即切断其现有 conntrack 连接（回环/链路本地仅应用层封禁，防止内网断联）
     pub async fn ban_source_cidr(&self, cidr_or_ip: &str, duration_secs: u64) -> Result<(), String> {
         let key = BanKey::parse_cidr_or_ip(cidr_or_ip).ok_or_else(|| format!("非法封禁地址: {}", cidr_or_ip))?;
+        if key.is_loopback_or_link_local() {
+            return Ok(());
+        }
         let dur = duration_secs.clamp(60, 86_400);
         let now = logger::unix_now();
         let _serial = self.op_lock.lock().await;
-        {
+        let prev_bans = {
             let mut bans = self.bans.lock().map_err(|_| "封禁锁损坏")?;
+            let prev = bans.clone();
             bans.retain(|_, exp| *exp > now);
             if bans.len() >= 1024 && !bans.contains_key(&key) {
                 if let Some(oldest) = bans.iter().min_by_key(|(_, exp)| **exp).map(|(k, _)| *k) {
@@ -447,50 +496,67 @@ impl FirewallManager {
                 }
             }
             bans.insert(key, now + dur);
-        }
+            prev
+        };
         if !self.is_auto_manage() || self.backend == FirewallBackend::DryRun {
             return Ok(());
         }
         let norm_cidr = key.display_cidr();
-        match self.backend {
+        let sync_res = match self.backend {
             FirewallBackend::Nftables => {
                 if nftables::add_ban_cidr(self.executor.as_ref(), &norm_cidr, dur).await.is_err() {
-                    self.sync_all_locked().await?;
+                    self.sync_all_locked().await
+                } else {
+                    Ok(())
                 }
             }
-            FirewallBackend::IptablesLegacy | FirewallBackend::IptablesNft => {
-                self.sync_all_locked().await?;
+            FirewallBackend::IptablesLegacy | FirewallBackend::IptablesNft => self.sync_all_locked().await,
+            FirewallBackend::DryRun => Ok(()),
+        };
+        if let Err(e) = sync_res {
+            if let Ok(mut bans) = self.bans.lock() {
+                *bans = prev_bans;
             }
-            FirewallBackend::DryRun => {}
+            return Err(e);
         }
-        let _ = self.executor.run("conntrack", &["-D", "-s", &norm_cidr], None).await;
+        let fam = match key {
+            BanKey::V4(_) => "ipv4",
+            BanKey::V6Prefix64(_) => "ipv6",
+        };
+        let _ = self.executor.run("conntrack", &["-D", "-f", fam, "-s", &norm_cidr], None).await;
         Ok(())
     }
 
-    /// 解除源 IP / IPv6 /64 子网的内核封禁
+    /// 解除源 IP / IPv6 /64 子网的内核封禁（失败回滚内存封禁表）
     pub async fn unban_source_cidr(&self, cidr_or_ip: &str) -> Result<bool, String> {
         let key = BanKey::parse_cidr_or_ip(cidr_or_ip).ok_or_else(|| format!("非法解封地址: {}", cidr_or_ip))?;
         let _serial = self.op_lock.lock().await;
-        let existed = self
-            .bans
-            .lock()
-            .map_err(|_| "封禁锁损坏")?
-            .remove(&key)
-            .is_some();
+        let (prev_bans, existed) = {
+            let mut g = self.bans.lock().map_err(|_| "封禁锁损坏")?;
+            let prev = g.clone();
+            let ex = g.remove(&key).is_some();
+            (prev, ex)
+        };
         if !self.is_auto_manage() || self.backend == FirewallBackend::DryRun {
             return Ok(existed);
         }
         let norm_cidr = key.display_cidr();
-        match self.backend {
+        let sync_res = match self.backend {
             FirewallBackend::Nftables => {
                 if nftables::remove_ban_cidr(self.executor.as_ref(), &norm_cidr).await.is_err() {
-                    self.sync_all_locked().await?;
+                    self.sync_all_locked().await
+                } else {
+                    Ok(())
                 }
             }
-            FirewallBackend::IptablesLegacy | FirewallBackend::IptablesNft => {
-                self.sync_all_locked().await?;
+            FirewallBackend::IptablesLegacy | FirewallBackend::IptablesNft => self.sync_all_locked().await,
+            FirewallBackend::DryRun => Ok(()),
+        };
+        if let Err(e) = sync_res {
+            if let Ok(mut g) = self.bans.lock() {
+                *g = prev_bans;
             }
-            FirewallBackend::DryRun => {}
+            return Err(e);
         }
         Ok(existed)
     }
@@ -535,12 +601,20 @@ impl FirewallManager {
             return;
         }
         match rule {
-            FirewallRule::WanInput { proto, port, .. } => {
+            FirewallRule::WanInput { proto, port, ipv4, ipv6, .. } => {
                 let port_s = port.to_string();
-                let _ = self
-                    .executor
-                    .run("conntrack", &["-D", "-p", proto, "--dport", &port_s], None)
-                    .await;
+                if *ipv4 {
+                    let _ = self
+                        .executor
+                        .run("conntrack", &["-D", "-f", "ipv4", "-p", proto, "--dport", &port_s], None)
+                        .await;
+                }
+                if *ipv6 {
+                    let _ = self
+                        .executor
+                        .run("conntrack", &["-D", "-f", "ipv6", "-p", proto, "--dport", &port_s], None)
+                        .await;
+                }
             }
             FirewallRule::KernelDnat { proto, listen_port: port, target, .. } => {
                 let port_s = port.to_string();

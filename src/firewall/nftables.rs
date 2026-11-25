@@ -91,9 +91,17 @@ pub fn build_nft_script(
         "add set inet vane_shield ban_v6 { type ipv6_addr; flags interval, timeout; }".to_string(),
         "add chain inet vane_shield prerouting { type filter hook prerouting priority filter - 10; policy accept; }"
             .to_string(),
-        "add rule inet vane_shield prerouting ip saddr @ban_v4 counter drop".to_string(),
-        "add rule inet vane_shield prerouting ip6 saddr @ban_v6 counter drop".to_string(),
     ];
+    for wan in &wan_ifaces {
+        lines.push(format!(
+            "add rule inet vane_shield prerouting iifname \"{}\" ip saddr @ban_v4 counter drop",
+            wan
+        ));
+        lines.push(format!(
+            "add rule inet vane_shield prerouting iifname \"{}\" ip6 saddr @ban_v6 counter drop",
+            wan
+        ));
+    }
 
     for (key, exp) in bans {
         if *exp <= now_unix {
@@ -145,7 +153,7 @@ pub fn build_nft_script(
                         wan, proto, listen_port, fam, target
                     ));
                     lines.push(format!(
-                        "add rule inet fw4 vane_forward iifname \"{}\" {} daddr {} {} dport {} accept",
+                        "add rule inet fw4 vane_forward iifname \"{}\" ct status dnat {} daddr {} {} dport {} accept",
                         wan,
                         fam,
                         target.ip(),

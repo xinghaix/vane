@@ -127,6 +127,7 @@ async fn nftables_atomic_script_mounts_jumps_handles_bans_lockdown_and_rolls_bac
         .unwrap();
     assert!(last_script.contains("add table inet vane_shield"));
     assert!(last_script.contains("priority filter - 10; policy accept;"));
+    assert!(last_script.contains(r#"add rule inet vane_shield prerouting iifname "pppoe-wan" ip6 saddr @ban_v6 counter drop"#));
     assert!(last_script.contains("2001:db8:dead:beef::/64 timeout"));
     assert!(last_script.contains("198.51.100.77/32 timeout"));
     assert!(last_script.contains(r#"add rule inet fw4 vane_input iifname "pppoe-wan" tcp dport 8443 accept"#));
@@ -152,6 +153,19 @@ async fn nftables_atomic_script_mounts_jumps_handles_bans_lockdown_and_rolls_bac
     assert_eq!(mgr.list_rules().len(), 2);
     exec.set_fail_substr(None);
 
+    // 移除失败时必须回滚内存规则表，保证不发生内存与内核失步
+    exec.set_fail_substr(Some("-f -"));
+    assert!(mgr.remove_rule("reverse_proxy", "https_8443").await.is_err());
+    assert_eq!(mgr.list_rules().len(), 2);
+    exec.set_fail_substr(None);
+
+    // 回环/链路本地封禁不得下发到内核集合（防止误封整个 LAN / loopback）
+    mgr.ban_source_cidr("::1", 600).await.unwrap();
+    assert!(!exec
+        .snapshot()
+        .iter()
+        .any(|(_, a, _)| a.iter().any(|s| s.contains("{ ::/64") || s == "::/64")));
+
     mgr.trigger_lockdown(true).await.unwrap();
     let after_lockdown = exec.snapshot();
     let lockdown_script = after_lockdown
@@ -161,7 +175,7 @@ async fn nftables_atomic_script_mounts_jumps_handles_bans_lockdown_and_rolls_bac
         .unwrap();
     assert!(!lockdown_script.contains("dport 8443 accept"));
     assert!(lockdown_script.contains("2001:db8:dead:beef::/64 timeout"));
-    assert!(after_lockdown.iter().any(|(p, a, _)| p == "conntrack" && a.contains(&"8443".to_string())));
+    assert!(after_lockdown.iter().any(|(p, a, _)| p == "conntrack" && a.contains(&"ipv6".to_string()) && a.contains(&"8443".to_string())));
 }
 
 #[tokio::test]
@@ -201,7 +215,12 @@ fn local_forward_target_bypass_is_blocked_while_lan_nas_is_allowed() {
     assert!(validate_forward_target_safety("127.0.0.1:22".parse().unwrap(), "userspace_splice", true, 23456, &listeners).is_err());
     assert!(validate_forward_target_safety("[::1]:23456".parse().unwrap(), "userspace_splice", true, 23456, &listeners).is_err());
     assert!(validate_forward_target_safety("192.168.1.1:23456".parse().unwrap(), "userspace_splice", true, 23456, &listeners).is_err());
+    assert!(validate_forward_target_safety("[::ffff:192.168.1.1]:23456".parse().unwrap(), "userspace_splice", true, 23456, &listeners).is_err());
+    assert!(validate_forward_target_safety("192.168.1.1:22".parse().unwrap(), "userspace_splice", true, 23456, &listeners).is_err());
     assert!(validate_forward_target_safety("127.0.0.1:9000".parse().unwrap(), "kernel_dnat", true, 23456, &listeners).is_err());
     assert!(validate_forward_target_safety("192.168.1.50:22".parse().unwrap(), "userspace_splice", true, 23456, &listeners).is_ok());
     assert!(validate_forward_target_safety("192.168.1.50:443".parse().unwrap(), "kernel_dnat", true, 23456, &listeners).is_ok());
+    assert!(validate_iface_name("-j").is_err());
+    assert!(validate_iface_name("..").is_err());
+    assert!(validate_iface_name("pppoe-wan").is_ok());
 }

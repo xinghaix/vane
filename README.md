@@ -13,7 +13,7 @@ Built with **Rust + Svelte 5 (Runes)**, Vane compiles into a single static binar
 
 ---
 
-> **Development status:** This is not production-ready. ACME now implements the real DNS-01 order protocol and DDNS sends real provider requests, but live CA/DNS and Linux/OpenWrt acceptance tests are still pending. Some Cron actions only log messages. Manual notifications now perform real delivery; background alert events are not yet connected. The feature list includes design goals, not a claim of completed acceptance testing. Do not deploy this version as a public production gateway.
+> **Development status:** This is still a development release and automated local tests do not constitute production certification. Real RFC 8555 DNS-01 ACME, multi-provider DDNS + Split-DNS, all five Cron action types, eight notification providers with background alert dispatch, Vault-sealed reverse-proxy headers + Auth-Gate WS ticket UI, and full cross-machine `.vane.bak` backup/restore (including ACME accounts, valid certs, challenge journals, and admin TLS certs) are implemented and covered by 121+ automated regression tests. However, live CA/DNS/notification acceptance with real credentials and physical Linux/OpenWrt `fw3`/`fw4` hardware & power-loss testing are still pending. Do not deploy directly as an unverified public production gateway.
 
 ## Admin access
 

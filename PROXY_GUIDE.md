@@ -14,7 +14,7 @@
 
 逐跳头以及 Connection 指定的附加头都会删除，再由 Hyper 按消息正文重新编码传输。未经首部策略检查的 trailers 不转发。自定义头禁止覆盖 Host、Content-Length 和逐跳控制字段；Host 使用专用 upstream_host_header 配置。
 
-管理会话 Cookie 不发送给上游，上游也不能通过 Set-Cookie 覆盖管理会话。后端自己的 Cookie 和 Authorization 正常透传，除非配置显式移除。反代自定义请求头中的静态凭据尚需在配置安全阶段补齐 Vault 全覆盖，当前不要把未加封的配置文件当成无敏感数据。
+管理会话 Cookie (`vane_session`) 与入口路径 Cookie (`vane_entry`) 均不会发送给上游，上游也不能通过 `Set-Cookie`（含前导空白变体）覆盖管理会话或入口 Cookie。后端自己的 Cookie 和 Authorization 正常透传，除非配置显式移除。反代自定义请求头 (`request_headers_set`) 已全链路接入 Vault 信封加密（落盘 `enc:v1:...`、API 掩码、`sanitized_export` 脱敏、运行时解密），并在前端提供结构化请求头编辑器。
 
 ## 上游 HTTPS
 
@@ -28,14 +28,15 @@ upstream_sni 和 upstream_host_header 分别控制 TLS 服务器名称与 HTTP H
 
 auth_gate=true 的普通 HTTP 请求需有效 FullAdmin 会话；必须改初始密码的会话不能通过。写请求还需可信 Origin。当前复用管理 Cookie 适用于管理面与反代同主机名、不同端口的部署；不同主机名之间的交互式登录交接尚待管理 UI/认证阶段完成，不会通过放宽 Cookie Domain 来冒充支持。
 
-WebSocket 必须满足规则 websocket=true、合法 HTTPS Origin 和一次性票据，即使 auth_gate=false 也不豁免。票据流程：
+WebSocket 升级仅在 `mode = "proxy"` 且 `websocket = true` 时允许（`static`/`redirect` 规则会在门禁校验前直接拒绝升级）：
 
-1. 在管理面完整登录后，以可信 Origin 向 POST /api/proxy/ticket 提交 listener、authority、path。
-2. authority 包含反代实际端口，例如 proxy.example.com:8443；path 是完整 WS 路径及原有查询串。
-3. 将返回的 ticket 作为 vane_ticket 查询参数附加到目标 WSS URL。
-4. 票据 30 秒失效、只能使用一次，绑定管理员会话摘要、目标路径和来源网段；代理转发前移除票据参数。
+- `auth_gate = false`：校验合法 HTTP/1.1 `GET` + `Connection: upgrade` 后透明透传升级，适合常规自托管应用（如 Home Assistant、Immich、Syncthing 等）开箱即用。
+- `auth_gate = true`：除上述校验外，还强制要求单一可信 HTTPS `Origin`（目标 origin 或管理面 `canonical_origin`）与一次性票据。取票流程如下（亦可在 Web 控制台「反向代理」对应规则卡片直接点击 **WS 票据** 弹窗一键签发并复制完整 `wss://` 链接）：
 
-浏览器发起 WS 的 Origin 可以是目标 HTTPS origin 或管理面的 canonical_origin。会话撤销/过期会在一秒级检查后关闭隧道。原有后端网页如果自动建立 WebSocket，必须增加上述取票集成；当前管理 UI 尚未提供通用取票交互，不能宣称任意第三方 WebSocket 页面开箱即用。
+1. 在管理面完整登录后，以可信 Origin 向 `POST /api/proxy/ticket` 提交 `listener`、`authority`、`path`。
+2. `authority` 包含反代实际端口，例如 `proxy.example.com:8443`；`path` 是完整 WS 路径及原有查询串。
+3. 将返回的 `ticket` 作为 `vane_ticket` 查询参数附加到目标 WSS URL。
+4. 票据 30 秒失效、只能使用一次，绑定管理员会话摘要、目标路径和来源网段；代理转发前移除 `vane_ticket` 参数。会话撤销/过期会在一秒级检查后关闭已建立的隧道。
 
 ## 资源与停止
 
@@ -45,6 +46,6 @@ max_body_mb=0 表示流式不限总大小，不表示无限缓存；非零值对
 
 ## 已验证与未验证
 
-真实 localhost TCP/TLS 测试覆盖二进制 POST、分片/chunked、伪造头清洗、HTTP2、IPv6 前后端、源 CIDR、防伪 authority、上传上限、严格/固定指纹/不安全 TLS 模式、WebSocket Origin/票据重放/撤权、活动上游取消与配额归还。
+真实 localhost TCP/TLS 测试覆盖二进制 POST、分片/chunked、伪造头清洗、HTTP2、IPv6 前后端、源 CIDR、防伪 authority、路径规范化与前缀防绕过、重定向模板防注入、`vane_entry` Cookie 清洗、上传上限、严格/固定指纹/不安全 TLS 模式、WebSocket 门禁/Origin/票据重放/撤权、活动上游取消与配额归还。
 
-尚未执行公网压测、长期背压测试、真实第三方应用兼容测试或 OpenWrt 防火墙运行验收。端口转发、STUN、内核防火墙以及跨主机登录交接是后续工作，不因本模块测试通过而视为完成。
+尚未执行公网压测、长期背压测试、真实第三方应用兼容测试或 OpenWrt 防火墙运行验收；跨主机名管理员门禁登录交接仍需在目标部署场景进一步评估，不因本地测试通过而宣称完成生产压测验收。

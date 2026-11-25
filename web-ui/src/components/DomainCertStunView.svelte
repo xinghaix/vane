@@ -1,16 +1,19 @@
 <script>
   import Icons from './Icons.svelte';
   import SecretField from './SecretField.svelte';
+  import HeaderRowsEditor from './HeaderRowsEditor.svelte';
   import {
     splitCsv,
     joinCsv,
-    kvObjectToText,
-    textToKvObject,
+    kvObjectToRows,
+    rowsToKvObject,
     deepClone,
     copyText,
     formatUnixTime,
     secretMaskedHint,
+    isSecretConfigured,
     resolveSecretInput,
+    translateRuntimeStatus,
   } from '../lib/helpers.js';
 
   let {
@@ -28,11 +31,47 @@
   } = $props();
 
   let busyKey = $state('');
+  let busyToggleKey = $state('');
   let saving = $state(false);
   let searchQuery = $state('');
+  let filterStatus = $state('all');
 
   let ifaceNames = $derived((networkInfo?.interfaces || []).map((i) => i.iface));
   let neighborEntries = $derived(networkInfo?.neighbors || []);
+
+  // 切换 Tab 模式时重置筛选和抽屉，避免跨视图状态泄漏
+  $effect(() => {
+    void mode;
+    searchQuery = '';
+    filterStatus = 'all';
+    provDrawerOpen = false;
+    ddnsDrawerOpen = false;
+    acmeDrawerOpen = false;
+    stunDrawerOpen = false;
+  });
+
+  function providerRefs(id) {
+    const usedByDdns = (settingsJson?.ddns || []).filter((d) => d.provider === id).map((d) => d.name);
+    const usedByAcme = (settingsJson?.acme || []).filter((a) => a.dns_provider === id).map((a) => a.domain);
+    return [...usedByDdns, ...usedByAcme];
+  }
+
+  function parsePortListStrict(csv) {
+    const raw = splitCsv(csv);
+    const out = [];
+    for (const token of raw) {
+      if (!/^\d+$/.test(token)) return { error: token };
+      const num = Number(token);
+      if (!Number.isInteger(num) || num < 1 || num > 65535) return { error: token };
+      out.push(num);
+    }
+    return { ports: out };
+  }
+
+  async function copyOrToast(val) {
+    if (await copyText(val)) showToast(t.copied, 'success');
+    else showToast(t.copyFailed, 'error');
+  }
 
   // ---------------- DNS Provider Drawer ----------------
   let provDrawerOpen = $state(false);
@@ -62,11 +101,23 @@
     if (saving) return;
     const cleanId = provDraftId.trim();
     if (!cleanId) return;
+    if (cleanId !== provEditId && settingsJson?.dns_providers?.[cleanId]) {
+      showToast(lang === 'en' ? `Provider ID "${cleanId}" already exists` : `服务商 ID "${cleanId}" 已存在，请更换名称`, 'error');
+      return;
+    }
+    if (provDraft.provider === 'cloudflare' && provDraft.zone_id?.trim() && !provDraft.zone_name?.trim()) {
+      showToast(lang === 'en' ? 'Zone Name is required when Zone ID is specified' : '填写 Cloudflare Zone ID 时必须同时填写 Zone Name', 'error');
+      return;
+    }
     saving = true;
     try {
       const orig = provEditId ? settingsJson.dns_providers[provEditId] : null;
       provDraft.api_token = resolveSecretInput(orig?.api_token, provTokenInput, provTokenClear);
-      provDraft.secret_key = resolveSecretInput(orig?.secret_key, provSecretInput, provSecretClear);
+      provDraft.secret_key =
+        provDraft.provider === 'cloudflare'
+          ? ''
+          : resolveSecretInput(orig?.secret_key, provSecretInput, provSecretClear);
+      if (provDraft.provider !== 'cloudflare') provDraft.zone_id = '';
       provDraft.happy_eyeballs_delay_ms = Number(provDraft.happy_eyeballs_delay_ms || 250);
 
       const next = deepClone(settingsJson);
@@ -74,6 +125,13 @@
       if (provEditId && provEditId !== cleanId) {
         delete next.dns_providers[provEditId];
         renames.push({ from: `dns_providers.${provEditId}`, to: `dns_providers.${cleanId}` });
+        // 级联更新引用该服务商 ID 的 DDNS 与 ACME 规则
+        for (const d of next.ddns || []) {
+          if (d.provider === provEditId) d.provider = cleanId;
+        }
+        for (const a of next.acme || []) {
+          if (a.dns_provider === provEditId) a.dns_provider = cleanId;
+        }
       }
       next.dns_providers[cleanId] = provDraft;
       if (await onSaveSettings(next, renames)) provDrawerOpen = false;
@@ -83,17 +141,19 @@
   }
 
   function deleteProvider(id) {
-    const usedByDdns = (settingsJson?.ddns || []).filter((d) => d.provider === id).map((d) => d.name);
-    const usedByAcme = (settingsJson?.acme || []).filter((a) => a.dns_provider === id).map((a) => a.domain);
-    const refs = [...usedByDdns, ...usedByAcme];
-    const refWarning = refs.length
-      ? lang === 'en'
-        ? ` (Referenced by: ${refs.join(', ')})`
-        : `（注意：正被 ${refs.join(', ')} 引用！）`
-      : '';
+    const refs = providerRefs(id);
+    if (refs.length > 0) {
+      showToast(
+        lang === 'en'
+          ? `Cannot delete "${id}": still referenced by ${refs.join(', ')}`
+          : `无法删除 "${id}"：仍被 ${refs.join(', ')} 引用，请先调整对应规则`,
+        'warn'
+      );
+      return;
+    }
     askConfirm({
       title: t.common.confirmDeleteTitle,
-      message: `${id}${refWarning}`,
+      message: `${id}`,
       confirmLabel: t.delete,
       danger: true,
       onConfirm: async () => {
@@ -121,7 +181,7 @@
   let ddnsHttpUrlClear = $state(false);
   let ddnsHttpBodyInput = $state('');
   let ddnsHttpBodyClear = $state(false);
-  let ddnsHttpHeadersTxt = $state('');
+  let ddnsHttpHeaderRows = $state([]);
   let ddnsSrcUrlV4Input = $state('');
   let ddnsSrcUrlV4Clear = $state(false);
   let ddnsSrcUrlV6Input = $state('');
@@ -160,9 +220,29 @@
     return d;
   }
 
-  function openDdnsDrawer(idx = -1, preset = 'wan') {
+  function openDdnsDrawer(idx = -1, preset = 'wan', cloneFrom = null) {
     ddnsEditIdx = idx;
-    const d = idx >= 0 ? deepClone(settingsJson.ddns[idx]) : defaultDdns(preset);
+    const d = cloneFrom
+      ? deepClone(cloneFrom)
+      : idx >= 0
+        ? deepClone(settingsJson.ddns[idx])
+        : defaultDdns(preset);
+    if (cloneFrom) {
+      d.name = `${d.name}_copy`;
+      d.domain = `copy-${d.domain}`;
+      d.token = '';
+      if (d.custom_http) {
+        d.custom_http.url = '';
+        d.custom_http.body = '';
+        d.custom_http.headers = {};
+      }
+      if (d.source?.kind === 'external_url') {
+        d.source.url_v4 = '';
+        d.source.url_v6 = '';
+      } else if (d.source?.kind === 'custom_http_extract') {
+        d.source.url = '';
+      }
+    }
     ddnsOrigName = idx >= 0 ? d.name : '';
     ddnsDraft = d;
     ddnsSourceKind = d.source?.kind || 'interface';
@@ -177,7 +257,7 @@
     ddnsHttpUrlClear = false;
     ddnsHttpBodyInput = '';
     ddnsHttpBodyClear = false;
-    ddnsHttpHeadersTxt = kvObjectToText(d.custom_http?.headers);
+    ddnsHttpHeaderRows = kvObjectToRows(d.custom_http?.headers);
     ddnsSrcUrlV4Input = '';
     ddnsSrcUrlV4Clear = false;
     ddnsSrcUrlV6Input = '';
@@ -195,19 +275,50 @@
     else ddnsDraft.source = { kind: 'custom_http_extract', url: '' };
   }
 
+  let selectedDdnsProviderKind = $derived(
+    ddnsDraft?.provider === 'custom_http'
+      ? 'custom_http'
+      : settingsJson?.dns_providers?.[ddnsDraft?.provider]?.provider || ''
+  );
+
   async function saveDdns(e) {
     e.preventDefault();
     if (saving) return;
+    const recs = [];
+    if (ddnsRecA) recs.push('A');
+    if (ddnsRecAAAA) recs.push('AAAA');
+    if (recs.length === 0) {
+      showToast(lang === 'en' ? 'Select at least one record type (A or AAAA)' : '请至少勾选 A 或 AAAA 记录类型之一', 'error');
+      return;
+    }
+    if (ddnsDraft.provider === 'custom_http' && ddnsDraft.on_missing_public_ip === 'delete_record') {
+      showToast(lang === 'en' ? 'custom_http does not support delete_record; use keep_existing' : 'custom_http 不支持 delete_record，请选择 keep_existing', 'error');
+      return;
+    }
+    const splitList = splitCsv(ddnsSplitCsv);
+    if (ddnsDraft.domain?.trim().startsWith('*.') && splitList.length > 0) {
+      showToast(lang === 'en' ? 'Split-DNS does not support wildcard domains' : 'Split-DNS 不支持通配符域名', 'error');
+      return;
+    }
+    const tcpParsed = parsePortListStrict(ddnsTcpPortsCsv);
+    if (tcpParsed.error) {
+      showToast(lang === 'en' ? `Invalid TCP port: ${tcpParsed.error}` : `非法 TCP 端口: ${tcpParsed.error}（需 1~65535 整数）`, 'error');
+      return;
+    }
+    const udpParsed = parsePortListStrict(ddnsUdpPortsCsv);
+    if (udpParsed.error) {
+      showToast(lang === 'en' ? `Invalid UDP port: ${udpParsed.error}` : `非法 UDP 端口: ${udpParsed.error}（需 1~65535 整数）`, 'error');
+      return;
+    }
     saving = true;
     try {
       const orig = ddnsEditIdx >= 0 ? settingsJson.ddns[ddnsEditIdx] : null;
-      const recs = [];
-      if (ddnsRecA) recs.push('A');
-      if (ddnsRecAAAA) recs.push('AAAA');
+      ddnsDraft.name = String(ddnsDraft.name || '').trim();
+      ddnsDraft.domain = String(ddnsDraft.domain || '').trim();
       ddnsDraft.records = recs;
-      ddnsDraft.split_dns_lan_ips = splitCsv(ddnsSplitCsv);
-      ddnsDraft.firewall_allow_tcp_ports = splitCsv(ddnsTcpPortsCsv).map(Number).filter((n) => n > 0);
-      ddnsDraft.firewall_allow_udp_ports = splitCsv(ddnsUdpPortsCsv).map(Number).filter((n) => n > 0);
+      ddnsDraft.split_dns_lan_ips = splitList;
+      ddnsDraft.firewall_allow_tcp_ports = tcpParsed.ports;
+      ddnsDraft.firewall_allow_udp_ports = udpParsed.ports;
       ddnsDraft.ttl = Number(ddnsDraft.ttl || 300);
       ddnsDraft.reconcile_interval_secs = Number(ddnsDraft.reconcile_interval_secs || 600);
       if (ddnsDraft.source.kind === 'interface') {
@@ -216,7 +327,7 @@
       ddnsDraft.token = resolveSecretInput(orig?.token, ddnsTokenInput, ddnsTokenClear);
       ddnsDraft.custom_http.url = resolveSecretInput(orig?.custom_http?.url, ddnsHttpUrlInput, ddnsHttpUrlClear);
       ddnsDraft.custom_http.body = resolveSecretInput(orig?.custom_http?.body, ddnsHttpBodyInput, ddnsHttpBodyClear);
-      ddnsDraft.custom_http.headers = textToKvObject(ddnsHttpHeadersTxt, orig?.custom_http?.headers || {});
+      ddnsDraft.custom_http.headers = rowsToKvObject(ddnsHttpHeaderRows, true);
 
       if (ddnsDraft.source.kind === 'external_url') {
         const origSrc = orig?.source?.kind === 'external_url' ? orig.source : null;
@@ -244,9 +355,16 @@
   }
 
   async function toggleDdnsEnabled(idx) {
-    const next = deepClone(settingsJson);
-    next.ddns[idx].enabled = !next.ddns[idx].enabled;
-    await onSaveSettings(next);
+    const key = `ddns:${idx}`;
+    if (busyToggleKey) return;
+    busyToggleKey = key;
+    try {
+      const next = deepClone(settingsJson);
+      next.ddns[idx].enabled = !next.ddns[idx].enabled;
+      await onSaveSettings(next);
+    } finally {
+      busyToggleKey = '';
+    }
   }
 
   function deleteDdns(idx) {
@@ -288,38 +406,47 @@
   let acmeExtraCsv = $state('');
   let acmeEabKeyInput = $state('');
   let acmeEabKeyClear = $state(false);
-  let acmeCopyDir = $state('');
-  let acmeHookEdits = $state([]); // [{ kind: 'webhook', origIdx, urlOrig, urlInput, urlClear, include_private_key }]
+  let acmeCopyDirs = $state([]); // string[] — 保留全部 copy_to_dir 钩子
+  let acmeHookEdits = $state([]); // [{ origIdx, urlOrig, urlInput, urlClear, include_private_key }]
 
-  function openAcmeDrawer(idx = -1) {
+  function openAcmeDrawer(idx = -1, cloneFrom = null) {
     acmeEditIdx = idx;
     const firstProv = Object.keys(settingsJson?.dns_providers || {})[0] || '';
-    const a = idx >= 0
-      ? deepClone(settingsJson.acme[idx])
-      : {
-          enabled: true,
-          domain: '*.home.example.com',
-          extra_domains: ['home.example.com'],
-          email: 'admin@example.com',
-          dns_provider: firstProv,
-          cert_dir: '/data/vane/certs',
-          renew_before_days: 30,
-          directory_url: 'letsencrypt',
-          eab_kid: '',
-          eab_hmac_key: '',
-          challenge_alias_domain: '',
-          propagation_timeout_secs: 180,
-          deploy_hooks: [],
-          use_for_admin: false,
-        };
+    const a = cloneFrom
+      ? deepClone(cloneFrom)
+      : idx >= 0
+        ? deepClone(settingsJson.acme[idx])
+        : {
+            enabled: true,
+            domain: '*.home.example.com',
+            extra_domains: ['home.example.com'],
+            email: 'admin@example.com',
+            dns_provider: firstProv,
+            cert_dir: '/data/vane/certs',
+            renew_before_days: 30,
+            directory_url: 'letsencrypt',
+            eab_kid: '',
+            eab_hmac_key: '',
+            challenge_alias_domain: '',
+            propagation_timeout_secs: 180,
+            deploy_hooks: [],
+            use_for_admin: false,
+          };
+    if (cloneFrom) {
+      a.domain = `copy-${a.domain}`;
+      a.use_for_admin = false;
+      a.eab_hmac_key = '';
+      a.deploy_hooks = (a.deploy_hooks || []).filter((h) => h.kind === 'copy_to_dir');
+    }
     acmeOrigDomain = idx >= 0 ? a.domain : '';
     acmeDraft = a;
     acmeCaChoice = PRESET_CA.has(a.directory_url) ? a.directory_url : 'custom';
     acmeExtraCsv = joinCsv(a.extra_domains);
     acmeEabKeyInput = '';
     acmeEabKeyClear = false;
-    const copyHook = (a.deploy_hooks || []).find((h) => h.kind === 'copy_to_dir');
-    acmeCopyDir = copyHook ? copyHook.dir : '';
+    acmeCopyDirs = (a.deploy_hooks || [])
+      .filter((h) => h.kind === 'copy_to_dir')
+      .map((h) => h.dir || '');
     acmeHookEdits = (a.deploy_hooks || [])
       .map((h, i) => ({ h, i }))
       .filter(({ h }) => h.kind === 'webhook')
@@ -331,6 +458,14 @@
         include_private_key: Boolean(h.include_private_key),
       }));
     acmeDrawerOpen = true;
+  }
+
+  function addAcmeCopyDir() {
+    acmeCopyDirs = [...acmeCopyDirs, ''];
+  }
+
+  function removeAcmeCopyDir(idx) {
+    acmeCopyDirs = acmeCopyDirs.filter((_, i) => i !== idx);
   }
 
   function addAcmeWebhook() {
@@ -347,24 +482,54 @@
   async function saveAcme(e) {
     e.preventDefault();
     if (saving) return;
+    if (!acmeDraft.dns_provider) {
+      showToast(lang === 'en' ? 'Add and select a DNS Provider account first' : '请先在上方添加并选择 DNS 服务商账号', 'error');
+      return;
+    }
+    const orig = acmeEditIdx >= 0 ? settingsJson.acme[acmeEditIdx] : null;
+    const resolvedEabKey = resolveSecretInput(orig?.eab_hmac_key, acmeEabKeyInput, acmeEabKeyClear);
+    const hasKid = Boolean(acmeDraft.eab_kid?.trim());
+    const hasHmac = Boolean(resolvedEabKey);
+    if (hasKid !== hasHmac) {
+      showToast(lang === 'en' ? 'EAB Key ID and HMAC Key must both be configured or both empty' : 'EAB Key ID 与 HMAC Key 必须同时配置或同时留空', 'error');
+      return;
+    }
+    if (
+      acmeDraft.enabled &&
+      acmeDraft.use_for_admin &&
+      (settingsJson?.acme || []).some((other, i) => i !== acmeEditIdx && other.enabled && other.use_for_admin)
+    ) {
+      showToast(lang === 'en' ? 'Only one enabled ACME rule can be used for Admin HTTPS' : '最多只允许一条已启用 ACME 规则用作管理后台证书', 'error');
+      return;
+    }
+    for (let i = 0; i < acmeHookEdits.length; i++) {
+      const wh = acmeHookEdits[i];
+      const u = resolveSecretInput(wh.urlOrig, wh.urlInput, wh.urlClear);
+      if (!u) {
+        showToast(lang === 'en' ? `Webhook #${i + 1} URL is required` : `Webhook #${i + 1} URL 不能为空`, 'error');
+        return;
+      }
+      if (wh.include_private_key && wh.urlInput.trim() && !wh.urlInput.trim().startsWith('https://')) {
+        showToast(lang === 'en' ? `Webhook #${i + 1} with private key must use https://` : `携带私钥的 Webhook #${i + 1} 必须使用 https://`, 'error');
+        return;
+      }
+    }
+
     saving = true;
     try {
-      const orig = acmeEditIdx >= 0 ? settingsJson.acme[acmeEditIdx] : null;
+      acmeDraft.domain = String(acmeDraft.domain || '').trim();
       acmeDraft.extra_domains = splitCsv(acmeExtraCsv);
       acmeDraft.renew_before_days = Number(acmeDraft.renew_before_days || 30);
       acmeDraft.propagation_timeout_secs = Number(acmeDraft.propagation_timeout_secs || 180);
-      acmeDraft.eab_hmac_key = resolveSecretInput(orig?.eab_hmac_key, acmeEabKeyInput, acmeEabKeyClear);
+      acmeDraft.eab_hmac_key = resolvedEabKey;
 
       const renames = [];
-      if (acmeEditIdx >= 0 && acmeOrigDomain && acmeOrigDomain !== acmeDraft.domain) {
-        renames.push({ from: `acme.${acmeOrigDomain}`, to: `acme.${acmeDraft.domain}` });
-      }
       const oldDomainPrefix = `acme.${acmeOrigDomain || acmeDraft.domain}`;
       const newDomainPrefix = `acme.${acmeDraft.domain}`;
 
-      // 构建 deploy_hooks 并追踪 webhook 下标，防止新增/删除 copy_to_dir 移位丢失密文
+      // 先推送具体的 webhook 索引前移重命名，再推送外层域名重命名，确保精准匹配不串位
       const builtHooks = acmeHookEdits.map((wh, newIdx) => {
-        if (wh.origIdx >= 0 && wh.origIdx !== newIdx && acmeEditIdx >= 0) {
+        if (wh.origIdx >= 0 && (wh.origIdx !== newIdx || (acmeOrigDomain && acmeOrigDomain !== acmeDraft.domain)) && acmeEditIdx >= 0) {
           renames.push({
             from: `${oldDomainPrefix}.deploy_hooks.${wh.origIdx}.url`,
             to: `${newDomainPrefix}.deploy_hooks.${newIdx}.url`,
@@ -376,8 +541,12 @@
           include_private_key: wh.include_private_key,
         };
       });
-      if (acmeCopyDir.trim()) {
-        builtHooks.push({ kind: 'copy_to_dir', dir: acmeCopyDir.trim() });
+      if (acmeEditIdx >= 0 && acmeOrigDomain && acmeOrigDomain !== acmeDraft.domain) {
+        renames.push({ from: `acme.${acmeOrigDomain}`, to: `acme.${acmeDraft.domain}` });
+      }
+      for (const dir of acmeCopyDirs) {
+        const clean = String(dir || '').trim();
+        if (clean) builtHooks.push({ kind: 'copy_to_dir', dir: clean });
       }
       acmeDraft.deploy_hooks = builtHooks;
 
@@ -391,9 +560,16 @@
   }
 
   async function toggleAcmeEnabled(idx) {
-    const next = deepClone(settingsJson);
-    next.acme[idx].enabled = !next.acme[idx].enabled;
-    await onSaveSettings(next);
+    const key = `acme:${idx}`;
+    if (busyToggleKey) return;
+    busyToggleKey = key;
+    try {
+      const next = deepClone(settingsJson);
+      next.acme[idx].enabled = !next.acme[idx].enabled;
+      await onSaveSettings(next);
+    } finally {
+      busyToggleKey = '';
+    }
   }
 
   function deleteAcme(idx) {
@@ -438,22 +614,29 @@
   let stunCfTokenInput = $state('');
   let stunCfTokenClear = $state(false);
 
-  function openStunDrawer(idx = -1) {
+  function openStunDrawer(idx = -1, cloneFrom = null) {
     stunEditIdx = idx;
-    const s = idx >= 0
-      ? deepClone(settingsJson.stun[idx])
-      : {
-          name: `nat_${(settingsJson?.stun?.length || 0) + 1}`,
-          enabled: true,
-          proto: 'udp',
-          local_port: 8443,
-          stun_server: 'stun.miwifi.com:3478',
-          stun_servers: ['stun.miwifi.com:3478', 'stun.qq.com:3478'],
-          keepalive_secs: 25,
-          webhook_url: '',
-          bind_rule: '',
-          on_change_cloudflare_redirect: null,
-        };
+    const s = cloneFrom
+      ? deepClone(cloneFrom)
+      : idx >= 0
+        ? deepClone(settingsJson.stun[idx])
+        : {
+            name: `nat_${(settingsJson?.stun?.length || 0) + 1}`,
+            enabled: true,
+            proto: 'udp',
+            local_port: 8443,
+            stun_server: 'stun.miwifi.com:3478',
+            stun_servers: ['stun.miwifi.com:3478', 'stun.qq.com:3478'],
+            keepalive_secs: 25,
+            webhook_url: '',
+            bind_rule: '',
+            on_change_cloudflare_redirect: null,
+          };
+    if (cloneFrom) {
+      s.name = `${s.name}_copy`;
+      s.webhook_url = '';
+      if (s.on_change_cloudflare_redirect) s.on_change_cloudflare_redirect.api_token = '';
+    }
     stunOrigName = idx >= 0 ? s.name : '';
     stunDraft = s;
     const allSrvs = s.stun_servers?.length ? s.stun_servers : s.stun_server ? [s.stun_server] : [];
@@ -474,6 +657,19 @@
     stunCfTokenClear = false;
     stunDrawerOpen = true;
   }
+
+  function resolveBoundRulePort(ruleName) {
+    if (!ruleName) return null;
+    const rp = (settingsJson?.reverse_proxy || []).find((r) => r.name === ruleName);
+    if (rp) return rp.listen_port;
+    const pf = (settingsJson?.port_forwards || []).find((p) => p.name === ruleName);
+    if (pf) return pf.listen_port;
+    return null;
+  }
+
+  let stunBindRuleDangling = $derived(
+    Boolean(stunDraft?.bind_rule) && resolveBoundRulePort(stunDraft.bind_rule) === null
+  );
 
   async function saveStun(e) {
     e.preventDefault();
@@ -517,9 +713,16 @@
   }
 
   async function toggleStunEnabled(idx) {
-    const next = deepClone(settingsJson);
-    next.stun[idx].enabled = !next.stun[idx].enabled;
-    await onSaveSettings(next);
+    const key = `stun:${idx}`;
+    if (busyToggleKey) return;
+    busyToggleKey = key;
+    try {
+      const next = deepClone(settingsJson);
+      next.stun[idx].enabled = !next.stun[idx].enabled;
+      await onSaveSettings(next);
+    } finally {
+      busyToggleKey = '';
+    }
   }
 
   function deleteStun(idx) {
@@ -541,7 +744,11 @@
     busyKey = `stun:${name}`;
     try {
       const r = await apiFetch(`/api/stun/${encodeURIComponent(name)}/probe`, { method: 'POST' });
-      showToast(`${name} → ${r.public_addr}`, 'success');
+      if (r.status === 'degraded') {
+        showToast(`${name} → ${r.public_addr} (${r.error || translateRuntimeStatus('degraded', t)})`, 'warn');
+      } else {
+        showToast(`${name} → ${r.public_addr}`, 'success');
+      }
       await onRefresh();
     } catch (err) {
       showToast(err.message, 'error');
@@ -551,16 +758,52 @@
     }
   }
 
+  function certDaysRemaining(unixSecs) {
+    if (!unixSecs) return null;
+    return Math.floor((unixSecs - Math.floor(Date.now() / 1000)) / 86400);
+  }
+
   let filteredDdns = $derived(
     (settingsJson?.ddns || [])
       .map((d, idx) => ({ d, idx }))
-      .filter(({ d }) => !searchQuery.trim() || `${d.name} ${d.domain} ${d.provider}`.toLowerCase().includes(searchQuery.trim().toLowerCase()))
+      .filter(({ d }) => {
+        if (filterStatus === 'enabled' && !d.enabled) return false;
+        if (filterStatus === 'disabled' && d.enabled) return false;
+        if (!searchQuery.trim()) return true;
+        return `${d.name} ${d.domain} ${d.provider}`.toLowerCase().includes(searchQuery.trim().toLowerCase());
+      })
+  );
+
+  let filteredAcme = $derived(
+    (settingsJson?.acme || [])
+      .map((a, idx) => ({ a, idx }))
+      .filter(({ a }) => {
+        if (filterStatus === 'enabled' && !a.enabled) return false;
+        if (filterStatus === 'disabled' && a.enabled) return false;
+        if (!searchQuery.trim()) return true;
+        return `${a.domain} ${(a.extra_domains || []).join(' ')} ${a.dns_provider} ${a.directory_url}`
+          .toLowerCase()
+          .includes(searchQuery.trim().toLowerCase());
+      })
+  );
+
+  let filteredStun = $derived(
+    (settingsJson?.stun || [])
+      .map((s, idx) => ({ s, idx }))
+      .filter(({ s }) => {
+        if (filterStatus === 'enabled' && !s.enabled) return false;
+        if (filterStatus === 'disabled' && s.enabled) return false;
+        if (!searchQuery.trim()) return true;
+        return `${s.name} ${s.proto} ${s.bind_rule} ${s.stun_server}`
+          .toLowerCase()
+          .includes(searchQuery.trim().toLowerCase());
+      })
   );
 </script>
 
 <svelte:window
   onkeydown={(e) => {
-    if (e.key === 'Escape') {
+    if (e.key === 'Escape' && !e.defaultPrevented && !saving) {
       if (provDrawerOpen) provDrawerOpen = false;
       else if (ddnsDrawerOpen) ddnsDrawerOpen = false;
       else if (acmeDrawerOpen) acmeDrawerOpen = false;
@@ -640,6 +883,11 @@
           <span class="search-icon"><Icons name="search" size={15} /></span>
           <input type="text" placeholder={t.search} bind:value={searchQuery} />
         </div>
+        <div class="btn-group">
+          <button type="button" class="chip {filterStatus === 'all' ? 'active' : ''}" onclick={() => filterStatus = 'all'}>{t.all}</button>
+          <button type="button" class="chip {filterStatus === 'enabled' ? 'active' : ''}" onclick={() => filterStatus = 'enabled'}>{t.enabled}</button>
+          <button type="button" class="chip {filterStatus === 'disabled' ? 'active' : ''}" onclick={() => filterStatus = 'disabled'}>{t.disabled}</button>
+        </div>
       </div>
     {/if}
 
@@ -649,50 +897,62 @@
       <div class="empty-state">{t.common.noMatches}</div>
     {:else}
       <div style="display:grid;gap:12px;">
-        {#each filteredDdns as { d, idx }}
+        {#each filteredDdns as { d, idx } (d.name)}
           {@const rt = (dashboard?.ddns || []).find((x) => x.name === d.name)}
+          {@const ddnsErrors = [rt?.ipv4?.error ? `IPv4: ${rt.ipv4.error}` : '', rt?.ipv6?.error ? `IPv6: ${rt.ipv6.error}` : '', rt?.firewall_error ? `FW: ${rt.firewall_error}` : ''].filter(Boolean)}
           <div class="subcard">
             <div class="row-between">
               <div style="min-width:0;flex:1;">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
                   <span class="status-dot {d.enabled ? (rt?.status === 'failed' ? 'danger' : rt?.status === 'synced' ? 'ok' : 'warn') : 'muted'}"></span>
-                  <span style="font-weight:700;font-size:15px;" class="mono">{d.domain}</span>
+                  <span style="font-weight:700;font-size:15px;word-break:break-all;" class="mono">{d.domain}</span>
                   <span class="badge badge-muted">{d.name}</span>
                   <span class="badge badge-info">{d.provider} ({d.records.join('+')})</span>
                   {#if rt}
-                    <span class="badge {rt.status === 'synced' ? 'badge-ok' : rt.status === 'failed' ? 'badge-danger' : 'badge-warn'}">{rt.status}</span>
+                    <span class="badge {rt.status === 'synced' ? 'badge-ok' : rt.status === 'failed' ? 'badge-danger' : 'badge-warn'}">{translateRuntimeStatus(rt.status, t)}</span>
                   {/if}
                 </div>
-                <div class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:6px;">
+                <div class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:6px;word-break:break-all;">
                   Source: {d.source.kind}
                   {#if rt?.last_ipv4} · A={rt.last_ipv4}{/if}
+                  {#if rt?.ipv4?.action && rt.ipv4.action !== 'disabled'} ({rt.ipv4.action}){/if}
                   {#if rt?.last_ipv6} · AAAA={rt.last_ipv6}{/if}
-                  {#if rt?.last_sync_unix} · Synced {formatUnixTime(rt.last_sync_unix)}{/if}
+                  {#if rt?.ipv6?.action && rt.ipv6.action !== 'disabled'} ({rt.ipv6.action}){/if}
+                  {#if rt?.last_sync_unix} · {formatUnixTime(rt.last_sync_unix)}{/if}
                 </div>
                 {#if d.split_dns_lan_ips?.length}
-                  <div class="mono" style="font-size:11px;color:var(--info);margin-top:4px;">
+                  <div class="mono" style="font-size:11px;color:var(--info);margin-top:4px;word-break:break-all;">
                     Split-DNS: {d.split_dns_lan_ips.join(', ')}
                   </div>
                 {/if}
-                {#if rt?.ipv4?.error || rt?.ipv6?.error || rt?.firewall_error}
-                  <div class="mono" style="font-size:11px;color:var(--danger);margin-top:4px;">
-                    {rt.ipv4?.error || rt.ipv6?.error || rt.firewall_error}
+                {#each ddnsErrors as errLine}
+                  <div class="mono" style="font-size:11px;color:var(--danger);margin-top:4px;word-break:break-word;">
+                    {errLine}
                   </div>
-                {/if}
+                {/each}
               </div>
               <div class="btn-group">
                 <button
                   type="button"
                   role="switch"
                   aria-checked={d.enabled}
-                  aria-label="Toggle DDNS rule"
+                  aria-label={t.nav.ddns}
                   class="switch"
+                  disabled={busyToggleKey === `ddns:${idx}`}
                   onclick={() => toggleDdnsEnabled(idx)}
                 >
                   <span class="switch-thumb"></span>
                 </button>
-                <button type="button" class="btn btn-xs btn-primary" disabled={busyKey === `ddns:${d.name}`} onclick={() => triggerDdnsSync(d.name)}>
+                <button
+                  type="button"
+                  class="btn btn-xs btn-primary"
+                  disabled={!d.enabled || busyKey === `ddns:${d.name}`}
+                  onclick={() => triggerDdnsSync(d.name)}
+                >
                   {busyKey === `ddns:${d.name}` ? '...' : t.ddns.syncNow}
+                </button>
+                <button type="button" class="btn btn-xs" title={t.clone} onclick={() => openDdnsDrawer(-1, 'wan', d)}>
+                  <Icons name="duplicate" size={13} />
                 </button>
                 <button type="button" class="btn btn-xs" onclick={() => openDdnsDrawer(idx)}>{t.edit}</button>
                 <button type="button" class="btn btn-xs btn-danger" onclick={() => deleteDdns(idx)}>{t.delete}</button>
@@ -719,33 +979,60 @@
       </button>
     </div>
 
+    {#if settingsJson.acme?.length}
+      <div class="toolbar">
+        <div class="search-wrap">
+          <span class="search-icon"><Icons name="search" size={15} /></span>
+          <input type="text" placeholder={t.search} bind:value={searchQuery} />
+        </div>
+        <div class="btn-group">
+          <button type="button" class="chip {filterStatus === 'all' ? 'active' : ''}" onclick={() => filterStatus = 'all'}>{t.all}</button>
+          <button type="button" class="chip {filterStatus === 'enabled' ? 'active' : ''}" onclick={() => filterStatus = 'enabled'}>{t.enabled}</button>
+          <button type="button" class="chip {filterStatus === 'disabled' ? 'active' : ''}" onclick={() => filterStatus = 'disabled'}>{t.disabled}</button>
+        </div>
+      </div>
+    {/if}
+
     {#if !settingsJson.acme?.length}
       <div class="empty-state">{t.common.empty}</div>
+    {:else if !filteredAcme.length}
+      <div class="empty-state">{t.common.noMatches}</div>
     {:else}
       <div style="display:grid;gap:12px;">
-        {#each settingsJson.acme as a, idx}
+        {#each filteredAcme as { a, idx } (a.domain)}
           {@const st = (dashboard?.certs || []).find((c) => c.domain === a.domain)}
+          {@const days = certDaysRemaining(st?.expires_at_unix)}
           <div class="subcard">
             <div class="row-between">
               <div style="min-width:0;flex:1;">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
                   <span class="status-dot {a.enabled ? (st?.status === 'active' ? 'ok' : st?.status === 'failed' ? 'danger' : 'warn') : 'muted'}"></span>
-                  <span style="font-weight:700;font-size:15px;" class="mono">{a.domain}</span>
+                  <span style="font-weight:700;font-size:15px;word-break:break-all;" class="mono">{a.domain}</span>
                   {#if a.extra_domains?.length}
                     <span class="badge badge-muted mono">+{a.extra_domains.length} SAN</span>
                   {/if}
                   <span class="badge badge-info">{a.directory_url}</span>
+                  {#if a.deploy_hooks?.length}
+                    <span class="badge badge-muted">{a.deploy_hooks.length} Hook</span>
+                  {/if}
                   {#if a.use_for_admin}<span class="badge badge-warn">Admin Panel</span>{/if}
                   {#if st}
-                    <span class="badge {st.status === 'active' ? 'badge-ok' : 'badge-danger'}">{st.status}</span>
+                    <span class="badge {st.status === 'active' ? (days !== null && days <= 14 ? 'badge-warn' : 'badge-ok') : st.status === 'failed' ? 'badge-danger' : 'badge-warn'}">
+                      {translateRuntimeStatus(st.status, t)}{days !== null ? ` (${days}d)` : ''}
+                    </span>
                   {/if}
                 </div>
-                <div class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:6px;">
+                <div class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:6px;word-break:break-all;">
                   DNS: {a.dns_provider} · Renew &lt; {a.renew_before_days}d
                   {#if st?.expires_at_unix} · {t.dash.expires}: {formatUnixTime(st.expires_at_unix)}{/if}
                 </div>
+                {#if st?.challenge_record}
+                  <div class="mono" style="font-size:11px;color:var(--info);margin-top:4px;word-break:break-all;">
+                    DNS-01 TXT: {st.challenge_record}
+                  </div>
+                {/if}
                 {#if st?.last_error}
-                  <div class="mono" style="font-size:11px;color:var(--danger);margin-top:4px;">{st.last_error}</div>
+                  <div class="mono" style="font-size:11px;color:var(--danger);margin-top:4px;word-break:break-word;">{st.last_error}</div>
                 {/if}
               </div>
               <div class="btn-group">
@@ -753,14 +1040,23 @@
                   type="button"
                   role="switch"
                   aria-checked={a.enabled}
-                  aria-label="Toggle ACME rule"
+                  aria-label={t.nav.acme}
                   class="switch"
+                  disabled={busyToggleKey === `acme:${idx}`}
                   onclick={() => toggleAcmeEnabled(idx)}
                 >
                   <span class="switch-thumb"></span>
                 </button>
-                <button type="button" class="btn btn-xs btn-primary" disabled={busyKey === `acme:${a.domain}`} onclick={() => triggerAcmeIssue(a.domain)}>
+                <button
+                  type="button"
+                  class="btn btn-xs btn-primary"
+                  disabled={!a.enabled || busyKey === `acme:${a.domain}`}
+                  onclick={() => triggerAcmeIssue(a.domain)}
+                >
                   {busyKey === `acme:${a.domain}` ? '...' : t.acme.issueNow}
+                </button>
+                <button type="button" class="btn btn-xs" title={t.clone} onclick={() => openAcmeDrawer(-1, a)}>
+                  <Icons name="duplicate" size={13} />
                 </button>
                 <button type="button" class="btn btn-xs" onclick={() => openAcmeDrawer(idx)}>{t.edit}</button>
                 <button type="button" class="btn btn-xs btn-danger" onclick={() => deleteAcme(idx)}>{t.delete}</button>
@@ -787,29 +1083,59 @@
       </button>
     </div>
 
+    {#if settingsJson.stun?.length}
+      <div class="toolbar">
+        <div class="search-wrap">
+          <span class="search-icon"><Icons name="search" size={15} /></span>
+          <input type="text" placeholder={t.search} bind:value={searchQuery} />
+        </div>
+        <div class="btn-group">
+          <button type="button" class="chip {filterStatus === 'all' ? 'active' : ''}" onclick={() => filterStatus = 'all'}>{t.all}</button>
+          <button type="button" class="chip {filterStatus === 'enabled' ? 'active' : ''}" onclick={() => filterStatus = 'enabled'}>{t.enabled}</button>
+          <button type="button" class="chip {filterStatus === 'disabled' ? 'active' : ''}" onclick={() => filterStatus = 'disabled'}>{t.disabled}</button>
+        </div>
+      </div>
+    {/if}
+
     {#if !settingsJson.stun?.length}
       <div class="empty-state">{t.common.empty}</div>
+    {:else if !filteredStun.length}
+      <div class="empty-state">{t.common.noMatches}</div>
     {:else}
       <div style="display:grid;gap:12px;">
-        {#each settingsJson.stun as s, idx}
+        {#each filteredStun as { s, idx } (s.name)}
           {@const st = (dashboard?.stun || []).find((x) => x.name === s.name)}
           {@const pubAddr = st?.public_addr || dashboard?.stun_public_addrs?.[s.name] || ''}
+          {@const boundPort = resolveBoundRulePort(s.bind_rule)}
           <div class="subcard">
             <div class="row-between">
               <div style="min-width:0;flex:1;">
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
                   <span class="status-dot {s.enabled ? (st?.status === 'active' ? 'ok' : st?.status === 'error' ? 'danger' : 'warn') : 'muted'}"></span>
                   <span style="font-weight:700;font-size:15px;">{s.name}</span>
-                  <span class="badge badge-info mono">{s.proto.toUpperCase()} :{s.local_port || 'auto'}</span>
+                  <span class="badge badge-info mono">
+                    {s.proto.toUpperCase()} :{s.local_port || boundPort || 'auto'}
+                  </span>
                   {#if s.bind_rule}<span class="badge badge-muted">Bind: {s.bind_rule}</span>{/if}
                   {#if s.on_change_cloudflare_redirect}<span class="badge badge-warn">CF Redirect</span>{/if}
-                  {#if st}<span class="badge {st.status === 'active' ? 'badge-ok' : 'badge-danger'}">{st.status}</span>{/if}
+                  {#if st}
+                    <span class="badge {st.status === 'active' ? 'badge-ok' : st.status === 'degraded' ? 'badge-warn' : 'badge-danger'}">
+                      {translateRuntimeStatus(st.status, t)}
+                    </span>
+                  {/if}
                 </div>
-                <div class="mono" style="font-size:13px;color:var(--info);margin-top:6px;">
+                <div class="mono" style="font-size:13px;color:var(--info);margin-top:6px;word-break:break-all;">
                   Public: {pubAddr || (lang === 'en' ? 'Not probed yet' : '等待探测...')}
                 </div>
+                {#if st?.server || st?.local_addr || st?.last_probe_unix}
+                  <div class="mono" style="font-size:11px;color:var(--text-secondary);margin-top:3px;word-break:break-all;">
+                    {#if st.local_addr}Local: {st.local_addr}{/if}
+                    {#if st.server} · Server: {st.server}{/if}
+                    {#if st.last_probe_unix} · {formatUnixTime(st.last_probe_unix)}{/if}
+                  </div>
+                {/if}
                 {#if st?.error}
-                  <div class="mono" style="font-size:11px;color:var(--danger);margin-top:4px;">{st.error}</div>
+                  <div class="mono" style="font-size:11px;color:var(--danger);margin-top:4px;word-break:break-word;">{st.error}</div>
                 {/if}
               </div>
               <div class="btn-group">
@@ -817,19 +1143,28 @@
                   type="button"
                   role="switch"
                   aria-checked={s.enabled}
-                  aria-label="Toggle STUN rule"
+                  aria-label={t.nav.stun}
                   class="switch"
+                  disabled={busyToggleKey === `stun:${idx}`}
                   onclick={() => toggleStunEnabled(idx)}
                 >
                   <span class="switch-thumb"></span>
                 </button>
                 {#if pubAddr}
-                  <button type="button" class="btn btn-xs" onclick={async () => { if (await copyText(pubAddr)) showToast(t.copied, 'success'); }}>
+                  <button type="button" class="btn btn-xs" onclick={() => copyOrToast(pubAddr)}>
                     {t.copy}
                   </button>
                 {/if}
-                <button type="button" class="btn btn-xs btn-primary" disabled={busyKey === `stun:${s.name}`} onclick={() => triggerStunProbe(s.name)}>
+                <button
+                  type="button"
+                  class="btn btn-xs btn-primary"
+                  disabled={!s.enabled || busyKey === `stun:${s.name}`}
+                  onclick={() => triggerStunProbe(s.name)}
+                >
                   {busyKey === `stun:${s.name}` ? '...' : t.stun.probeNow}
+                </button>
+                <button type="button" class="btn btn-xs" title={t.clone} onclick={() => openStunDrawer(-1, s)}>
+                  <Icons name="duplicate" size={13} />
                 </button>
                 <button type="button" class="btn btn-xs" onclick={() => openStunDrawer(idx)}>{t.edit}</button>
                 <button type="button" class="btn btn-xs btn-danger" onclick={() => deleteStun(idx)}>{t.delete}</button>
@@ -844,11 +1179,12 @@
 
 <!-- DNS 服务商账号抽屉 -->
 {#if provDrawerOpen && provDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) provDrawerOpen = false; }}>
-    <form class="drawer-panel" onsubmit={saveProvider}>
+  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) provDrawerOpen = false; }}>
+    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.dns.addAccount}>
+    <form style="display:contents;" onsubmit={saveProvider}>
       <div class="drawer-header">
-        <div class="card-title">{provEditId ? t.edit : t.add} · DNS Provider</div>
-        <button type="button" class="btn btn-sm" onclick={() => provDrawerOpen = false}>{t.cancel}</button>
+        <div class="card-title">{provEditId ? t.edit : t.add} · {t.dns.provider}</div>
+        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => provDrawerOpen = false}>{t.cancel}</button>
       </div>
       <div class="drawer-body">
         <div class="form-grid">
@@ -872,6 +1208,7 @@
           bind:value={provTokenInput}
           bind:clear={provTokenClear}
           placeholder="Paste API token"
+          required={true}
           {t}
         />
         {#if provDraft.provider !== 'cloudflare'}
@@ -882,18 +1219,27 @@
             bind:value={provSecretInput}
             bind:clear={provSecretClear}
             placeholder="Paste secret key"
+            required={true}
             {t}
           />
         {/if}
         <div class="form-grid">
           <div class="field">
             <label for="dp-zn">{t.dns.zoneName}</label>
-            <input id="dp-zn" type="text" class="mono" bind:value={provDraft.zone_name} />
+            <input
+              id="dp-zn"
+              type="text"
+              class="mono"
+              required={provDraft.provider === 'cloudflare' && Boolean(provDraft.zone_id?.trim())}
+              bind:value={provDraft.zone_name}
+            />
           </div>
-          <div class="field">
-            <label for="dp-zid">{t.dns.zoneId}</label>
-            <input id="dp-zid" type="text" class="mono" bind:value={provDraft.zone_id} />
-          </div>
+          {#if provDraft.provider === 'cloudflare'}
+            <div class="field">
+              <label for="dp-zid">{t.dns.zoneId}</label>
+              <input id="dp-zid" type="text" class="mono" bind:value={provDraft.zone_id} />
+            </div>
+          {/if}
           <div class="field">
             <label for="dp-he">{t.dns.happyDelay}</label>
             <input id="dp-he" type="number" min="100" max="2000" bind:value={provDraft.happy_eyeballs_delay_ms} />
@@ -901,20 +1247,22 @@
         </div>
       </div>
       <div class="drawer-footer">
-        <button type="button" class="btn" onclick={() => provDrawerOpen = false}>{t.cancel}</button>
+        <button type="button" class="btn" disabled={saving} onclick={() => provDrawerOpen = false}>{t.cancel}</button>
         <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
       </div>
     </form>
+    </div>
   </div>
 {/if}
 
 <!-- DDNS 规则抽屉 -->
 {#if ddnsDrawerOpen && ddnsDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) ddnsDrawerOpen = false; }}>
-    <form class="drawer-panel" onsubmit={saveDdns}>
+  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) ddnsDrawerOpen = false; }}>
+    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.nav.ddns}>
+    <form style="display:contents;" onsubmit={saveDdns}>
       <div class="drawer-header">
         <div class="card-title">{ddnsEditIdx >= 0 ? t.edit : t.add} · {t.nav.ddns}</div>
-        <button type="button" class="btn btn-sm" onclick={() => ddnsDrawerOpen = false}>{t.cancel}</button>
+        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => ddnsDrawerOpen = false}>{t.cancel}</button>
       </div>
       <div class="drawer-body">
         <div class="form-grid">
@@ -1062,10 +1410,7 @@
                 <input id="dd-chk" type="text" class="mono" bind:value={ddnsDraft.custom_http.success_keyword} />
               </div>
             </div>
-            <div class="field" style="margin-bottom:0;">
-              <label for="dd-chh">{t.ddns.httpHeaders}</label>
-              <textarea id="dd-chh" class="mono" bind:value={ddnsHttpHeadersTxt}></textarea>
-            </div>
+            <HeaderRowsEditor label={t.ddns.httpHeaders} bind:rows={ddnsHttpHeaderRows} secret={true} {t} />
           </div>
         {/if}
 
@@ -1073,25 +1418,31 @@
           <label class="check-row"><input type="checkbox" bind:checked={ddnsDraft.enabled} /> {t.enabled}</label>
           <label class="check-row"><input type="checkbox" bind:checked={ddnsRecA} /> A (IPv4)</label>
           <label class="check-row"><input type="checkbox" bind:checked={ddnsRecAAAA} /> AAAA (IPv6)</label>
-          <label class="check-row"><input type="checkbox" bind:checked={ddnsDraft.proxied} /> {t.ddns.proxied}</label>
+          {#if selectedDdnsProviderKind === 'cloudflare'}
+            <label class="check-row"><input type="checkbox" bind:checked={ddnsDraft.proxied} /> {t.ddns.proxied}</label>
+          {/if}
         </div>
 
         <div class="form-grid">
-          <div class="field">
-            <label for="dd-fw6">{t.ddns.tcpPorts}</label>
-            <input id="dd-fw6" type="text" class="mono" placeholder="5001, 8443" bind:value={ddnsTcpPortsCsv} />
-          </div>
-          <div class="field">
-            <label for="dd-fwu">{t.ddns.udpPorts}</label>
-            <input id="dd-fwu" type="text" class="mono" placeholder="51820" bind:value={ddnsUdpPortsCsv} />
-          </div>
-          <div class="field">
-            <label for="dd-split">{t.ddns.splitIps}</label>
-            <input id="dd-split" type="text" class="mono" placeholder="192.168.1.10" bind:value={ddnsSplitCsv} />
-          </div>
+          {#if ddnsDraft.source.kind === 'prefix_and_iid' || ddnsDraft.source.kind === 'neighbor_mac'}
+            <div class="field">
+              <label for="dd-fw6">{t.ddns.tcpPorts}</label>
+              <input id="dd-fw6" type="text" class="mono" placeholder="5001, 8443" bind:value={ddnsTcpPortsCsv} />
+            </div>
+            <div class="field">
+              <label for="dd-fwu">{t.ddns.udpPorts}</label>
+              <input id="dd-fwu" type="text" class="mono" placeholder="51820" bind:value={ddnsUdpPortsCsv} />
+            </div>
+          {/if}
+          {#if !ddnsDraft.domain?.trim().startsWith('*.')}
+            <div class="field">
+              <label for="dd-split">{t.ddns.splitIps}</label>
+              <input id="dd-split" type="text" class="mono" placeholder="192.168.1.10" bind:value={ddnsSplitCsv} />
+            </div>
+          {/if}
         </div>
 
-        {#if splitCsv(ddnsSplitCsv).length > 0 && networkInfo?.split_dns_path}
+        {#if !ddnsDraft.domain?.trim().startsWith('*.') && splitCsv(ddnsSplitCsv).length > 0 && networkInfo?.split_dns_path}
           <div class="banner banner-info" style="margin-bottom:10px;">
             <div style="flex:1;min-width:0;">
               <div style="font-weight:600;">{t.ddns.splitHint}</div>
@@ -1100,9 +1451,7 @@
             <button
               type="button"
               class="btn btn-xs"
-              onclick={async () => {
-                if (await copyText(`addn-hosts=${networkInfo.split_dns_path}`)) showToast(t.copied, 'success');
-              }}
+              onclick={() => copyOrToast(`addn-hosts=${networkInfo.split_dns_path}`)}
             >
               {t.copy}
             </button>
@@ -1118,7 +1467,9 @@
               <label for="dd-miss">{t.ddns.missingPolicy}</label>
               <select id="dd-miss" bind:value={ddnsDraft.on_missing_public_ip}>
                 <option value="keep_existing">keep_existing</option>
-                <option value="delete_record">delete_record</option>
+                {#if ddnsDraft.provider !== 'custom_http'}
+                  <option value="delete_record">delete_record</option>
+                {/if}
               </select>
             </div>
             <div class="field">
@@ -1129,16 +1480,18 @@
               <label for="dd-int">{t.ddns.interval}</label>
               <input id="dd-int" type="number" min="30" max="86400" bind:value={ddnsDraft.reconcile_interval_secs} />
             </div>
-            <div class="field">
-              <label for="dd-line">{t.ddns.line}</label>
-              <select id="dd-line" bind:value={ddnsDraft.line}>
-                <option value="default">default</option>
-                <option value="telecom">telecom</option>
-                <option value="unicom">unicom</option>
-                <option value="mobile">mobile</option>
-                <option value="oversea">oversea</option>
-              </select>
-            </div>
+            {#if selectedDdnsProviderKind === 'aliyun' || selectedDdnsProviderKind === 'dnspod'}
+              <div class="field">
+                <label for="dd-line">{t.ddns.line}</label>
+                <select id="dd-line" bind:value={ddnsDraft.line}>
+                  <option value="default">default</option>
+                  <option value="telecom">telecom</option>
+                  <option value="unicom">unicom</option>
+                  <option value="mobile">mobile</option>
+                  <option value="oversea">oversea</option>
+                </select>
+              </div>
+            {/if}
             <div class="field">
               <label for="dd-cmt">{t.ddns.comment}</label>
               <input id="dd-cmt" type="text" bind:value={ddnsDraft.comment} />
@@ -1147,20 +1500,22 @@
         </details>
       </div>
       <div class="drawer-footer">
-        <button type="button" class="btn" onclick={() => ddnsDrawerOpen = false}>{t.cancel}</button>
+        <button type="button" class="btn" disabled={saving} onclick={() => ddnsDrawerOpen = false}>{t.cancel}</button>
         <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
       </div>
     </form>
+    </div>
   </div>
 {/if}
 
 <!-- ACME 证书抽屉 -->
 {#if acmeDrawerOpen && acmeDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) acmeDrawerOpen = false; }}>
-    <form class="drawer-panel" onsubmit={saveAcme}>
+  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) acmeDrawerOpen = false; }}>
+    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.nav.acme}>
+    <form style="display:contents;" onsubmit={saveAcme}>
       <div class="drawer-header">
         <div class="card-title">{acmeEditIdx >= 0 ? t.edit : t.add} · {t.nav.acme}</div>
-        <button type="button" class="btn btn-sm" onclick={() => acmeDrawerOpen = false}>{t.cancel}</button>
+        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => acmeDrawerOpen = false}>{t.cancel}</button>
       </div>
       <div class="drawer-body">
         <div class="form-grid">
@@ -1175,7 +1530,10 @@
           <div class="field">
             <label for="ac-prov">{t.acme.dnsProvider}</label>
             <select id="ac-prov" bind:value={acmeDraft.dns_provider} required>
-              {#each Object.keys(settingsJson.dns_providers || {}) as pid}
+              {#if !Object.keys(settingsJson.dns_providers || {}).length}
+                <option value="">{lang === 'en' ? '— Add DNS Provider first —' : '— 请先添加 DNS 账号 —'}</option>
+              {/if}
+              {#each Object.keys(settingsJson.dns_providers || {}) as pid (pid)}
                 <option value={pid}>{pid}</option>
               {/each}
             </select>
@@ -1222,10 +1580,6 @@
             <input id="ac-dir" type="text" class="mono" bind:value={acmeDraft.cert_dir} required />
           </div>
           <div class="field">
-            <label for="ac-copy">{t.acme.copyDir}</label>
-            <input id="ac-copy" type="text" class="mono" placeholder="/mnt/usb/shared-certs" bind:value={acmeCopyDir} />
-          </div>
-          <div class="field">
             <label for="ac-rdays">{t.acme.renewDays}</label>
             <input id="ac-rdays" type="number" min="7" max="60" bind:value={acmeDraft.renew_before_days} />
           </div>
@@ -1233,6 +1587,27 @@
             <label for="ac-pto">{t.acme.propTimeout}</label>
             <input id="ac-pto" type="number" min="10" max="900" bind:value={acmeDraft.propagation_timeout_secs} />
           </div>
+        </div>
+
+        <!-- 支持多条 copy_to_dir 部署钩子，不再静默丢失第 2+ 条 -->
+        <div style="margin-bottom:12px;">
+          <div class="row-between" style="margin-bottom:6px;">
+            <span style="font-size:12.5px;font-weight:600;color:var(--text-secondary);">{t.acme.copyDir}</span>
+            <button type="button" class="btn btn-xs" onclick={addAcmeCopyDir}>+ {t.add}</button>
+          </div>
+          {#each acmeCopyDirs as _dir, cIdx (cIdx)}
+            <div style="display:flex;gap:8px;margin-bottom:6px;">
+              <input
+                type="text"
+                class="mono control-compact"
+                placeholder="/mnt/usb/shared-certs"
+                bind:value={acmeCopyDirs[cIdx]}
+              />
+              <button type="button" class="btn btn-xs btn-danger" onclick={() => removeAcmeCopyDir(cIdx)}>
+                <Icons name="trash" size={12} />
+              </button>
+            </div>
+          {/each}
         </div>
 
         <div class="form-grid">
@@ -1256,7 +1631,7 @@
             <span style="font-size:13px;font-weight:600;color:var(--text-secondary);">{t.acme.webhooks}</span>
             <button type="button" class="btn btn-xs" onclick={addAcmeWebhook}>+ {t.acme.addWebhook}</button>
           </div>
-          {#each acmeHookEdits as wh, wIdx}
+          {#each acmeHookEdits as wh, wIdx (wIdx)}
             <div class="subcard" style="margin-bottom:8px;">
               <SecretField
                 id="ac-wh-{wIdx}"
@@ -1265,6 +1640,7 @@
                 bind:value={wh.urlInput}
                 bind:clear={wh.urlClear}
                 placeholder="https://..."
+                required={true}
                 {t}
               />
               <div class="row-between">
@@ -1283,20 +1659,22 @@
         </div>
       </div>
       <div class="drawer-footer">
-        <button type="button" class="btn" onclick={() => acmeDrawerOpen = false}>{t.cancel}</button>
+        <button type="button" class="btn" disabled={saving} onclick={() => acmeDrawerOpen = false}>{t.cancel}</button>
         <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
       </div>
     </form>
+    </div>
   </div>
 {/if}
 
 <!-- STUN 规则抽屉 -->
 {#if stunDrawerOpen && stunDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) stunDrawerOpen = false; }}>
-    <form class="drawer-panel" onsubmit={saveStun}>
+  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) stunDrawerOpen = false; }}>
+    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.nav.stun}>
+    <form style="display:contents;" onsubmit={saveStun}>
       <div class="drawer-header">
         <div class="card-title">{stunEditIdx >= 0 ? t.edit : t.add} · {t.nav.stun}</div>
-        <button type="button" class="btn btn-sm" onclick={() => stunDrawerOpen = false}>{t.cancel}</button>
+        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => stunDrawerOpen = false}>{t.cancel}</button>
       </div>
       <div class="drawer-body">
         <div class="form-grid">
@@ -1314,15 +1692,32 @@
           <div class="field">
             <label for="st-port">{t.stun.localPort}</label>
             <input id="st-port" type="number" min="0" max="65535" bind:value={stunDraft.local_port} />
+            {#if stunDraft.bind_rule && Number(stunDraft.local_port) === 0}
+              {@const bp = resolveBoundRulePort(stunDraft.bind_rule)}
+              {#if bp}
+                <div class="field-hint" style="color:var(--accent);">
+                  {lang === 'en' ? `Inheriting port :${bp} from ${stunDraft.bind_rule}` : `将自动继承 ${stunDraft.bind_rule} 的端口 :${bp}`}
+                </div>
+              {/if}
+            {/if}
           </div>
           <div class="field">
             <label for="st-bind">{t.stun.bindRule}</label>
-            <select id="st-bind" bind:value={stunDraft.bind_rule}>
+            <select
+              id="st-bind"
+              bind:value={stunDraft.bind_rule}
+              onchange={() => {
+                if (stunDraft.bind_rule) stunDraft.local_port = 0;
+              }}
+            >
               <option value="">— None —</option>
-              {#each settingsJson.reverse_proxy || [] as rp}
+              {#if stunBindRuleDangling}
+                <option value={stunDraft.bind_rule}>⚠ {stunDraft.bind_rule} ({lang === 'en' ? 'missing' : '规则不存在'})</option>
+              {/if}
+              {#each settingsJson.reverse_proxy || [] as rp (rp.name)}
                 <option value={rp.name}>[Proxy] {rp.name} (:{rp.listen_port})</option>
               {/each}
-              {#each settingsJson.port_forwards || [] as pf}
+              {#each settingsJson.port_forwards || [] as pf (pf.name)}
                 <option value={pf.name}>[Forward] {pf.name} (:{pf.listen_port})</option>
               {/each}
             </select>
@@ -1402,9 +1797,10 @@
         {/if}
       </div>
       <div class="drawer-footer">
-        <button type="button" class="btn" onclick={() => stunDrawerOpen = false}>{t.cancel}</button>
+        <button type="button" class="btn" disabled={saving} onclick={() => stunDrawerOpen = false}>{t.cancel}</button>
         <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
       </div>
     </form>
+    </div>
   </div>
 {/if}

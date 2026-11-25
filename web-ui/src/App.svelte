@@ -92,11 +92,16 @@
   let containers = $state([]);
   let dockerError = $state('');
   let restartRequiredFields = $state([]);
+  let refreshing = $state(false);
+  let refreshNonce = 0;
 
-  // Web 终端按需异步加载分包（关闭时 0 字节下载）
+  // Web 终端按需异步加载分包（关闭时 0 字节下载），开启连接后切 Tab 不卸载
   let TerminalComp = $state(null);
+  let ptyLoadError = $state('');
+  let ptyEverOpened = $state(false);
   let terminalInitialTarget = $state('host');
   let terminalTargetNonce = $state(0);
+  const toastTimers = new Map();
 
   let navGroups = $derived.by(() => {
     const groups = [
@@ -185,26 +190,49 @@
     document.documentElement.setAttribute('lang', lang === 'en' ? 'en' : 'zh-CN');
   });
 
-  $effect(() => {
-    if (activeTab === 'web_terminal' && modules.web_terminal && !TerminalComp) {
-      import('./components/TerminalView.svelte').then((m) => {
+  function loadTerminalChunk() {
+    ptyLoadError = '';
+    import('./components/TerminalView.svelte')
+      .then((m) => {
         TerminalComp = m.default;
+      })
+      .catch((err) => {
+        ptyLoadError = err?.message || t.ptyLoadFailed;
       });
+  }
+
+  $effect(() => {
+    if (activeTab === 'web_terminal' && modules.web_terminal) {
+      ptyEverOpened = true;
+      if (!TerminalComp && !ptyLoadError) {
+        loadTerminalChunk();
+      }
+    }
+    if (!modules.web_terminal) {
+      ptyEverOpened = false;
     }
   });
 
-  function syncUrlHash(tab, sub = settingsSubTab) {
+  function isTabAvailable(tab) {
+    if (['dashboard', 'logs', 'settings'].includes(tab)) return true;
+    return Boolean(modules[tab]);
+  }
+
+  function syncUrlHash(tab, sub = settingsSubTab, push = false) {
     const nextHash = tab === 'settings' && sub !== 'general' ? `#settings/${sub}` : `#${tab}`;
     if (location.hash !== nextHash) {
-      history.replaceState(null, '', nextHash);
+      if (push) history.pushState(null, '', nextHash);
+      else history.replaceState(null, '', nextHash);
     }
   }
 
   function handleHashChange() {
     const { tab, sub } = parseHash();
-    if (tab !== activeTab || sub !== settingsSubTab) {
-      activeTab = tab;
-      settingsSubTab = sub;
+    const safeTab = isTabAvailable(tab) ? tab : 'dashboard';
+    if (safeTab !== tab) syncUrlHash(safeTab, 'general', false);
+    if (safeTab !== activeTab || sub !== settingsSubTab) {
+      activeTab = safeTab;
+      settingsSubTab = safeTab === 'settings' ? sub : 'general';
       refreshActiveView(true);
     }
   }
@@ -232,14 +260,34 @@
   }
 
   function dismissToast(id) {
+    const timer = toastTimers.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      toastTimers.delete(id);
+    }
     toasts = toasts.filter((x) => x.id !== id);
+  }
+
+  function pauseToast(id) {
+    const timer = toastTimers.get(id);
+    if (timer) {
+      clearTimeout(timer);
+      toastTimers.delete(id);
+    }
+  }
+
+  function resumeToast(id) {
+    const item = toasts.find((x) => x.id === id);
+    if (!item || toastTimers.has(id)) return;
+    const duration = item.type === 'error' || item.type === 'warn' ? 4000 : 2500;
+    toastTimers.set(id, setTimeout(() => dismissToast(id), duration));
   }
 
   function showToast(msg, type = 'info') {
     const id = nextToastId++;
     const duration = type === 'error' || type === 'warn' ? 6000 : 3500;
     toasts = [...toasts.slice(-3), { id, message: String(msg), type }];
-    setTimeout(() => dismissToast(id), duration);
+    toastTimers.set(id, setTimeout(() => dismissToast(id), duration));
   }
 
   function askConfirm({ title, message, confirmLabel = '', danger = true, onConfirm }) {
@@ -279,6 +327,21 @@
     return '';
   }
 
+  function clearSessionState() {
+    authenticated = false;
+    mustChangePassword = false;
+    dashboard = null;
+    settingsJson = null;
+    networkInfo = null;
+    containers = [];
+    dockerError = '';
+    logs = [];
+    logModules = [];
+    restartRequiredFields = [];
+    mobileMoreOpen = false;
+    ptyEverOpened = false;
+  }
+
   async function apiFetch(path, options = {}) {
     const res = await fetch(path, {
       headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
@@ -290,9 +353,7 @@
       throw new Error(localizeError(data.message || 'Must change initial password', lang, data.error));
     }
     if (res.status === 401 && !path.startsWith('/api/auth/')) {
-      authenticated = false;
-      dashboard = null;
-      settingsJson = null;
+      clearSessionState();
       throw new Error(t.errors.UNAUTHORIZED);
     }
     if (!res.ok) {
@@ -350,20 +411,17 @@
     applyAuthStatus(st);
     if (toastMsg) showToast(toastMsg, 'success');
     if (authenticated && !mustChangePassword) {
-      syncUrlHash(activeTab, settingsSubTab);
+      if (!isTabAvailable(activeTab)) {
+        activeTab = 'dashboard';
+      }
+      syncUrlHash(activeTab, settingsSubTab, false);
       await refreshActiveView();
     }
   }
 
   async function logout() {
     await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
-    authenticated = false;
-    mustChangePassword = false;
-    dashboard = null;
-    settingsJson = null;
-    networkInfo = null;
-    containers = [];
-    logs = [];
+    clearSessionState();
     await checkAuthStatus();
   }
 
@@ -378,55 +436,120 @@
 
   async function refreshActiveView(silent = false) {
     if (!authenticated || mustChangePassword) return;
+    const myNonce = ++refreshNonce;
+    const tab = activeTab;
+    if (!silent) refreshing = true;
     try {
-      if (['dashboard', 'reverse_proxy', 'port_forward', 'ddns', 'acme', 'stun', 'cron'].includes(activeTab)) {
-        dashboard = await apiFetch('/api/dashboard');
+      const tasks = [];
+      if (['dashboard', 'reverse_proxy', 'port_forward', 'ddns', 'acme', 'stun', 'cron'].includes(tab)) {
+        tasks.push(
+          apiFetch('/api/dashboard').then((r) => {
+            if (myNonce === refreshNonce) dashboard = r;
+          })
+        );
       } else if (!dashboard) {
-        dashboard = await apiFetch('/api/dashboard').catch(() => dashboard);
+        tasks.push(
+          apiFetch('/api/dashboard')
+            .then((r) => {
+              if (myNonce === refreshNonce) dashboard = r;
+            })
+            .catch(() => {})
+        );
       }
 
-      if (activeTab === 'logs') {
+      if (tab === 'logs') {
         const params = new URLSearchParams();
         if (logLevelFilter) params.set('level', logLevelFilter);
         if (logModuleFilter) params.set('module', logModuleFilter);
         const qs = params.toString();
-        const r = await apiFetch(`/api/logs${qs ? `?${qs}` : ''}`);
-        logs = r.entries || [];
-        logModules = r.modules || [];
-        if (r.capacity) logCapacity = r.capacity;
+        tasks.push(
+          apiFetch(`/api/logs${qs ? `?${qs}` : ''}`).then((r) => {
+            if (myNonce !== refreshNonce) return;
+            logs = r.entries || [];
+            logModules = r.modules || [];
+            if (r.capacity) logCapacity = r.capacity;
+            if (logModuleFilter && !logModules.includes(logModuleFilter)) {
+              logModuleFilter = '';
+            }
+          })
+        );
       }
 
-      if (['dashboard', 'settings', 'reverse_proxy', 'port_forward', 'ddns', 'acme', 'stun', 'cron', 'web_terminal'].includes(activeTab)) {
+      if (['dashboard', 'settings', 'reverse_proxy', 'port_forward', 'ddns', 'acme', 'stun', 'cron', 'docker', 'web_terminal'].includes(tab)) {
         if (!silent || !settingsJson) {
-          settingsJson = await apiFetch('/api/settings');
-          if (settingsJson?.modules) modules = settingsJson.modules;
+          tasks.push(
+            apiFetch('/api/settings').then((r) => {
+              if (myNonce !== refreshNonce) return;
+              settingsJson = r;
+              if (r?.modules) modules = r.modules;
+            })
+          );
         }
       }
 
-      if (['reverse_proxy', 'port_forward', 'ddns', 'acme', 'settings'].includes(activeTab)) {
-        await ensureNetworkInfo(!silent);
+      if (['reverse_proxy', 'port_forward', 'ddns', 'acme', 'settings'].includes(tab)) {
+        tasks.push(ensureNetworkInfo(!silent));
       }
 
-      if ((activeTab === 'docker' || activeTab === 'web_terminal' || activeTab === 'cron') && modules.docker) {
-        try {
-          const r = await apiFetch('/api/docker/containers');
-          containers = r.containers || [];
-          dockerError = '';
-        } catch (err) {
-          containers = [];
-          dockerError = err.message;
-        }
+      if ((tab === 'docker' || tab === 'web_terminal' || tab === 'cron') && modules.docker) {
+        tasks.push(
+          apiFetch('/api/docker/containers')
+            .then((r) => {
+              if (myNonce !== refreshNonce) return;
+              containers = r.containers || [];
+              dockerError = '';
+            })
+            .catch((err) => {
+              if (myNonce !== refreshNonce) return;
+              containers = [];
+              dockerError = err.message;
+            })
+        );
       }
+
+      await Promise.all(tasks);
     } catch (err) {
       if (!silent) showToast(err.message, 'error');
+    } finally {
+      if (myNonce === refreshNonce) refreshing = false;
+    }
+  }
+
+  async function pollIncrementalLogs() {
+    if (!authenticated || mustChangePassword || activeTab !== 'logs') return;
+    try {
+      const lastSeq = logs.length > 0 ? Math.max(...logs.map((e) => Number(e.seq || 0))) : 0;
+      const params = new URLSearchParams();
+      if (logLevelFilter) params.set('level', logLevelFilter);
+      if (logModuleFilter) params.set('module', logModuleFilter);
+      if (lastSeq > 0) params.set('after_seq', String(lastSeq));
+      const qs = params.toString();
+      const r = await apiFetch(`/api/logs${qs ? `?${qs}` : ''}`);
+      logModules = r.modules || logModules;
+      if (r.capacity) logCapacity = r.capacity;
+      if (logModuleFilter && !logModules.includes(logModuleFilter)) {
+        logModuleFilter = '';
+        await refreshActiveView(true);
+        return;
+      }
+      const incoming = r.entries || [];
+      if (lastSeq > 0 && incoming.length > 0) {
+        const merged = [...logs, ...incoming];
+        logs = merged.slice(-logCapacity);
+      } else if (lastSeq === 0) {
+        logs = incoming;
+      }
+    } catch {
+      // ignore transient live poll errors
     }
   }
 
   async function switchTab(id, sub = 'general') {
+    if (!isTabAvailable(id)) return;
     activeTab = id;
     if (id === 'settings') settingsSubTab = sub;
     mobileMoreOpen = false;
-    syncUrlHash(id, settingsSubTab);
+    syncUrlHash(id, settingsSubTab, true);
     await refreshActiveView();
   }
 
@@ -464,7 +587,7 @@
         throw new Error(localizeError(data.message, lang, data.error));
       }
       if (res.status === 401) {
-        authenticated = false;
+        clearSessionState();
         throw new Error(t.errors.UNAUTHORIZED);
       }
       if (!res.ok) {
@@ -472,7 +595,8 @@
       }
       const restartHdr = res.headers.get('x-vane-restart-required');
       if (restartHdr) {
-        restartRequiredFields = restartHdr.split(',').map((s) => s.trim()).filter(Boolean);
+        const nextFields = restartHdr.split(',').map((s) => s.trim()).filter(Boolean);
+        restartRequiredFields = [...new Set([...restartRequiredFields, ...nextFields])];
         showToast(t.restartBannerTitle, 'warn');
       } else {
         showToast(t.settingsSaved, 'success');
@@ -506,7 +630,7 @@
               firewall: { ...dashboard.firewall, lockdown: Boolean(r.lockdown) },
             };
           }
-          showToast(r.lockdown ? t.lockdownOn : t.lockdownOff, r.lockdown ? 'warn' : 'success');
+          showToast(r.lockdown ? t.lockdownEnabledToast : t.lockdownDisabledToast, r.lockdown ? 'warn' : 'success');
           dashboard = await apiFetch('/api/dashboard').catch(() => dashboard);
         } catch (err) {
           showToast(err.message, 'error');
@@ -527,11 +651,17 @@
 <svelte:window
   onhashchange={handleHashChange}
   onkeydown={(e) => {
-    if (e.key === 'Escape' && mobileMoreOpen) mobileMoreOpen = false;
+    if (e.key === 'Escape' && !e.defaultPrevented && mobileMoreOpen) mobileMoreOpen = false;
   }}
 />
 
-<ToastStack {toasts} onDismiss={dismissToast} />
+<ToastStack
+  {toasts}
+  onDismiss={dismissToast}
+  onPause={pauseToast}
+  onResume={resumeToast}
+  dismissLabel={t.common.dismiss}
+/>
 <ConfirmModal
   open={confirmState.open}
   title={confirmState.title}
@@ -548,7 +678,7 @@
   <div class="auth-shell">
     <div class="card" style="display:flex;align-items:center;gap:12px;">
       <img src="/icon.svg" alt="Vane" class="brand-icon" />
-      <span class="mono" style="font-size:14px;">Loading Vane Gateway...</span>
+      <span class="mono" style="font-size:14px;">{t.loadingGateway}</span>
     </div>
   </div>
 {:else if !authenticated || mustChangePassword}
@@ -566,6 +696,7 @@
     connError={authConnError}
     onRetryStatus={checkAuthStatus}
     {apiFetch}
+    {showToast}
     onAuthenticated={handleAuthenticated}
     onLogout={logout}
   />
@@ -577,17 +708,18 @@
         <img src="/icon.svg" alt="Vane" class="brand-icon" />
         <div>
           <div style="font-size:16px;font-weight:700;letter-spacing:-0.01em;">Vane</div>
-          <div class="mono" style="font-size:11px;color:var(--text-secondary);">IPv4 + IPv6 Dual-Stack</div>
+          <div class="mono" style="font-size:11px;color:var(--text-secondary);">{t.dualStackTag}</div>
         </div>
       </div>
 
-      {#each navGroups as group}
+      {#each navGroups as group (group.label)}
         <div class="nav-group-label">{group.label}</div>
-        {#each group.items as item}
+        {#each group.items as item (item.id)}
           {@const dot = moduleStatusDot(item.id)}
           <button
             type="button"
             class="nav-btn {activeTab === item.id ? 'active' : ''}"
+            aria-current={activeTab === item.id ? 'page' : undefined}
             onclick={() => switchTab(item.id)}
           >
             <Icons name={item.id} size={17} />
@@ -632,9 +764,9 @@
           </div>
         </div>
         <div class="btn-group">
-          <button type="button" class="btn btn-sm" onclick={() => refreshActiveView()}>
+          <button type="button" class="btn btn-sm" disabled={refreshing} onclick={() => refreshActiveView()}>
             <Icons name="refresh" size={14} />
-            <span>{t.refresh}</span>
+            <span>{refreshing ? t.common.loading : t.refresh}</span>
           </button>
           {#if dashboard?.firewall}
             <button
@@ -649,26 +781,50 @@
         </div>
       </header>
 
+      {#if dashboard?.firewall?.lockdown}
+        <div class="banner banner-danger" role="alert">
+          <div style="display:flex;gap:10px;align-items:flex-start;flex:1;min-width:0;">
+            <Icons name="shield" size={18} />
+            <div style="min-width:0;">
+              <div style="font-weight:700;">{t.lockdownActiveBannerTitle}</div>
+              <div style="font-size:12px;color:var(--text-secondary);">{t.lockdownActiveBannerDesc}</div>
+            </div>
+          </div>
+          <button type="button" class="btn btn-xs btn-primary" onclick={() => requestLockdownToggle(false)}>
+            {t.lockdownOn}
+          </button>
+        </div>
+      {/if}
+
       {#if restartRequiredFields.length > 0}
         <div class="banner banner-warn">
-          <div style="display:flex;gap:10px;align-items:flex-start;">
+          <div style="display:flex;gap:10px;align-items:flex-start;flex:1;min-width:0;">
             <Icons name="alert" size={18} />
-            <div>
+            <div style="min-width:0;">
               <div style="font-weight:700;">{t.restartBannerTitle}</div>
-              <div style="font-size:12px;color:var(--text-secondary);">
+              <div style="font-size:12px;color:var(--text-secondary);word-break:break-word;">
                 {t.restartBannerDesc} <code class="mono">{restartRequiredFields.join(', ')}</code>
               </div>
             </div>
           </div>
-          <button type="button" class="btn btn-xs" onclick={() => restartRequiredFields = []}>
+          <button type="button" class="btn btn-xs" aria-label={t.close} onclick={() => restartRequiredFields = []}>
             <Icons name="x" size={13} />
           </button>
         </div>
       {/if}
 
       {#if activeTab === 'dashboard'}
-        <DashboardView {t} {lang} {dashboard} {settingsJson} onRefresh={refreshActiveView} {apiFetch} {showToast} />
-      {:else if activeTab === 'reverse_proxy' || activeTab === 'port_forward'}
+        <DashboardView
+          {t}
+          {lang}
+          {dashboard}
+          {settingsJson}
+          onRefresh={refreshActiveView}
+          onNavigate={(tab) => switchTab(tab)}
+          {apiFetch}
+          {showToast}
+        />
+      {:else if (activeTab === 'reverse_proxy' && modules.reverse_proxy) || (activeTab === 'port_forward' && modules.port_forward)}
         <NetworkRulesView
           mode={activeTab}
           {t}
@@ -682,7 +838,7 @@
           {showToast}
           onRefresh={refreshActiveView}
         />
-      {:else if activeTab === 'ddns' || activeTab === 'acme' || activeTab === 'stun'}
+      {:else if (activeTab === 'ddns' && modules.ddns) || (activeTab === 'acme' && modules.acme) || (activeTab === 'stun' && modules.stun)}
         <DomainCertStunView
           mode={activeTab}
           {t}
@@ -696,7 +852,7 @@
           {showToast}
           onRefresh={refreshActiveView}
         />
-      {:else if activeTab === 'docker' || activeTab === 'cron' || activeTab === 'logs'}
+      {:else if (activeTab === 'docker' && modules.docker) || (activeTab === 'cron' && modules.cron) || activeTab === 'logs'}
         <OpsViews
           mode={activeTab}
           {t}
@@ -715,6 +871,7 @@
             logModuleFilter = mod;
             await refreshActiveView();
           }}
+          onPollLogsIncremental={pollIncrementalLogs}
           webTerminalEnabled={modules.web_terminal}
           onOpenContainerTerminal={openContainerShell}
           onSaveSettings={saveFullSettings}
@@ -723,21 +880,6 @@
           {showToast}
           onRefresh={refreshActiveView}
         />
-      {:else if activeTab === 'web_terminal' && modules.web_terminal}
-        {#if TerminalComp}
-          <TerminalComp
-            {t}
-            {lang}
-            initialTarget={terminalInitialTarget}
-            targetNonce={terminalTargetNonce}
-            {containers}
-            requireReauth={Boolean(settingsJson?.web_terminal?.require_reauth)}
-            {apiFetch}
-            {showToast}
-          />
-        {:else}
-          <div class="card mono">Loading PTY module...</div>
-        {/if}
       {:else if activeTab === 'settings'}
         <SettingsView
           {t}
@@ -748,28 +890,69 @@
           subTab={settingsSubTab}
           onSubTabChange={(sub) => {
             settingsSubTab = sub;
-            syncUrlHash('settings', sub);
+            syncUrlHash('settings', sub, false);
           }}
           onToggleModule={toggleModule}
           onSaveSettings={saveFullSettings}
           onAuthRefresh={refreshAuthStatusOnly}
+          onBackupRestored={(st) => {
+            applyAuthStatus(st);
+            if (Array.isArray(st?.restart_required) && st.restart_required.length > 0) {
+              restartRequiredFields = [...new Set([...restartRequiredFields, ...st.restart_required])];
+            }
+          }}
           {askConfirm}
           {apiFetch}
           {showToast}
           onRefresh={refreshActiveView}
         />
       {/if}
+
+      <!-- Web 终端加载后保持挂载（切 Tab 时用 CSS 隐藏，不误杀正在运行的 PTY 会话） -->
+      {#if modules.web_terminal && (ptyEverOpened || activeTab === 'web_terminal')}
+        <div style={activeTab === 'web_terminal' ? '' : 'display:none;'}>
+          {#if TerminalComp}
+            <TerminalComp
+              {t}
+              {lang}
+              visible={activeTab === 'web_terminal'}
+              initialTarget={terminalInitialTarget}
+              targetNonce={terminalTargetNonce}
+              {containers}
+              requireReauth={Boolean(settingsJson?.web_terminal?.require_reauth)}
+              {apiFetch}
+              {showToast}
+            />
+          {:else if ptyLoadError}
+            <div class="card row-between">
+              <span class="mono" style="color:var(--danger);font-size:13px;">{ptyLoadError}</span>
+              <button type="button" class="btn btn-sm" onclick={loadTerminalChunk}>{t.retry}</button>
+            </div>
+          {:else}
+            <div class="card mono">{t.loadingPty}</div>
+          {/if}
+        </div>
+      {/if}
     </main>
 
     <!-- 移动端底部拇指区悬浮导航栏 + 全功能抽屉入口 -->
     <nav class="mobile-tabbar">
-      {#each mobilePrimaryItems as item}
-        <button type="button" class="tab-btn {activeTab === item.id ? 'active' : ''}" onclick={() => switchTab(item.id)}>
+      {#each mobilePrimaryItems as item (item.id)}
+        <button
+          type="button"
+          class="tab-btn {activeTab === item.id ? 'active' : ''}"
+          aria-current={activeTab === item.id ? 'page' : undefined}
+          onclick={() => switchTab(item.id)}
+        >
           <Icons name={item.id} size={18} />
           <span>{item.label}</span>
         </button>
       {/each}
-      <button type="button" class="tab-btn {mobileMoreOpen ? 'active' : ''}" onclick={() => mobileMoreOpen = !mobileMoreOpen}>
+      <button
+        type="button"
+        class="tab-btn {mobileMoreOpen || !mobilePrimaryItems.some((p) => p.id === activeTab) ? 'active' : ''}"
+        onclick={() => mobileMoreOpen = !mobileMoreOpen}
+      >
         <Icons name="more" size={18} />
         <span>{t.more}</span>
       </button>
@@ -777,17 +960,29 @@
 
     {#if mobileMoreOpen}
       <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) mobileMoreOpen = false; }}>
-        <div class="drawer-panel">
+        <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.more}>
           <div class="drawer-header">
             <span class="card-title">{t.navGroups.overview} / {t.more}</span>
             <button type="button" class="btn btn-sm" onclick={() => mobileMoreOpen = false}>{t.close}</button>
           </div>
           <div class="drawer-body">
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px;">
-              {#each navItems as item}
-                <button type="button" class="btn {activeTab === item.id ? 'btn-primary' : ''}" onclick={() => switchTab(item.id)}>
+              {#each navItems as item (item.id)}
+                {@const dot = moduleStatusDot(item.id)}
+                <button
+                  type="button"
+                  class="btn {activeTab === item.id ? 'btn-primary' : ''}"
+                  style="justify-content:flex-start;min-width:0;overflow:hidden;"
+                  onclick={() => switchTab(item.id)}
+                >
                   <Icons name={item.id} size={16} />
-                  <span>{item.label}</span>
+                  <span style="overflow:hidden;text-overflow:ellipsis;">{item.label}</span>
+                  <span class="nav-meta">
+                    {#if dot}<span class="status-dot {dot}"></span>{/if}
+                    {#if typeof item.count === 'number'}
+                      <span class="nav-count num">{item.count}</span>
+                    {/if}
+                  </span>
                 </button>
               {/each}
             </div>

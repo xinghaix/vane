@@ -1,14 +1,20 @@
 <script>
   import Icons from './Icons.svelte';
+  import HeaderRowsEditor from './HeaderRowsEditor.svelte';
   import {
     splitCsv,
     joinCsv,
-    kvObjectToText,
-    textToKvObject,
+    kvObjectToRows,
+    rowsToKvObject,
+    copyText,
     deepClone,
     formatUnixTime,
     domainMatchesCert,
   } from '../lib/helpers.js';
+
+  const PROTECTED_WAN_PORTS = new Set([
+    21, 22, 23, 53, 67, 68, 80, 139, 443, 445, 1883, 2375, 2376, 3306, 4000, 5432, 6379,
+  ]);
 
   let {
     mode = 'reverse_proxy',
@@ -27,10 +33,16 @@
   let searchQuery = $state('');
   let filterStatus = $state('all'); // all | enabled | disabled
   let saving = $state(false);
+  let busyToggleKey = $state('');
+  let busyLeaseKey = $state('');
+  let customLeaseName = $state('');
+  let customLeaseMins = $state(30);
+  let nowSec = $state(Math.floor(Date.now() / 1000));
 
   // Reverse Proxy Listener & Rule Drawer 状态
   let rpDrawerOpen = $state(false);
   let rpEditIndex = $state(-1);
+  let rpOrigName = $state('');
   let rpDraft = $state(null);
 
   let ruleDrawerOpen = $state(false);
@@ -39,10 +51,23 @@
   let ruleDraft = $state(null);
   let ruleAllowedCsv = $state('');
   let ruleDeniedCsv = $state('');
-  let ruleReqSetTxt = $state('');
+  let ruleReqRows = $state([]);
   let ruleReqRemCsv = $state('');
-  let ruleRespSetTxt = $state('');
+  let ruleRespRows = $state([]);
   let ruleRespRemCsv = $state('');
+
+  // 反代门禁 WebSocket 一次性票据弹窗状态
+  let wsTicketOpen = $state(false);
+  let wsTicketListener = $state('');
+  let wsTicketPort = $state(8443);
+  let wsTicketHost = $state('');
+  let wsTicketPath = $state('/');
+  let wsTicketBusy = $state(false);
+  let wsTicketErr = $state('');
+  let wsTicketToken = $state('');
+  let wsTicketUrl = $state('');
+  let wsTicketExpiresAt = $state(0);
+  let wsTicketRemain = $state(0);
 
   // Port Forward Drawer 状态
   let pfDrawerOpen = $state(false);
@@ -52,6 +77,46 @@
   let pfAllowedCsv = $state('');
 
   let ifaceNames = $derived((networkInfo?.interfaces || []).map((i) => i.iface));
+  let stunRuleNames = $derived((settingsJson?.stun || []).map((s) => s.name).filter(Boolean));
+  let adminPorts = $derived(
+    (settingsJson?.admin?.listen_lan || [])
+      .map((a) => Number(String(a).split(':').pop()))
+      .filter((n) => n > 0)
+  );
+
+  // 切换 Tab 模式时重置搜索、筛选和抽屉状态，避免跨视图残留
+  $effect(() => {
+    void mode;
+    searchQuery = '';
+    filterStatus = 'all';
+    rpDrawerOpen = false;
+    ruleDrawerOpen = false;
+    pfDrawerOpen = false;
+    wsTicketOpen = false;
+    customLeaseName = '';
+  });
+
+  // 定时刷新当前时间戳用于端口转发租约倒计时
+  $effect(() => {
+    const timer = setInterval(() => {
+      nowSec = Math.floor(Date.now() / 1000);
+    }, 15_000);
+    return () => clearInterval(timer);
+  });
+
+  // WS 票据 30 秒倒计时
+  $effect(() => {
+    if (!wsTicketToken || !wsTicketExpiresAt) {
+      wsTicketRemain = 0;
+      return;
+    }
+    const tick = () => {
+      wsTicketRemain = Math.max(0, Math.ceil((wsTicketExpiresAt - Date.now()) / 1000));
+    };
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  });
 
   function listenerRuntime(name) {
     return (dashboard?.reverse_proxy_status || []).find((s) => s.name === name);
@@ -60,9 +125,15 @@
     return (dashboard?.port_forward_status || []).find((s) => s.name === name);
   }
 
+  function isProtectedPort(port) {
+    const p = Number(port);
+    return PROTECTED_WAN_PORTS.has(p) || adminPorts.includes(p);
+  }
+
   function statusMeta(rt, enabled) {
     if (!enabled) return { cls: 'badge-muted', dot: 'muted', text: t.common.statusDisabled };
-    const st = rt?.status || 'running';
+    if (!rt) return { cls: 'badge-muted', dot: 'muted', text: t.common.statusUnknown };
+    const st = rt.status;
     if (st === 'failed') return { cls: 'badge-danger', dot: 'danger', text: t.common.statusFailed };
     if (st === 'waiting_window') return { cls: 'badge-warn', dot: 'warn', text: t.common.statusWaiting };
     if (st === 'expired') return { cls: 'badge-danger', dot: 'danger', text: t.common.statusExpired };
@@ -134,6 +205,7 @@
 
   function openListenerDrawer(idx = -1) {
     rpEditIndex = idx;
+    rpOrigName = idx >= 0 ? settingsJson.reverse_proxy[idx].name : '';
     rpDraft = idx >= 0 ? deepClone(settingsJson.reverse_proxy[idx]) : defaultListener();
     rpDrawerOpen = true;
   }
@@ -143,12 +215,20 @@
     if (saving) return;
     saving = true;
     try {
+      rpDraft.name = String(rpDraft.name || '').trim();
       rpDraft.listen_port = Number(rpDraft.listen_port);
       rpDraft.max_concurrent_conns = Number(rpDraft.max_concurrent_conns);
       const next = deepClone(settingsJson);
-      if (rpEditIndex >= 0) next.reverse_proxy[rpEditIndex] = rpDraft;
-      else next.reverse_proxy.push(rpDraft);
-      if (await onSaveSettings(next)) rpDrawerOpen = false;
+      const renames = [];
+      if (rpEditIndex >= 0) {
+        if (rpOrigName && rpOrigName !== rpDraft.name) {
+          renames.push({ from: `reverse_proxy.${rpOrigName}`, to: `reverse_proxy.${rpDraft.name}` });
+        }
+        next.reverse_proxy[rpEditIndex] = rpDraft;
+      } else {
+        next.reverse_proxy.push(rpDraft);
+      }
+      if (await onSaveSettings(next, renames)) rpDrawerOpen = false;
     } finally {
       saving = false;
     }
@@ -171,9 +251,16 @@
   }
 
   async function toggleListenerEnabled(idx) {
-    const next = deepClone(settingsJson);
-    next.reverse_proxy[idx].enabled = !next.reverse_proxy[idx].enabled;
-    await onSaveSettings(next);
+    const key = `rp:${idx}`;
+    if (busyToggleKey) return;
+    busyToggleKey = key;
+    try {
+      const next = deepClone(settingsJson);
+      next.reverse_proxy[idx].enabled = !next.reverse_proxy[idx].enabled;
+      await onSaveSettings(next);
+    } finally {
+      busyToggleKey = '';
+    }
   }
 
   function openRuleDrawer(lIdx, rIdx = -1, preset = 'nas', cloneFrom = null) {
@@ -184,13 +271,17 @@
       : rIdx >= 0
         ? deepClone(settingsJson.reverse_proxy[lIdx].rules[rIdx])
         : defaultProxyRule(preset);
-    if (cloneFrom) r.host = `copy-${r.host}`;
+    if (cloneFrom) {
+      r.host = `copy-${r.host}`;
+      // 克隆规则不复用旧规则的 Vault 密文占位符，避免新索引 AAD 不匹配
+      r.request_headers_set = {};
+    }
     ruleDraft = r;
     ruleAllowedCsv = joinCsv(r.allowed_cidrs);
     ruleDeniedCsv = joinCsv(r.denied_cidrs);
-    ruleReqSetTxt = kvObjectToText(r.request_headers_set);
+    ruleReqRows = kvObjectToRows(r.request_headers_set);
     ruleReqRemCsv = joinCsv(r.request_headers_remove);
-    ruleRespSetTxt = kvObjectToText(r.response_headers_set);
+    ruleRespRows = kvObjectToRows(r.response_headers_set);
     ruleRespRemCsv = joinCsv(r.response_headers_remove);
     ruleDrawerOpen = true;
   }
@@ -202,9 +293,9 @@
     try {
       ruleDraft.allowed_cidrs = splitCsv(ruleAllowedCsv);
       ruleDraft.denied_cidrs = splitCsv(ruleDeniedCsv);
-      ruleDraft.request_headers_set = textToKvObject(ruleReqSetTxt);
+      ruleDraft.request_headers_set = rowsToKvObject(ruleReqRows, true);
       ruleDraft.request_headers_remove = splitCsv(ruleReqRemCsv);
-      ruleDraft.response_headers_set = textToKvObject(ruleRespSetTxt);
+      ruleDraft.response_headers_set = rowsToKvObject(ruleRespRows, false);
       ruleDraft.response_headers_remove = splitCsv(ruleRespRemCsv);
       ruleDraft.max_body_mb = Number(ruleDraft.max_body_mb || 0);
       ruleDraft.read_timeout_secs = Number(ruleDraft.read_timeout_secs || 120);
@@ -221,13 +312,21 @@
   }
 
   async function toggleRuleEnabled(lIdx, rIdx) {
-    const next = deepClone(settingsJson);
-    next.reverse_proxy[lIdx].rules[rIdx].enabled = !next.reverse_proxy[lIdx].rules[rIdx].enabled;
-    await onSaveSettings(next);
+    const key = `rule:${lIdx}:${rIdx}`;
+    if (busyToggleKey) return;
+    busyToggleKey = key;
+    try {
+      const next = deepClone(settingsJson);
+      next.reverse_proxy[lIdx].rules[rIdx].enabled = !next.reverse_proxy[lIdx].rules[rIdx].enabled;
+      await onSaveSettings(next);
+    } finally {
+      busyToggleKey = '';
+    }
   }
 
   function deleteRule(lIdx, rIdx) {
-    const r = settingsJson.reverse_proxy[lIdx].rules[rIdx];
+    const l = settingsJson.reverse_proxy[lIdx];
+    const r = l.rules[rIdx];
     askConfirm({
       title: t.common.confirmDeleteTitle,
       message: `${r.host}${r.path_prefix}`,
@@ -235,10 +334,67 @@
       danger: true,
       onConfirm: async () => {
         const next = deepClone(settingsJson);
+        const oldLen = next.reverse_proxy[lIdx].rules.length;
         next.reverse_proxy[lIdx].rules.splice(rIdx, 1);
-        await onSaveSettings(next);
+        const renames = [];
+        for (let i = rIdx + 1; i < oldLen; i++) {
+          renames.push({
+            from: `reverse_proxy.${l.name}.rules.${i}`,
+            to: `reverse_proxy.${l.name}.rules.${i - 1}`,
+          });
+        }
+        await onSaveSettings(next, renames);
       },
     });
+  }
+
+  function openWsTicketModal(listener, rule) {
+    wsTicketListener = listener.name;
+    wsTicketPort = listener.listen_port;
+    wsTicketHost = rule.host.startsWith('*.') ? `app.${rule.host.slice(2)}` : rule.host;
+    wsTicketPath = rule.path_prefix && rule.path_prefix.startsWith('/') ? rule.path_prefix : '/';
+    wsTicketToken = '';
+    wsTicketUrl = '';
+    wsTicketErr = '';
+    wsTicketExpiresAt = 0;
+    wsTicketOpen = true;
+  }
+
+  async function issueWsTicket(e) {
+    e.preventDefault();
+    if (wsTicketBusy) return;
+    wsTicketErr = '';
+    const host = wsTicketHost.trim();
+    const path = wsTicketPath.trim() || '/';
+    if (!host || host.includes('*') || host.includes('/')) {
+      wsTicketErr = lang === 'en' ? 'Enter a concrete target hostname (no wildcard)' : '请输入具体目标主机名（不可包含通配符 *）';
+      return;
+    }
+    if (!path.startsWith('/') || path.startsWith('//') || path.includes('#') || path.includes('vane_ticket=')) {
+      wsTicketErr = lang === 'en' ? 'Path must start with / and exclude # or vane_ticket=' : '路径必须以 / 开头且不可包含 # 或 vane_ticket=';
+      return;
+    }
+    const authority = `${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${wsTicketPort}`;
+    wsTicketBusy = true;
+    try {
+      const r = await apiFetch('/api/proxy/ticket', {
+        method: 'POST',
+        body: JSON.stringify({ listener: wsTicketListener, authority, path }),
+      });
+      wsTicketToken = r.ticket;
+      const sep = path.includes('?') ? '&' : '?';
+      wsTicketUrl = `wss://${authority}${path}${sep}vane_ticket=${encodeURIComponent(r.ticket)}`;
+      wsTicketExpiresAt = Date.now() + Number(r.expires_in || 30) * 1000;
+    } catch (err) {
+      wsTicketErr = err.message;
+    } finally {
+      wsTicketBusy = false;
+    }
+  }
+
+  async function copyOrToast(text) {
+    if (await copyText(text)) showToast(t.copied, 'success');
+    else showToast(t.copyFailed, 'error');
   }
 
   // ---------------- Port Forward ----------------
@@ -300,8 +456,11 @@
 
   function onPfEngineChange() {
     if (pfDraft?.engine === 'kernel_dnat') {
-      if (pfDraft.stack === 'dual') pfDraft.stack = 'ipv4_only';
+      const firstTarget = splitCsv(pfTargetsCsv)[0] || '';
+      const isV6 = firstTarget.startsWith('[');
+      if (pfDraft.stack === 'dual') pfDraft.stack = isV6 ? 'ipv6_only' : 'ipv4_only';
       pfDraft.send_proxy_protocol = 'none';
+      pfDraft.open_wan_firewall = true;
       pfAllowedCsv = '';
     }
   }
@@ -346,22 +505,39 @@
   }
 
   async function togglePfEnabled(idx) {
-    const next = deepClone(settingsJson);
-    next.port_forwards[idx].enabled = !next.port_forwards[idx].enabled;
-    await onSaveSettings(next);
+    const key = `pf:${idx}`;
+    if (busyToggleKey) return;
+    busyToggleKey = key;
+    try {
+      const next = deepClone(settingsJson);
+      next.port_forwards[idx].enabled = !next.port_forwards[idx].enabled;
+      await onSaveSettings(next);
+    } finally {
+      busyToggleKey = '';
+    }
   }
 
   async function grantLease(name, minutes) {
+    if (busyLeaseKey) return;
+    busyLeaseKey = `${name}:${minutes}`;
     try {
       await apiFetch(`/api/port-forwards/${encodeURIComponent(name)}/lease`, {
         method: 'POST',
         body: JSON.stringify({ minutes }),
       });
       showToast(minutes > 0 ? `${name}: +${minutes}m` : `${name}: ${t.pf.permanent}`, 'success');
+      customLeaseName = '';
       await onRefresh();
     } catch (err) {
       showToast(err.message, 'error');
+    } finally {
+      busyLeaseKey = '';
     }
+  }
+
+  function ruleMatchesSearch(r, q) {
+    if (!q) return true;
+    return `${r.host} ${r.path_prefix} ${r.upstream} ${r.redirect_url}`.toLowerCase().includes(q);
   }
 
   let filteredListeners = $derived(
@@ -397,8 +573,9 @@
 
 <svelte:window
   onkeydown={(e) => {
-    if (e.key === 'Escape') {
-      if (ruleDrawerOpen) ruleDrawerOpen = false;
+    if (e.key === 'Escape' && !e.defaultPrevented && !saving) {
+      if (wsTicketOpen) wsTicketOpen = false;
+      else if (ruleDrawerOpen) ruleDrawerOpen = false;
       else if (rpDrawerOpen) rpDrawerOpen = false;
       else if (pfDrawerOpen) pfDrawerOpen = false;
     }
@@ -466,8 +643,9 @@
                   type="button"
                   role="switch"
                   aria-checked={listener.enabled}
-                  aria-label="Toggle listener"
+                  aria-label={t.nav.reverse_proxy}
                   class="switch"
+                  disabled={busyToggleKey === `rp:${lIdx}`}
                   onclick={() => toggleListenerEnabled(lIdx)}
                 >
                   <span class="switch-thumb"></span>
@@ -500,60 +678,83 @@
             </div>
 
             {#if listener.rules?.length}
+              {@const qLow = searchQuery.trim().toLowerCase()}
+              {@const listenerMatchedSelf = !qLow || listener.name.toLowerCase().includes(qLow) || String(listener.listen_port).includes(qLow)}
               <div style="display:grid;gap:8px;">
                 {#each listener.rules as rule, rIdx}
-                  {@const certCov = domainMatchesCert(rule.host, settingsJson.acme, dashboard?.certs)}
-                  <div class="rule-card">
-                    <div class="row-between">
-                      <div style="min-width:0;flex:1;">
-                        <div style="font-weight:600;font-size:13.5px;word-break:break-all;" class="mono">
-                          https://{rule.host}:{listener.listen_port}{rule.path_prefix}
-                          <span style="color:var(--accent);">→</span>
-                          {#if rule.mode === 'proxy'}
-                            {rule.upstream}
-                          {:else if rule.mode === 'redirect'}
-                            [{rule.redirect_code}] {rule.redirect_url}
-                          {:else}
-                            [Static {rule.static_status}]
-                          {/if}
+                  {#if listenerMatchedSelf || ruleMatchesSearch(rule, qLow)}
+                    {@const certCov = domainMatchesCert(rule.host, settingsJson.acme, dashboard?.certs)}
+                    {@const hdrCount = Object.keys(rule.request_headers_set || {}).length + Object.keys(rule.response_headers_set || {}).length}
+                    <div class="rule-card">
+                      <div class="row-between">
+                        <div style="min-width:0;flex:1;">
+                          <div style="font-weight:600;font-size:13.5px;word-break:break-all;" class="mono">
+                            https://{rule.host}:{listener.listen_port}{rule.path_prefix}
+                            <span style="color:var(--accent);">→</span>
+                            {#if rule.mode === 'proxy'}
+                              {rule.upstream}
+                            {:else if rule.mode === 'redirect'}
+                              [{rule.redirect_code}] {rule.redirect_url}
+                            {:else}
+                              [Static {rule.static_status}]
+                            {/if}
+                          </div>
+                          <div class="btn-group" style="margin-top:6px;">
+                            <span class="badge {rule.enabled ? 'badge-ok' : 'badge-muted'}">{rule.enabled ? t.enabled : t.disabled}</span>
+                            <span class="badge badge-muted">{rule.mode}</span>
+                            {#if certCov === 'active'}
+                              <span class="badge badge-ok">{t.rp.certOk}</span>
+                            {:else if certCov === 'configured'}
+                              <span class="badge badge-info">ACME</span>
+                            {:else if listener.strict_sni}
+                              <span class="badge badge-warn">{t.rp.certMissing}</span>
+                            {/if}
+                            {#if rule.websocket && rule.mode === 'proxy'}<span class="badge badge-info">WS</span>{/if}
+                            {#if rule.auth_gate}<span class="badge badge-warn">Auth Gate</span>{/if}
+                            {#if rule.strip_prefix}<span class="badge badge-muted">Strip Prefix</span>{/if}
+                            {#if rule.mode === 'proxy' && rule.upstream?.startsWith('https://')}
+                              <span class="badge {rule.upstream_tls_mode === 'insecure_skip_verify' ? 'badge-warn' : 'badge-info'}">
+                                TLS: {rule.upstream_tls_mode}
+                              </span>
+                            {/if}
+                            {#if (rule.allowed_cidrs?.length || 0) + (rule.denied_cidrs?.length || 0) > 0}
+                              <span class="badge badge-muted">CIDR</span>
+                            {/if}
+                            {#if hdrCount > 0}
+                              <span class="badge badge-muted">{hdrCount} Hdr</span>
+                            {/if}
+                            {#if rule.mode === 'proxy' && rule.max_body_mb > 0}
+                              <span class="badge badge-muted">{rule.max_body_mb}MB</span>
+                            {/if}
+                          </div>
                         </div>
-                        <div class="btn-group" style="margin-top:6px;">
-                          <span class="badge {rule.enabled ? 'badge-ok' : 'badge-muted'}">{rule.enabled ? t.enabled : t.disabled}</span>
-                          <span class="badge badge-muted">{rule.mode}</span>
-                          {#if certCov === 'active'}
-                            <span class="badge badge-ok">{t.rp.certOk}</span>
-                          {:else if certCov === 'configured'}
-                            <span class="badge badge-info">ACME</span>
-                          {:else if listener.strict_sni}
-                            <span class="badge badge-warn">{t.rp.certMissing}</span>
+                        <div class="btn-group">
+                          {#if listener.enabled && rule.enabled && rule.mode === 'proxy' && rule.auth_gate && rule.websocket}
+                            <button type="button" class="btn btn-xs" onclick={() => openWsTicketModal(listener, rule)}>
+                              <Icons name="key" size={12} />
+                              <span>{t.rp.wsTicketBtn}</span>
+                            </button>
                           {/if}
-                          {#if rule.websocket && rule.mode === 'proxy'}<span class="badge badge-info">WS</span>{/if}
-                          {#if rule.auth_gate}<span class="badge badge-warn">Auth Gate</span>{/if}
-                          {#if rule.strip_prefix}<span class="badge badge-muted">Strip Prefix</span>{/if}
-                          {#if rule.mode === 'proxy' && rule.upstream?.startsWith('https://')}
-                            <span class="badge badge-info">TLS: {rule.upstream_tls_mode}</span>
-                          {/if}
+                          <button
+                            type="button"
+                            role="switch"
+                            aria-checked={rule.enabled}
+                            aria-label={t.rp.addRule}
+                            class="switch"
+                            disabled={busyToggleKey === `rule:${lIdx}:${rIdx}`}
+                            onclick={() => toggleRuleEnabled(lIdx, rIdx)}
+                          >
+                            <span class="switch-thumb"></span>
+                          </button>
+                          <button type="button" class="btn btn-xs" title={t.clone} onclick={() => openRuleDrawer(lIdx, -1, 'nas', rule)}>
+                            <Icons name="duplicate" size={13} />
+                          </button>
+                          <button type="button" class="btn btn-xs" onclick={() => openRuleDrawer(lIdx, rIdx)}>{t.edit}</button>
+                          <button type="button" class="btn btn-xs btn-danger" onclick={() => deleteRule(lIdx, rIdx)}>{t.delete}</button>
                         </div>
-                      </div>
-                      <div class="btn-group">
-                        <button
-                          type="button"
-                          role="switch"
-                          aria-checked={rule.enabled}
-                          aria-label="Toggle host rule"
-                          class="switch"
-                          onclick={() => toggleRuleEnabled(lIdx, rIdx)}
-                        >
-                          <span class="switch-thumb"></span>
-                        </button>
-                        <button type="button" class="btn btn-xs" title={t.clone} onclick={() => openRuleDrawer(lIdx, -1, 'nas', rule)}>
-                          <Icons name="duplicate" size={13} />
-                        </button>
-                        <button type="button" class="btn btn-xs" onclick={() => openRuleDrawer(lIdx, rIdx)}>{t.edit}</button>
-                        <button type="button" class="btn btn-xs btn-danger" onclick={() => deleteRule(lIdx, rIdx)}>{t.delete}</button>
                       </div>
                     </div>
-                  </div>
+                  {/if}
                 {/each}
               </div>
             {:else}
@@ -603,10 +804,10 @@
       <div class="empty-state">{t.common.noMatches}</div>
     {:else}
       <div style="display:grid;gap:12px;">
-        {#each filteredPortForwards as { pf, idx }}
-          {@const nowSec = Math.floor(Date.now() / 1000)}
+        {#each filteredPortForwards as { pf, idx } (pf.name)}
           {@const rt = pfRuntime(pf.name)}
           {@const sm = statusMeta(rt, pf.enabled)}
+          {@const famLabel = rt ? [rt.bound_v4 ? 'v4' : '', rt.bound_v6 ? 'v6' : ''].filter(Boolean).join('+') : ''}
           <div class="subcard">
             <div class="row-between">
               <div style="min-width:0;flex:1;">
@@ -614,8 +815,14 @@
                   <span class="status-dot {sm.dot}"></span>
                   <span style="font-weight:700;font-size:15px;">{pf.name}</span>
                   <span class="badge badge-info mono">:{pf.listen_port}/{pf.proto} ({pf.stack})</span>
-                  <span class="badge {sm.cls}">{sm.text}{#if rt && rt.active_conns > 0} · {rt.active_conns}c{/if}</span>
+                  <span class="badge {sm.cls}">{sm.text}{#if famLabel} · {famLabel}{/if}{#if rt && rt.active_conns > 0} · {rt.active_conns}c{/if}</span>
                   <span class="badge badge-muted">{pf.engine}</span>
+                  {#if pf.open_wan_firewall || pf.engine === 'kernel_dnat'}
+                    <span class="badge badge-warn">WAN Open</span>
+                  {/if}
+                  {#if pf.allowed_cidrs?.length}
+                    <span class="badge badge-muted">CIDR ({pf.allowed_cidrs.length})</span>
+                  {/if}
                   {#if pf.send_proxy_protocol !== 'none'}
                     <span class="badge badge-info">PP {pf.send_proxy_protocol}</span>
                   {/if}
@@ -624,30 +831,38 @@
                   {/if}
                   {#if pf.expire_at_unix > 0}
                     <span class="badge {pf.expire_at_unix > nowSec ? 'badge-ok' : 'badge-danger'} mono">
-                      Lease: {pf.expire_at_unix > nowSec ? `${Math.ceil((pf.expire_at_unix - nowSec) / 60)}m` : `Expired (${formatUnixTime(pf.expire_at_unix)})`}
+                      Lease: {pf.expire_at_unix > nowSec ? `${Math.ceil((pf.expire_at_unix - nowSec) / 60)}m` : `${t.common.statusExpired} (${formatUnixTime(pf.expire_at_unix)})`}
                     </span>
                   {/if}
                 </div>
-                <div class="mono" style="font-size:12.5px;color:var(--text-secondary);margin-top:6px;">
+                <div class="mono" style="font-size:12.5px;color:var(--text-secondary);margin-top:6px;word-break:break-all;">
                   Targets ({pf.load_balance}): {(pf.targets?.length ? pf.targets : [pf.target]).join(', ')}
                   {#if pf.bind_interface} · via {pf.bind_interface}{/if}
                 </div>
                 {#if rt?.last_error}
-                  <div class="mono" style="font-size:11.5px;color:var(--danger);margin-top:4px;">{rt.last_error}</div>
+                  <div class="mono" style="font-size:11.5px;color:var(--danger);margin-top:4px;word-break:break-word;">{rt.last_error}</div>
                 {/if}
               </div>
               <div class="btn-group">
-                <button type="button" class="btn btn-xs" onclick={() => grantLease(pf.name, 15)}>+15m</button>
-                <button type="button" class="btn btn-xs" onclick={() => grantLease(pf.name, 60)}>+1h</button>
+                <button type="button" class="btn btn-xs" disabled={Boolean(busyLeaseKey)} onclick={() => grantLease(pf.name, 15)}>+15m</button>
+                <button type="button" class="btn btn-xs" disabled={Boolean(busyLeaseKey)} onclick={() => grantLease(pf.name, 60)}>+1h</button>
+                <button
+                  type="button"
+                  class="btn btn-xs"
+                  onclick={() => { customLeaseName = customLeaseName === pf.name ? '' : pf.name; customLeaseMins = 30; }}
+                >
+                  +…m
+                </button>
                 {#if pf.expire_at_unix > 0}
-                  <button type="button" class="btn btn-xs" title={t.pf.permanent} onclick={() => grantLease(pf.name, 0)}>∞</button>
+                  <button type="button" class="btn btn-xs" disabled={Boolean(busyLeaseKey)} title={t.pf.permanent} onclick={() => grantLease(pf.name, 0)}>∞</button>
                 {/if}
                 <button
                   type="button"
                   role="switch"
                   aria-checked={pf.enabled}
-                  aria-label="Toggle port forward"
+                  aria-label={t.nav.port_forward}
                   class="switch"
+                  disabled={busyToggleKey === `pf:${idx}`}
                   onclick={() => togglePfEnabled(idx)}
                 >
                   <span class="switch-thumb"></span>
@@ -659,6 +874,27 @@
                 <button type="button" class="btn btn-xs btn-danger" onclick={() => deletePortForward(idx)}>{t.delete}</button>
               </div>
             </div>
+            {#if customLeaseName === pf.name}
+              <div class="btn-group" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border-subtle);">
+                <input
+                  type="number"
+                  min="1"
+                  max="1440"
+                  class="mono control-compact"
+                  style="width:110px;"
+                  bind:value={customLeaseMins}
+                />
+                <span style="font-size:12px;color:var(--text-secondary);">min (1~1440)</span>
+                <button
+                  type="button"
+                  class="btn btn-xs btn-primary"
+                  disabled={Boolean(busyLeaseKey)}
+                  onclick={() => grantLease(pf.name, Math.max(1, Math.min(1440, Number(customLeaseMins) || 30)))}
+                >
+                  {t.confirmAction}
+                </button>
+              </div>
+            {/if}
           </div>
         {/each}
       </div>
@@ -668,11 +904,12 @@
 
 <!-- 反代监听器抽屉 -->
 {#if rpDrawerOpen && rpDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) rpDrawerOpen = false; }}>
-    <form class="drawer-panel" onsubmit={saveListener}>
+  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) rpDrawerOpen = false; }}>
+    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.nav.reverse_proxy}>
+    <form style="display:contents;" onsubmit={saveListener}>
       <div class="drawer-header">
         <div class="card-title">{rpEditIndex >= 0 ? t.edit : t.add} · {t.nav.reverse_proxy}</div>
-        <button type="button" class="btn btn-sm" onclick={() => rpDrawerOpen = false}>{t.cancel}</button>
+        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => rpDrawerOpen = false}>{t.cancel}</button>
       </div>
       <div class="drawer-body">
         <div class="form-grid">
@@ -697,6 +934,9 @@
             <input id="rp-maxc" type="number" min="1" max="4096" bind:value={rpDraft.max_concurrent_conns} required />
           </div>
         </div>
+        {#if rpDraft.open_wan_firewall && isProtectedPort(rpDraft.listen_port)}
+          <div class="banner banner-warn" style="margin-bottom:10px;">{t.rp.protectedPortWarn}</div>
+        {/if}
         <div style="display:grid;gap:4px;">
           <label class="check-row"><input type="checkbox" bind:checked={rpDraft.enabled} /> {t.enabled}</label>
           <label class="check-row"><input type="checkbox" bind:checked={rpDraft.strict_sni} /> {t.rp.strictSni}</label>
@@ -704,20 +944,22 @@
         </div>
       </div>
       <div class="drawer-footer">
-        <button type="button" class="btn" onclick={() => rpDrawerOpen = false}>{t.cancel}</button>
+        <button type="button" class="btn" disabled={saving} onclick={() => rpDrawerOpen = false}>{t.cancel}</button>
         <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
       </div>
     </form>
+    </div>
   </div>
 {/if}
 
 <!-- 反代子规则抽屉 -->
 {#if ruleDrawerOpen && ruleDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) ruleDrawerOpen = false; }}>
-    <form class="drawer-panel" onsubmit={saveRule}>
+  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) ruleDrawerOpen = false; }}>
+    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.rp.addRule}>
+    <form style="display:contents;" onsubmit={saveRule}>
       <div class="drawer-header">
         <div class="card-title">{ruleEditIndex >= 0 ? t.edit : t.add} · {t.rp.addRule}</div>
-        <button type="button" class="btn btn-sm" onclick={() => ruleDrawerOpen = false}>{t.cancel}</button>
+        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => ruleDrawerOpen = false}>{t.cancel}</button>
       </div>
       <div class="drawer-body">
         <div class="form-grid">
@@ -797,6 +1039,20 @@
               <input id="rr-rurl" type="text" class="mono" bind:value={ruleDraft.redirect_url} required />
             </div>
           </div>
+          {#if stunRuleNames.length > 0}
+            <div class="btn-group" style="margin-bottom:10px;">
+              <span style="font-size:12px;color:var(--text-muted);">{t.rp.stunInsertLabel}</span>
+              {#each stunRuleNames as sName (sName)}
+                <button
+                  type="button"
+                  class="chip mono"
+                  onclick={() => { ruleDraft.redirect_url = `https://{{stun.${sName}.public_addr}}{{path}}`; }}
+                >
+                  {sName}
+                </button>
+              {/each}
+            </div>
+          {/if}
         {:else}
           <div class="form-grid">
             <div class="field">
@@ -828,28 +1084,40 @@
                 <label for="rr-deny">{t.rp.denyCidrs}</label>
                 <input id="rr-deny" type="text" class="mono" bind:value={ruleDeniedCsv} />
               </div>
-              <div class="field">
-                <label for="rr-maxb">{t.rp.maxBodyMb}</label>
-                <input id="rr-maxb" type="number" min="0" bind:value={ruleDraft.max_body_mb} />
-              </div>
-              <div class="field">
-                <label for="rr-rto">{t.rp.readTimeout}</label>
-                <input id="rr-rto" type="number" min="1" max="86400" bind:value={ruleDraft.read_timeout_secs} />
-              </div>
+              {#if ruleDraft.mode === 'proxy'}
+                <div class="field">
+                  <label for="rr-maxb">{t.rp.maxBodyMb}</label>
+                  <input id="rr-maxb" type="number" min="0" bind:value={ruleDraft.max_body_mb} />
+                </div>
+                <div class="field">
+                  <label for="rr-rto">{t.rp.readTimeout}</label>
+                  <input id="rr-rto" type="number" min="1" max="86400" bind:value={ruleDraft.read_timeout_secs} />
+                </div>
+              {/if}
             </div>
+            {#if ruleDraft.mode === 'proxy'}
+              <HeaderRowsEditor
+                label={t.rp.reqHeadersSet}
+                bind:rows={ruleReqRows}
+                secret={true}
+                forbidProtocolHeaders={true}
+                {t}
+              />
+            {/if}
+            <HeaderRowsEditor
+              label={t.rp.respHeadersSet}
+              bind:rows={ruleRespRows}
+              secret={false}
+              forbidProtocolHeaders={true}
+              {t}
+            />
             <div class="form-grid">
-              <div class="field">
-                <label for="rr-rqset">{t.rp.reqHeadersSet}</label>
-                <textarea id="rr-rqset" class="mono" bind:value={ruleReqSetTxt}></textarea>
-              </div>
-              <div class="field">
-                <label for="rr-rsset">{t.rp.respHeadersSet}</label>
-                <textarea id="rr-rsset" class="mono" bind:value={ruleRespSetTxt}></textarea>
-              </div>
-              <div class="field">
-                <label for="rr-rqrem">{t.rp.reqHeadersRem}</label>
-                <input id="rr-rqrem" type="text" class="mono" placeholder="X-Debug, Server" bind:value={ruleReqRemCsv} />
-              </div>
+              {#if ruleDraft.mode === 'proxy'}
+                <div class="field">
+                  <label for="rr-rqrem">{t.rp.reqHeadersRem}</label>
+                  <input id="rr-rqrem" type="text" class="mono" placeholder="X-Debug, Server" bind:value={ruleReqRemCsv} />
+                </div>
+              {/if}
               <div class="field">
                 <label for="rr-rsrem">{t.rp.respHeadersRem}</label>
                 <input id="rr-rsrem" type="text" class="mono" placeholder="X-Powered-By" bind:value={ruleRespRemCsv} />
@@ -859,20 +1127,73 @@
         </details>
       </div>
       <div class="drawer-footer">
-        <button type="button" class="btn" onclick={() => ruleDrawerOpen = false}>{t.cancel}</button>
+        <button type="button" class="btn" disabled={saving} onclick={() => ruleDrawerOpen = false}>{t.cancel}</button>
         <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
       </div>
     </form>
+    </div>
+  </div>
+{/if}
+
+<!-- 反代门禁 WebSocket 一次性票据弹窗 -->
+{#if wsTicketOpen}
+  <div class="modal-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !wsTicketBusy) wsTicketOpen = false; }}>
+    <div class="modal-card" style="max-width:520px;" role="dialog" aria-modal="true" aria-label={t.rp.wsTicketTitle}>
+    <form onsubmit={issueWsTicket}>
+      <div class="row-between" style="margin-bottom:10px;">
+        <div class="card-title"><Icons name="key" size={16} />{t.rp.wsTicketTitle}</div>
+        <button type="button" class="btn btn-xs" onclick={() => wsTicketOpen = false}>{t.close}</button>
+      </div>
+      <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:12px;line-height:1.5;">{t.rp.wsTicketDesc}</p>
+      {#if wsTicketErr}
+        <div role="alert" class="badge badge-danger" style="width:100%;padding:8px 10px;border-radius:8px;margin-bottom:10px;white-space:normal;">
+          {wsTicketErr}
+        </div>
+      {/if}
+      <div class="form-grid">
+        <div class="field">
+          <label for="wst-host">{t.rp.wsTicketHost}</label>
+          <input id="wst-host" type="text" class="mono" bind:value={wsTicketHost} required />
+        </div>
+        <div class="field">
+          <label for="wst-path">{t.rp.wsTicketPath}</label>
+          <input id="wst-path" type="text" class="mono" bind:value={wsTicketPath} required />
+        </div>
+      </div>
+      {#if wsTicketToken}
+        <div class="subcard mono" style="font-size:12px;margin-bottom:12px;word-break:break-all;display:grid;gap:8px;">
+          <div class="row-between">
+            <span style="font-weight:700;">{t.rp.wsTicketReady}</span>
+            <span class="badge {wsTicketRemain > 0 ? 'badge-ok' : 'badge-danger'} num">
+              {wsTicketRemain > 0 ? `${wsTicketRemain}s` : t.rp.wsTicketExpired}
+            </span>
+          </div>
+          <div style="color:var(--accent);">{wsTicketUrl}</div>
+          <div class="btn-group">
+            <button type="button" class="btn btn-xs" onclick={() => copyOrToast(wsTicketUrl)}>{t.copy} WSS URL</button>
+            <button type="button" class="btn btn-xs" onclick={() => copyOrToast(wsTicketToken)}>{t.copy} Ticket</button>
+          </div>
+        </div>
+      {/if}
+      <div style="display:flex;justify-content:flex-end;gap:8px;">
+        <button type="button" class="btn btn-sm" onclick={() => wsTicketOpen = false}>{t.close}</button>
+        <button type="submit" class="btn btn-sm btn-primary" disabled={wsTicketBusy}>
+          {wsTicketBusy ? '...' : t.rp.wsTicketIssue}
+        </button>
+      </div>
+    </form>
+    </div>
   </div>
 {/if}
 
 <!-- 端口转发抽屉 -->
 {#if pfDrawerOpen && pfDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) pfDrawerOpen = false; }}>
-    <form class="drawer-panel" onsubmit={savePortForward}>
+  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) pfDrawerOpen = false; }}>
+    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.nav.port_forward}>
+    <form style="display:contents;" onsubmit={savePortForward}>
       <div class="drawer-header">
         <div class="card-title">{pfEditIndex >= 0 ? t.edit : t.add} · {t.nav.port_forward}</div>
-        <button type="button" class="btn btn-sm" onclick={() => pfDrawerOpen = false}>{t.cancel}</button>
+        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => pfDrawerOpen = false}>{t.cancel}</button>
       </div>
       <div class="drawer-body">
         <div class="form-grid">
@@ -920,29 +1241,37 @@
           {/if}
         </div>
 
+        {#if (pfDraft.open_wan_firewall || pfDraft.engine === 'kernel_dnat') && isProtectedPort(pfDraft.listen_port)}
+          <div class="banner banner-warn" style="margin-bottom:12px;">{t.rp.protectedPortWarn}</div>
+        {/if}
+
         {#if pfDraft.engine === 'kernel_dnat'}
           <div class="banner banner-info" style="margin-bottom:14px;">{t.pf.dnatHint}</div>
         {/if}
 
-        <div class="field">
-          <label for="pf-targets">{t.pf.targets}</label>
-          <input id="pf-targets" type="text" class="mono" placeholder="192.168.1.10:8080" bind:value={pfTargetsCsv} required />
+        <div class="form-grid">
+          <div class="field">
+            <label for="pf-targets">{t.pf.targets}</label>
+            <input id="pf-targets" type="text" class="mono" placeholder="192.168.1.10:8080" bind:value={pfTargetsCsv} required />
+          </div>
+          <div class="field">
+            <label for="pf-win">{t.pf.timeWindow}</label>
+            <input id="pf-win" type="text" class="mono" placeholder="08:00-23:30" bind:value={pfDraft.allowed_time_window} />
+          </div>
         </div>
 
         {#if pfDraft.engine !== 'kernel_dnat'}
           <div class="form-grid">
-            <div class="field">
-              <label for="pf-pp">{t.pf.proxyProto}</label>
-              <select id="pf-pp" bind:value={pfDraft.send_proxy_protocol}>
-                <option value="none">none</option>
-                <option value="v1">v1 (Text)</option>
-                <option value="v2">v2 (Binary)</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="pf-win">{t.pf.timeWindow}</label>
-              <input id="pf-win" type="text" class="mono" placeholder="08:00-23:30" bind:value={pfDraft.allowed_time_window} />
-            </div>
+            {#if pfDraft.proto !== 'udp'}
+              <div class="field">
+                <label for="pf-pp">{t.pf.proxyProto}</label>
+                <select id="pf-pp" bind:value={pfDraft.send_proxy_protocol}>
+                  <option value="none">none</option>
+                  <option value="v1">v1 (Text)</option>
+                  <option value="v2">v2 (Binary)</option>
+                </select>
+              </div>
+            {/if}
             <div class="field">
               <label for="pf-cidr">{t.pf.allowCidrs}</label>
               <input id="pf-cidr" type="text" class="mono" placeholder="192.168.0.0/16" bind:value={pfAllowedCsv} />
@@ -966,31 +1295,44 @@
                 <label for="pf-maxc">{t.pf.maxConns}</label>
                 <input id="pf-maxc" type="number" min="1" max="4096" bind:value={pfDraft.max_concurrent_conns} />
               </div>
-              <div class="field">
-                <label for="pf-tcpid">{t.pf.tcpIdle}</label>
-                <input id="pf-tcpid" type="number" min="5" max="86400" bind:value={pfDraft.tcp_idle_timeout_secs} />
-              </div>
-              <div class="field">
-                <label for="pf-udpid">{t.pf.udpIdle}</label>
-                <input id="pf-udpid" type="number" min="10" max="600" bind:value={pfDraft.udp_session_timeout_secs} />
-              </div>
-              <div class="field">
-                <label for="pf-hci">{t.pf.hcInterval}</label>
-                <input id="pf-hci" type="number" min="0" max="3600" bind:value={pfDraft.health_check_interval_secs} />
-              </div>
+              {#if pfDraft.proto !== 'udp'}
+                <div class="field">
+                  <label for="pf-tcpid">{t.pf.tcpIdle}</label>
+                  <input id="pf-tcpid" type="number" min="5" max="86400" bind:value={pfDraft.tcp_idle_timeout_secs} />
+                </div>
+                <div class="field">
+                  <label for="pf-hci">{t.pf.hcInterval}</label>
+                  <input id="pf-hci" type="number" min="0" max="3600" bind:value={pfDraft.health_check_interval_secs} />
+                </div>
+              {/if}
+              {#if pfDraft.proto !== 'tcp'}
+                <div class="field">
+                  <label for="pf-udpid">{t.pf.udpIdle}</label>
+                  <input id="pf-udpid" type="number" min="10" max="600" bind:value={pfDraft.udp_session_timeout_secs} />
+                </div>
+              {/if}
             </div>
           </details>
         {/if}
 
         <div style="display:flex;gap:18px;flex-wrap:wrap;">
           <label class="check-row"><input type="checkbox" bind:checked={pfDraft.enabled} /> {t.enabled}</label>
-          <label class="check-row"><input type="checkbox" bind:checked={pfDraft.open_wan_firewall} /> {t.pf.openWan}</label>
+          <label class="check-row">
+            <input
+              type="checkbox"
+              checked={pfDraft.engine === 'kernel_dnat' ? true : pfDraft.open_wan_firewall}
+              disabled={pfDraft.engine === 'kernel_dnat'}
+              onchange={(e) => { pfDraft.open_wan_firewall = e.currentTarget.checked; }}
+            />
+            {t.pf.openWan}
+          </label>
         </div>
       </div>
       <div class="drawer-footer">
-        <button type="button" class="btn" onclick={() => pfDrawerOpen = false}>{t.cancel}</button>
+        <button type="button" class="btn" disabled={saving} onclick={() => pfDrawerOpen = false}>{t.cancel}</button>
         <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
       </div>
     </form>
+    </div>
   </div>
 {/if}

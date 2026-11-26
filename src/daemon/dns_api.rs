@@ -1,5 +1,5 @@
 //! DNS 服务商真实 CRUD：Cloudflare v4、阿里云 RPC 与 DNSPod TC3。
-use crate::{config::DnsProviderConfig, logger, net::http_client::{shared, HttpRequest}, security::{auth::url_encode, vault::Vault}};
+use crate::{config::DnsProviderConfig, logger, net::http_client::{shared, HttpRequest, SsrfPolicy}, security::{auth::url_encode, vault::Vault}};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ring::{digest, hmac};
 use serde_json::{json, Value};
@@ -15,7 +15,7 @@ pub struct RecordSpec {
     pub ttl: u32, pub proxied: bool, pub line: String, pub comment: String,
 }
 
-pub struct DnsApi { cfg: DnsProviderConfig, endpoint: String }
+pub struct DnsApi { cfg: DnsProviderConfig, endpoint: String, ssrf_policy: SsrfPolicy }
 
 fn sha256(text: &[u8]) -> String { digest::digest(&digest::SHA256, text).as_ref().iter().map(|b| format!("{b:02x}")).collect() }
 fn sign256(key: &[u8], data: &str) -> Vec<u8> { hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data.as_bytes()).as_ref().to_vec() }
@@ -77,7 +77,11 @@ fn dnspod_line(line: &str) -> &str {
 
 impl DnsApi {
     #[cfg(test)]
-    pub(crate) fn with_test_endpoint(mut self, endpoint:String) -> Self { self.endpoint=endpoint; self }
+    pub(crate) fn with_test_endpoint(mut self, endpoint:String) -> Self {
+        self.endpoint = endpoint;
+        self.ssrf_policy = SsrfPolicy::AllowLoopback;
+        self
+    }
 
     pub fn new(id: &str, cfg: &DnsProviderConfig, vault: &Vault) -> Result<Self, String> {
         let endpoint = match cfg.provider.as_str() {
@@ -87,14 +91,24 @@ impl DnsApi {
             _ => return Err("不支持的 DNS 服务商".into()),
         };
         let mut plain = cfg.clone();
-        plain.api_token = vault.reveal_string(&format!("dns_providers.{id}.api_token"), &cfg.api_token)?;
-        plain.secret_key = vault.reveal_string(&format!("dns_providers.{id}.secret_key"), &cfg.secret_key)?;
+        let eid = crate::config::encode_secret_segment(id);
+        plain.api_token = vault.reveal_string_with_legacy(
+            &format!("dns_providers.{eid}.api_token"),
+            Some(&format!("dns_providers.{id}.api_token")),
+            &cfg.api_token,
+        )?;
+        plain.secret_key = vault.reveal_string_with_legacy(
+            &format!("dns_providers.{eid}.secret_key"),
+            Some(&format!("dns_providers.{id}.secret_key")),
+            &cfg.secret_key,
+        )?;
         if plain.api_token.is_empty() || (plain.provider != "cloudflare" && plain.secret_key.is_empty()) { return Err("DNS 服务商凭据未配置".into()); }
-        Ok(Self { cfg: plain, endpoint: endpoint.into() })
+        Ok(Self { cfg: plain, endpoint: endpoint.into(), ssrf_policy: SsrfPolicy::PublicOnly })
     }
 
     async fn cloudflare(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
         let mut request = HttpRequest::new(method, &format!("{}{path}", self.endpoint));
+        request.ssrf_policy = self.ssrf_policy;
         request.headers.insert("authorization".into(), format!("Bearer {}", self.cfg.api_token));
         request.happy_eyeballs_delay_ms = self.cfg.happy_eyeballs_delay_ms;
         if let Some(body) = body { request = request.json(&body); }
@@ -113,6 +127,7 @@ impl DnsApi {
 
     async fn rpc(&self, action: &str, payload: Value) -> Result<Value, String> {
         let mut request = HttpRequest::new("POST", &self.endpoint);
+        request.ssrf_policy = self.ssrf_policy;
         request.happy_eyeballs_delay_ms = self.cfg.happy_eyeballs_delay_ms;
         if self.cfg.provider == "aliyun" {
             let mut parameters: BTreeMap<String,String> = payload.as_object().ok_or("非法 RPC 参数")?.iter()

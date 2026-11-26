@@ -75,3 +75,64 @@ async fn vault_secrets_are_decrypted_and_real_http_is_sent() {
     assert!(request.contains("message"));
     assert!(!request.contains("enc:v1:"));
 }
+
+#[tokio::test]
+async fn external_notifications_redact_secrets_and_strip_control_chars() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/notify", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            let mut part = [0; 1024];
+            let n = stream.read(&mut part).await.unwrap();
+            assert!(n > 0);
+            bytes.extend_from_slice(&part[..n]);
+            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|v| v.trim().parse().ok())
+                    })
+                    .unwrap();
+                if bytes.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .await
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    });
+    let vault = Vault::from_master(&[7; 32]);
+    let cfg = NotificationConfig {
+        name: "hook".into(),
+        enabled: true,
+        url,
+        ..Default::default()
+    };
+    let mut all = crate::config::Config::default();
+    all.notifications.push(cfg);
+    broadcast_event(
+        &all,
+        &vault,
+        "cron_failed",
+        "Cron \x1b[31mError\r\nInjected token=top_secret_1",
+        "stderr: Authorization: Bearer super_jwt_val\npassword=my_secret_pw\x00enc:v1:QUJDREVGRw==",
+        "error",
+    )
+    .await;
+    let raw = task.await.unwrap();
+    let body = raw.split_once("\r\n\r\n").unwrap().1;
+    assert!(!body.contains("top_secret_1"), "body leaked secret: {body}");
+    assert!(!body.contains("super_jwt_val"), "body leaked bearer: {body}");
+    assert!(!body.contains("my_secret_pw"), "body leaked password: {body}");
+    assert!(!body.contains("QUJDREVGRw"), "body leaked enc:v1: {body}");
+    assert!(!body.contains("\\u001b"), "body leaked ESC control char: {body}");
+    assert!(!body.contains("\\u0000"), "body leaked NUL control char: {body}");
+}

@@ -28,12 +28,28 @@ impl Drop for TempSock {
 }
 
 #[tokio::test]
-async fn missing_socket_returns_real_error_not_fake_empty_list() {
+async fn missing_non_socket_and_symlink_return_uniform_error_without_existence_oracle() {
     let cfg = DockerConfig::default();
-    let err = list_containers("/tmp/vane_nonexistent_docker_99999.sock", &cfg)
+    let err_missing = list_containers("/tmp/vane_nonexistent_docker_99999.sock", &cfg)
         .await
         .unwrap_err();
-    assert!(err.contains("不存在"));
+    assert!(err_missing.contains("不存在"));
+
+    let reg = std::env::temp_dir().join(format!("vane_not_sock_{}.txt", crate::config::random_nonce()));
+    std::fs::write(&reg, b"plain").unwrap();
+    let err_reg = list_containers(reg.to_str().unwrap(), &cfg).await.unwrap_err();
+    let _ = std::fs::remove_file(&reg);
+
+    let real_sock = TempSock::new();
+    let _listener = UnixListener::bind(&real_sock.0).unwrap();
+    let sym = std::env::temp_dir().join(format!("vane_sym_sock_{}.sock", crate::config::random_nonce()));
+    std::os::unix::fs::symlink(&real_sock.0, &sym).unwrap();
+    let err_sym = list_containers(sym.to_str().unwrap(), &cfg).await.unwrap_err();
+    let _ = std::fs::remove_file(&sym);
+
+    // 缺失路径、普通文件与符号链接必须返回完全一致的错误消息，消除存在性预言机
+    assert_eq!(err_missing, err_reg);
+    assert_eq!(err_missing, err_sym);
 }
 
 #[tokio::test]
@@ -48,7 +64,7 @@ async fn unix_socket_chunked_list_id_protection_logs_demux_and_prune_work() {
                 Json(json!([
                     {
                         "Id": "a1b2c3d4e5f600001111222233334444555566667777888899990000aaaabbbb",
-                        "Names": ["/vane"],
+                        "Names": ["/vane_alias", "/vane"],
                         "Image": "ghcr.io/xinghaix/vane:latest",
                         "State": "running",
                         "Status": "Up 2 hours"
@@ -72,13 +88,11 @@ async fn unix_socket_chunked_list_id_protection_logs_demux_and_prune_work() {
             get(|| async {
                 // 构造两帧 Docker 8 字节多路复用流（stdout + stderr）
                 let mut mux = Vec::new();
-                let line1 = b"hello stdout
-";
+                let line1 = b"hello stdout\n";
                 mux.extend_from_slice(&[1, 0, 0, 0]);
                 mux.extend_from_slice(&(line1.len() as u32).to_be_bytes());
                 mux.extend_from_slice(line1);
-                let line2 = b"warn stderr
-";
+                let line2 = b"warn stderr\n";
                 mux.extend_from_slice(&[2, 0, 0, 0]);
                 mux.extend_from_slice(&(line2.len() as u32).to_be_bytes());
                 mux.extend_from_slice(line2);
@@ -116,20 +130,21 @@ async fn unix_socket_chunked_list_id_protection_logs_demux_and_prune_work() {
     let list = list_containers(sock_str, &cfg).await.unwrap();
     assert_eq!(list.len(), 2);
     assert!(list[0].protected);
+    assert_eq!(list[0].all_names, vec!["vane_alias".to_string(), "vane".to_string()]);
     assert!(!list[1].protected);
 
-    // 试图通过短 ID 停止受保护容器 vane -> 必须被拦截！
+    // 试图通过短 ID 或次级别名停止受保护容器 vane -> 必须被拦截！
     let err = container_action(sock_str, &cfg, "a1b2c3d4e5f6", "stop").await.unwrap_err();
     assert!(err.contains("受保护容器"));
+    let err_alias = container_action(sock_str, &cfg, "vane_alias", "stop").await.unwrap_err();
+    assert!(err_alias.contains("受保护容器"));
 
     // 非保护容器重启成功
     container_action(sock_str, &cfg, "f0e1d2c3b4a5", "restart").await.unwrap();
 
     // 多路复用日志解包
     let logs = container_logs(sock_str, &cfg, "jellyfin", Some(50)).await.unwrap();
-    assert_eq!(logs, "hello stdout
-warn stderr
-");
+    assert_eq!(logs, "hello stdout\nwarn stderr\n");
 
     // 镜像清理 dangling_only = false 与 true 参数区分
     let p_true = prune_images(sock_str, true).await.unwrap();

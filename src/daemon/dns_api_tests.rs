@@ -54,7 +54,9 @@ async fn cloudflare_discovers_zone_and_updates_then_deletes_record() {
         json!({"success":true,"result":{"id":"record-id"}}),
         json!({"success":true,"result":{"id":"record-id"}}),
     ]).await;
-    let mut api=api("cloudflare");api.endpoint=endpoint;
+    let api=api("cloudflare");
+    assert_eq!(api.ssrf_policy, SsrfPolicy::PublicOnly);
+    let api=api.with_test_endpoint(endpoint);
     let zone=api.zone("home.example.com").await.unwrap();
     let id=api.upsert(&zone,&spec()).await.unwrap();
     api.delete(&zone,&id).await.unwrap();
@@ -71,7 +73,7 @@ async fn aliyun_sends_signed_actual_record_operations() {
     let (endpoint,task)=fixture(vec![
         json!({"TotalCount":0,"DomainRecords":{"Record":[]}}),json!({"RecordId":"42"}),json!({"RecordId":"42"}),
     ]).await;
-    let mut api=api("aliyun");api.endpoint=endpoint;
+    let api=api("aliyun").with_test_endpoint(endpoint);
     let zone=api.zone("home.example.com").await.unwrap();
     let id=api.upsert(&zone,&spec()).await.unwrap();
     api.delete(&zone,&id).await.unwrap();
@@ -88,7 +90,7 @@ async fn dnspod_sends_tc3_signed_actual_record_operations() {
         json!({"Response":{"RecordCountInfo":{"TotalCount":1},"RecordList":[{"RecordId":42,"Name":"home","Type":"AAAA","Value":"2606:4700::1001"}]}}),
         json!({"Response":{"RecordId":42}}),json!({"Response":{"RequestId":"request-id"}}),
     ]).await;
-    let mut api=api("dnspod");api.endpoint=endpoint;
+    let api=api("dnspod").with_test_endpoint(endpoint);
     let zone=api.zone("home.example.com").await.unwrap();
     let id=api.upsert(&zone,&spec()).await.unwrap();
     api.delete(&zone,&id).await.unwrap();
@@ -102,7 +104,7 @@ async fn dnspod_sends_tc3_signed_actual_record_operations() {
 #[tokio::test]
 async fn provider_business_failure_is_not_success() {
     let (endpoint,task)=fixture(vec![json!({"success":false,"errors":[{"message":"contains-private-token"}]})]).await;
-    let mut api=api("cloudflare");api.endpoint=endpoint;
+    let api=api("cloudflare").with_test_endpoint(endpoint);
     let error=api.zone("home.example.com").await.unwrap_err();
     assert!(!error.contains("private-token"));
     task.await.unwrap();
@@ -114,8 +116,7 @@ async fn upsert_skips_write_when_existing_ip_matches() {
         json!({"TotalCount":1,"DomainRecords":{"Record":[{"RecordId":"77","RR":"home","Type":"AAAA","Value":"2606:4700:0000:0000:0000:0000:0000:1111","Line":"default"}]}}),
     ])
     .await;
-    let mut api = api("aliyun");
-    api.endpoint = endpoint;
+    let api = api("aliyun").with_test_endpoint(endpoint);
     let zone = Zone { id: String::new(), name: "example.com".into() };
     let id = api.upsert(&zone, &spec()).await.unwrap();
     assert_eq!(id, "77");

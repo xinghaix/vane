@@ -1,17 +1,20 @@
 //! 轻量级 /var/run/docker.sock 有界 HTTP/1.1 Unix Socket 客户端：
-//! 支持 chunked 响应流式有界读取、容器 ID 与名称双重保护拦截、多路复用日志解帧与镜像 Prune。
+//! 支持 chunked 响应流式有界读取、容器 ID 与全量名称双重保护拦截、多路复用日志解帧与镜像 Prune，
+//! 连接前以 `symlink_metadata` + `is_socket()` 统一校验防符号链接与存在性探测。
 use crate::config::DockerConfig;
 use axum::body::Body;
 use http::{Method, Request};
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::time::Duration;
 use tokio::net::UnixStream;
 
 const MAX_DOCKER_JSON_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DOCKER_LOG_BYTES: usize = 1024 * 1024;
+const INVALID_SOCKET_ERR: &str = "Docker Socket 不存在或路径非法（必须为非符号链接的本地 Unix Socket）";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContainerSummary {
@@ -19,10 +22,35 @@ pub struct ContainerSummary {
     #[serde(skip_serializing)]
     pub full_id: String,
     pub name: String,
+    #[serde(default, skip_serializing)]
+    pub all_names: Vec<String>,
     pub image: String,
     pub state: String,
     pub status: String,
     pub protected: bool,
+}
+
+/// 严格校验 Docker Socket 路径：必须为绝对路径且 `lstat` 确认其为非符号链接的 Unix Domain Socket；
+/// 对不存在、普通文件、目录、符号链接返回完全一致的错误消息，消除本地文件存在性预言机。
+pub fn validate_docker_socket_path(socket_path: &str) -> Result<(), String> {
+    if socket_path.is_empty() || socket_path.contains('\0') {
+        return Err(INVALID_SOCKET_ERR.into());
+    }
+    let path = Path::new(socket_path);
+    if !path.is_absolute() {
+        return Err(INVALID_SOCKET_ERR.into());
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() || !ft.is_socket() {
+                Err(INVALID_SOCKET_ERR.into())
+            } else {
+                Ok(())
+            }
+        }
+        Err(_) => Err(INVALID_SOCKET_ERR.into()),
+    }
 }
 
 pub fn validate_container_ident(ident: &str) -> Result<&str, String> {
@@ -81,9 +109,7 @@ async fn docker_http_request(
     max_bytes: usize,
     truncate_at_limit: bool,
 ) -> Result<(u16, Vec<u8>, bool), String> {
-    if socket_path.is_empty() || !Path::new(socket_path).exists() {
-        return Err(format!("Docker Socket 不存在或未挂载: {}", socket_path));
-    }
+    validate_docker_socket_path(socket_path)?;
     let stream = tokio::time::timeout(Duration::from_secs(5), UnixStream::connect(socket_path))
         .await
         .map_err(|_| "连接 docker.sock 超时".to_string())?
@@ -159,6 +185,7 @@ pub async fn list_containers(socket_path: &str, cfg: &DockerConfig) -> Result<Ve
                 a.iter()
                     .filter_map(|v| v.as_str())
                     .map(|s| s.trim_start_matches('/').to_string())
+                    .filter(|s| !s.is_empty())
                     .collect()
             })
             .unwrap_or_default();
@@ -171,6 +198,7 @@ pub async fn list_containers(socket_path: &str, cfg: &DockerConfig) -> Result<Ve
             id,
             full_id,
             name,
+            all_names,
             image,
             state,
             status: status_s,
@@ -180,7 +208,7 @@ pub async fn list_containers(socket_path: &str, cfg: &DockerConfig) -> Result<Ve
     Ok(out)
 }
 
-/// 校验目标标识（无论传入容器名、短 ID 还是完整 64 位 ID）是否命中受保护容器列表
+/// 校验目标标识（无论传入容器主名称、任意别名、短 ID 还是完整 64 位 ID）是否命中受保护容器列表
 pub async fn ensure_not_protected(
     socket_path: &str,
     cfg: &DockerConfig,
@@ -197,7 +225,8 @@ pub async fn ensure_not_protected(
         let id_match = c.full_id.eq_ignore_ascii_case(clean)
             || (!clean_low.is_empty() && c.full_id.to_ascii_lowercase().starts_with(&clean_low))
             || c.id.eq_ignore_ascii_case(clean)
-            || c.name.eq_ignore_ascii_case(clean);
+            || c.name.eq_ignore_ascii_case(clean)
+            || c.all_names.iter().any(|n| n.eq_ignore_ascii_case(clean));
         if id_match && c.protected {
             return Err(format!("受保护容器 {} ({}) 禁止执行 {} 操作", c.name, c.id, action));
         }

@@ -243,3 +243,114 @@ fn self_signed_certificates_never_become_active_acme_results() {
     };
     assert!(acme_store::verify(&bundle).err().unwrap().contains("自签"));
 }
+
+#[tokio::test]
+async fn acme_store_rejects_empty_single_label_bad_names_plaintext_account_and_pruned_preload() {
+    // VANE-M13: safe_name / try_safe_name 拒绝空串与 "."/".."
+    assert!(acme_store::try_safe_name("").is_err());
+    assert!(acme_store::try_safe_name(".").is_err());
+    assert!(acme_store::try_safe_name("..").is_err());
+    assert!(acme_store::try_safe_name("...").is_err());
+    assert_ne!(acme_store::safe_name("."), ".");
+    assert_ne!(acme_store::safe_name(""), "");
+
+    // VANE-M10: 内置公共 CA 启用 PublicOnly，自定义 CA 保留默认策略
+    for ca in [
+        "letsencrypt",
+        "letsencrypt_staging",
+        "zerossl",
+        "google",
+        "buypass",
+        "https://acme-v02.api.letsencrypt.org/directory",
+    ] {
+        assert_eq!(
+            AcmeTransport::for_directory(ca).ssrf_policy(),
+            crate::net::http_client::SsrfPolicy::PublicOnly
+        );
+    }
+    assert_eq!(
+        AcmeTransport::for_directory("https://step-ca.internal/acme/acme/directory").ssrf_policy(),
+        crate::net::http_client::SsrfPolicy::default()
+    );
+
+    // 签发一张含 2 个域名的测试 CA 证书，用于验证 verify 与 preload 交集过滤
+    let mut ca_params = rcgen::CertificateParams::default();
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Vane Test CA");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_kp = rcgen::KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_kp).unwrap();
+    let issuer = rcgen::Issuer::from_params(&ca_params, &ca_kp);
+
+    let mut leaf_params =
+        rcgen::CertificateParams::new(vec!["keep.example.com".into(), "pruned.example.com".into()]).unwrap();
+    leaf_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "keep.example.com");
+    leaf_params.not_before = rcgen::date_time_ymd(2025, 1, 1);
+    leaf_params.not_after = rcgen::date_time_ymd(2030, 1, 1);
+    let leaf_kp = rcgen::KeyPair::generate().unwrap();
+    let leaf_cert = leaf_params.signed_by(&leaf_kp, &issuer).unwrap();
+    let fullchain = format!("{}{}", leaf_cert.pem(), ca_cert.pem());
+    let privkey = leaf_kp.serialize_pem();
+
+    // VANE-M13: verify 拒绝空 domains 与单标签域名
+    let empty_bundle = Bundle {
+        directory: "https://ca.example/directory".into(),
+        domains: vec![],
+        certificate: fullchain.clone(),
+        private_key: privkey.clone(),
+    };
+    assert!(acme_store::verify(&empty_bundle).is_err());
+    let single_label = Bundle {
+        directory: "https://ca.example/directory".into(),
+        domains: vec!["localhost".into()],
+        certificate: fullchain.clone(),
+        private_key: privkey.clone(),
+    };
+    assert!(acme_store::verify(&single_label).is_err());
+
+    // VANE-L09: preload_cached_cert 仅加载当前 cfg.domain + extra_domains 的交集
+    let dir = std::env::temp_dir().join(format!("vane_acme_preload_{}", crate::config::random_nonce()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let valid_bundle = Bundle {
+        directory: "https://ca.example/directory".into(),
+        domains: vec!["keep.example.com".into(), "pruned.example.com".into()],
+        certificate: fullchain,
+        private_key: privkey,
+    };
+    acme_store::store(&dir.join("certs"), "keep.example.com", &valid_bundle)
+        .await
+        .unwrap();
+    let cfg = AcmeConfig {
+        enabled: true,
+        domain: "keep.example.com".into(),
+        extra_domains: vec![],
+        cert_dir: dir.join("certs").to_string_lossy().into_owned(),
+        ..Default::default()
+    };
+    let (_, _, admin_ck) = crate::net::tls_resolver::generate_self_signed_cert(&[]).unwrap();
+    let admin = Arc::new(ArcSwap::from(admin_ck));
+    let table = Arc::new(ArcSwap::from_pointee(CertTable::default()));
+    let runtime = AcmeRuntime::new(dir.clone());
+    preload_cached_cert(&cfg, &Config::default(), &table, &runtime, &admin).await;
+    assert!(table.load().exact.contains_key("keep.example.com"));
+    assert!(!table.load().exact.contains_key("pruned.example.com"));
+
+    // VANE-L03: 明文未加密的 acme-accounts/*.json 必须被 vault.open 拒绝
+    let directory = "https://ca.example/directory";
+    let hash = ring::digest::digest(
+        &ring::digest::SHA256,
+        format!("{}\n{}\n{}", directory, cfg.email, cfg.eab_kid).as_bytes(),
+    );
+    let id: String = hash.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let acc_path = dir.join("acme-accounts").join(format!("{id}.json"));
+    acme_store::atomic(acc_path, br#"{"id":"https://ca.example/acct/1"}"#.to_vec())
+        .await
+        .unwrap();
+    let vault = Vault::from_master(&[9; 32]);
+    assert!(account(&cfg, directory, &vault, &runtime).await.is_err());
+
+    let _ = std::fs::remove_dir_all(dir);
+}

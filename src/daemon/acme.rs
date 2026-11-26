@@ -148,11 +148,11 @@ async fn account(
         .join("acme-accounts")
         .join(format!("{id}.json"));
     let aad = format!("acme.account.{id}");
-    let builder = Account::builder_with_http(Box::new(AcmeTransport));
+    let builder = Account::builder_with_http(Box::new(AcmeTransport::for_directory(directory)));
     if let Some(bytes) = acme_store::read_bounded(&path, 128 * 1024).await? {
         let encoded = std::str::from_utf8(&bytes).map_err(|_| "账户文件编码错误")?;
-        let plain = vault.reveal_string(&aad, encoded)?;
-        let credentials = serde_json::from_str(&plain).map_err(|_| "账户凭据文件损坏")?;
+        let plain = vault.open(&aad, encoded)?;
+        let credentials = serde_json::from_str(plain.expose_str()).map_err(|_| "账户凭据文件损坏")?;
         return builder
             .from_credentials(credentials)
             .await
@@ -161,8 +161,10 @@ async fn account(
     let eab = if cfg.eab_kid.is_empty() {
         None
     } else {
-        let secret = vault.reveal_string(
-            &format!("acme.{}.eab_hmac_key", cfg.domain),
+        let edom = crate::config::encode_secret_segment(&cfg.domain);
+        let secret = vault.reveal_string_with_legacy(
+            &format!("acme.{}.eab_hmac_key", edom),
+            Some(&format!("acme.{}.eab_hmac_key", cfg.domain)),
             &cfg.eab_hmac_key,
         )?;
         let key = URL_SAFE_NO_PAD
@@ -318,7 +320,7 @@ async fn deploy(cfg: &AcmeConfig, vault: &Vault, bundle: &Bundle) -> Result<(), 
             &serde_json::to_vec(&(hook, &bundle.certificate)).map_err(|_| "部署指纹序列化失败")?,
         );
         let marker = Path::new(&cfg.cert_dir)
-            .join(acme_store::safe_name(&cfg.domain))
+            .join(acme_store::try_safe_name(&cfg.domain)?)
             .join(format!("deployment-{index}.sha256"));
         if acme_store::read_bounded(&marker, 64).await?.as_deref() == Some(fingerprint.as_ref()) {
             continue;
@@ -331,8 +333,10 @@ async fn deploy(cfg: &AcmeConfig, vault: &Vault, bundle: &Bundle) -> Result<(), 
                 url,
                 include_private_key,
             } => {
-                let url = vault.reveal_string(
-                    &format!("acme.{}.deploy_hooks.{}.url", cfg.domain, index),
+                let edom = crate::config::encode_secret_segment(&cfg.domain);
+                let url = vault.reveal_string_with_legacy(
+                    &format!("acme.{}.deploy_hooks.{}.url", edom, index),
+                    Some(&format!("acme.{}.deploy_hooks.{}.url", cfg.domain, index)),
                     url,
                 )?;
                 let mut payload =
@@ -363,9 +367,23 @@ fn activate(
     table: &Arc<ArcSwap<CertTable>>,
     admin: &Arc<ArcSwap<rustls::sign::CertifiedKey>>,
 ) -> Result<CertStatus, String> {
+    let safe_dir = acme_store::try_safe_name(&cfg.domain)?;
     let verified = acme_store::verify(bundle)?;
     if verified.expires <= logger::unix_now() || verified.issued > logger::unix_now() + 300 {
         return Err("证书尚未生效或已过期".into());
+    }
+    let configured_domains: std::collections::BTreeSet<String> = std::iter::once(&cfg.domain)
+        .chain(cfg.extra_domains.iter())
+        .map(|d| d.to_ascii_lowercase())
+        .collect();
+    let active_domains: Vec<String> = bundle
+        .domains
+        .iter()
+        .filter(|name| configured_domains.contains(&name.to_ascii_lowercase()))
+        .cloned()
+        .collect();
+    if active_domains.is_empty() {
+        return Err("证书包不包含当前配置中的任何有效域名".into());
     }
     if cfg.use_for_admin {
         let uri: http::Uri = all
@@ -374,7 +392,7 @@ fn activate(
             .parse()
             .map_err(|_| "管理域名无效")?;
         let host = uri.host().ok_or("管理域名缺失")?;
-        if !bundle.domains.iter().any(|name| {
+        if !active_domains.iter().any(|name| {
             name.eq_ignore_ascii_case(host)
                 || name.strip_prefix("*.").is_some_and(|suffix| {
                     host.split_once('.')
@@ -390,7 +408,7 @@ fn activate(
             wildcard: current.wildcard.clone(),
             fallback: current.fallback.clone(),
         };
-        for name in &bundle.domains {
+        for name in &active_domains {
             if let Some(suffix) = name.strip_prefix('*') {
                 next.wildcard
                     .insert(suffix.to_ascii_lowercase(), verified.key.clone());
@@ -410,7 +428,7 @@ fn activate(
         directory_url: bundle.directory.clone(),
         challenge_record: dns01_record_name(&cfg.domain, &cfg.challenge_alias_domain),
         cert_path: Path::new(&cfg.cert_dir)
-            .join(acme_store::safe_name(&cfg.domain))
+            .join(safe_dir)
             .join("current/fullchain.pem")
             .to_string_lossy()
             .into_owned(),
@@ -457,12 +475,23 @@ pub async fn preload_cached_cert(
     runtime: &AcmeRuntime,
     admin: &Arc<ArcSwap<rustls::sign::CertifiedKey>>,
 ) {
-    if !cfg.enabled {
+    if !cfg.enabled || acme_store::try_safe_name(&cfg.domain).is_err() {
         return;
     }
     let path = acme_store::bundle_path(Path::new(&cfg.cert_dir), &cfg.domain);
     if let Ok(Some(bytes)) = acme_store::read_bounded(&path, 1024 * 1024).await {
-        if let Ok(bundle) = serde_json::from_slice::<Bundle>(&bytes) {
+        if let Ok(mut bundle) = serde_json::from_slice::<Bundle>(&bytes) {
+            // 与当前配置的 domain + extra_domains 取交集，避免将已裁剪域名重新注入 cert_table
+            let configured: std::collections::BTreeSet<String> = std::iter::once(&cfg.domain)
+                .chain(cfg.extra_domains.iter())
+                .map(|d| d.to_ascii_lowercase())
+                .collect();
+            bundle
+                .domains
+                .retain(|d| configured.contains(&d.to_ascii_lowercase()));
+            if bundle.domains.is_empty() {
+                return;
+            }
             if let Ok(status) = activate(cfg, all, &bundle, table, admin) {
                 if let Ok(mut statuses) = runtime.write() {
                     statuses.insert(cfg.domain.clone(), status);
@@ -499,7 +528,7 @@ pub async fn issue_or_renew_cert(
         let journal_path = runtime
             .data_dir
             .join("acme-challenges")
-            .join(format!("{}.json", acme_store::safe_name(&cfg.domain)));
+            .join(format!("{}.json", acme_store::try_safe_name(&cfg.domain)?));
         let mut journal = match acme_store::read_bounded(&journal_path, 128 * 1024).await? {
             Some(bytes) => {
                 serde_json::from_slice::<Journal>(&bytes).map_err(|_| "挑战清理日志损坏")?

@@ -3,7 +3,7 @@ use crate::config::{cidr_contains, parse_cidr, Config, DdnsConfig, DdnsSource};
 use crate::daemon::{dns_api::{DnsApi, RecordSpec, Zone}, netlink_ip::{extract_ip_from_text, is_public_gua_ipv6, is_public_ipv4, list_interface_addresses, synthesize_subdevice_ipv6}};
 use crate::firewall::{FirewallManager, FirewallRule};
 use crate::logger::{self, Level};
-use crate::net::http_client::{shared, AddressFamily, HttpRequest};
+use crate::net::http_client::{shared, AddressFamily, HttpRequest, SsrfPolicy};
 use crate::security::{auth::url_encode, vault::Vault};
 use serde::Serialize;
 use std::{collections::BTreeMap, net::{IpAddr, Ipv4Addr, Ipv6Addr}, ops::Deref, sync::{Arc, Mutex, RwLock, Weak}};
@@ -79,6 +79,7 @@ pub fn resolve_ddns_addresses(cfg: &DdnsConfig) -> (Option<Ipv4Addr>, Option<Ipv
 async fn external_address(url: &str, want_v6: bool, force_family: bool) -> AddressResult {
     if url.is_empty() { return Ok(None); }
     let mut request = HttpRequest::new("GET", url);
+    request.ssrf_policy = SsrfPolicy::public_or_test();
     request.response_limit = 16 * 1024;
     if force_family { request.family = if want_v6 { AddressFamily::Ipv6 } else { AddressFamily::Ipv4 }; }
     let response = shared().execute(request).await?;
@@ -92,15 +93,28 @@ async fn external_address(url: &str, want_v6: bool, force_family: bool) -> Addre
 async fn resolve_addresses(cfg: &DdnsConfig, runtime: &DdnsRuntime, vault: &Vault) -> (AddressResult, AddressResult) {
     let want_v4 = cfg.records.iter().any(|r| r == "A");
     let want_v6 = cfg.records.iter().any(|r| r == "AAAA");
+    let ename = crate::config::encode_secret_segment(&cfg.name);
     match &cfg.source {
         DdnsSource::ExternalUrl { url_v4, url_v6 } => {
-            let v4_url=vault.reveal_string(&format!("ddns.{}.source.url_v4",cfg.name),url_v4);
-            let v6_url=vault.reveal_string(&format!("ddns.{}.source.url_v6",cfg.name),url_v6);
+            let v4_url = vault.reveal_string_with_legacy(
+                &format!("ddns.{ename}.source.url_v4"),
+                Some(&format!("ddns.{}.source.url_v4", cfg.name)),
+                url_v4,
+            );
+            let v6_url = vault.reveal_string_with_legacy(
+                &format!("ddns.{ename}.source.url_v6"),
+                Some(&format!("ddns.{}.source.url_v6", cfg.name)),
+                url_v6,
+            );
             tokio::join!(async { if want_v4 { external_address(&v4_url?, false, true).await } else { Ok(None) } },
                 async { if want_v6 { external_address(&v6_url?, true, true).await } else { Ok(None) } })
         }
         DdnsSource::CustomHttpExtract { url } => {
-            let url=match vault.reveal_string(&format!("ddns.{}.source.url",cfg.name),url) {Ok(url)=>url,Err(error)=>return (Err(error.clone()),Err(error))};
+            let url = match vault.reveal_string_with_legacy(
+                &format!("ddns.{ename}.source.url"),
+                Some(&format!("ddns.{}.source.url", cfg.name)),
+                url,
+            ) {Ok(url)=>url,Err(error)=>return (Err(error.clone()),Err(error))};
             tokio::join!(async { if want_v4 { external_address(&url, false, false).await } else { Ok(None) } },
                 async { if want_v6 { external_address(&url, true, false).await } else { Ok(None) } })
         }
@@ -159,11 +173,20 @@ impl Backend {
     async fn prepare(cfg: &DdnsConfig, all: &Config, vault: &Vault) -> Result<Self,String> {
         if cfg.provider == "custom_http" {
             let mut plain = cfg.clone();
-            let prefix = format!("ddns.{}", cfg.name);
-            plain.token = vault.reveal_string(&format!("{prefix}.token"), &cfg.token)?;
-            plain.custom_http.url = vault.reveal_string(&format!("{prefix}.custom_http.url"), &cfg.custom_http.url)?;
-            plain.custom_http.body = vault.reveal_string(&format!("{prefix}.custom_http.body"), &cfg.custom_http.body)?;
-            for (key,value) in &mut plain.custom_http.headers { *value = vault.reveal_string(&format!("{prefix}.custom_http.headers.{key}"), value)?; }
+            let ename = crate::config::encode_secret_segment(&cfg.name);
+            let prefix = format!("ddns.{ename}");
+            let legacy_prefix = format!("ddns.{}", cfg.name);
+            plain.token = vault.reveal_string_with_legacy(&format!("{prefix}.token"), Some(&format!("{legacy_prefix}.token")), &cfg.token)?;
+            plain.custom_http.url = vault.reveal_string_with_legacy(&format!("{prefix}.custom_http.url"), Some(&format!("{legacy_prefix}.custom_http.url")), &cfg.custom_http.url)?;
+            plain.custom_http.body = vault.reveal_string_with_legacy(&format!("{prefix}.custom_http.body"), Some(&format!("{legacy_prefix}.custom_http.body")), &cfg.custom_http.body)?;
+            for (key,value) in &mut plain.custom_http.headers {
+                let ekey = crate::config::encode_secret_segment(key);
+                *value = vault.reveal_string_with_legacy(
+                    &format!("{prefix}.custom_http.headers.{ekey}"),
+                    Some(&format!("{legacy_prefix}.custom_http.headers.{key}")),
+                    value,
+                )?;
+            }
             return Ok(Self::Custom(plain));
         }
         let provider = all.dns_providers.get(&cfg.provider).ok_or("DDNS 服务商不存在")?;

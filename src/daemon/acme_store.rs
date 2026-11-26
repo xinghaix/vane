@@ -25,6 +25,16 @@ pub struct Verified {
 }
 
 pub fn verify(bundle: &Bundle) -> Result<Verified, String> {
+    if bundle.domains.is_empty() {
+        return Err("证书包域名列表为空".into());
+    }
+    for domain in &bundle.domains {
+        crate::config::validate_domain(domain)?;
+        let body = domain.strip_prefix("*.").unwrap_or(domain);
+        if !body.contains('.') {
+            return Err(format!("ACME 证书域名至少需要两级标签: {}", domain));
+        }
+    }
     let key = certified_key_from_pem(bundle.certificate.as_bytes(), bundle.private_key.as_bytes())?;
     if key.cert.len() > 8 {
         return Err("证书链超过 8 张证书上限".into());
@@ -114,9 +124,13 @@ pub async fn atomic(path: PathBuf, bytes: Vec<u8>) -> Result<(), String> {
     Ok(())
 }
 
-pub fn safe_name(domain: &str) -> String {
-    let lower = domain.trim().to_ascii_lowercase().replace("*.", "wildcard_.");
-    lower
+pub fn try_safe_name(domain: &str) -> Result<String, String> {
+    let trimmed = domain.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        return Err("ACME 域名目录名称非法".into());
+    }
+    let lower = trimmed.to_ascii_lowercase().replace("*.", "wildcard_.");
+    let mut out = lower
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
@@ -125,8 +139,24 @@ pub fn safe_name(domain: &str) -> String {
                 '_'
             }
         })
-        .collect::<String>()
-        .replace("..", "_")
+        .collect::<String>();
+    while out.contains("..") {
+        out = out.replace("..", "_");
+    }
+    if out.is_empty()
+        || out == "."
+        || out == ".."
+        || out.starts_with('.')
+        || out.ends_with('.')
+        || !out.bytes().any(|b| b.is_ascii_alphanumeric())
+    {
+        return Err("ACME 域名目录名称非法".into());
+    }
+    Ok(out)
+}
+
+pub fn safe_name(domain: &str) -> String {
+    try_safe_name(domain).unwrap_or_else(|_| "_invalid_domain_".to_string())
 }
 pub fn bundle_path(dir: &Path, domain: &str) -> PathBuf {
     dir.join(safe_name(domain))
@@ -162,7 +192,8 @@ async fn store_inner(dir: &Path, domain: &str, bundle: &Bundle, write_bundle: bo
     {
         return Err("签发证书不在当前有效期内".into());
     }
-    let root = dir.join(safe_name(domain));
+    let safe = try_safe_name(domain)?;
+    let root = dir.join(safe);
     let dir_check = dir.to_path_buf();
     let root_check = root.clone();
     tokio::task::spawn_blocking(move || {

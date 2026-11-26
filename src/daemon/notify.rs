@@ -27,14 +27,25 @@ fn severity_rank(value: &str) -> Option<u8> {
 
 fn reveal_config(cfg: &NotificationConfig, vault: &Vault) -> Result<NotificationConfig, String> {
     let mut plain = cfg.clone();
-    let prefix = format!("notifications.{}", cfg.name);
-    plain.url = vault.reveal_string(&format!("{prefix}.url"), &cfg.url)?;
-    plain.token = vault.reveal_string(&format!("{prefix}.token"), &cfg.token)?;
-    plain.secret = vault.reveal_string(&format!("{prefix}.secret"), &cfg.secret)?;
+    let ename = crate::config::encode_secret_segment(&cfg.name);
+    let prefix = format!("notifications.{ename}");
+    let legacy_prefix = format!("notifications.{}", cfg.name);
+    plain.url = vault.reveal_string_with_legacy(&format!("{prefix}.url"), Some(&format!("{legacy_prefix}.url")), &cfg.url)?;
+    plain.token = vault.reveal_string_with_legacy(&format!("{prefix}.token"), Some(&format!("{legacy_prefix}.token")), &cfg.token)?;
+    plain.secret = vault.reveal_string_with_legacy(&format!("{prefix}.secret"), Some(&format!("{legacy_prefix}.secret")), &cfg.secret)?;
     for (name, value) in &mut plain.headers {
-        *value = vault.reveal_string(&format!("{prefix}.headers.{name}"), value)?;
+        let ehdr = crate::config::encode_secret_segment(name);
+        *value = vault.reveal_string_with_legacy(
+            &format!("{prefix}.headers.{ehdr}"),
+            Some(&format!("{legacy_prefix}.headers.{name}")),
+            value,
+        )?;
     }
-    plain.body_template = vault.reveal_string(&format!("{prefix}.body_template"), &cfg.body_template)?;
+    plain.body_template = vault.reveal_string_with_legacy(
+        &format!("{prefix}.body_template"),
+        Some(&format!("{legacy_prefix}.body_template")),
+        &cfg.body_template,
+    )?;
     Ok(plain)
 }
 
@@ -155,14 +166,48 @@ fn validate_delivery(provider: &str, response: HttpResponse) -> Result<(), Strin
     }
 }
 
+fn sanitize_single_line(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| match c {
+            '\r' | '\n' | '\x1b' => ' ',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn sanitize_multiline(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '\r' => {}
+            '\n' => out.push('\n'),
+            '\x1b' => out.push(' '),
+            c if c.is_control() => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    out.trim().to_string()
+}
+
+fn sanitize_notification_fields(title: &str, message: &str) -> (String, String) {
+    let clean_title = logger::redact(&sanitize_single_line(title));
+    let clean_msg = logger::redact(&sanitize_multiline(message));
+    (clean_title, clean_msg)
+}
+
 pub async fn dispatch_notification(cfg: &NotificationConfig, vault: &Vault, event: &str, title: &str, message: &str, severity: &str) -> Result<DeliveryOutcome, String> {
     let rank = severity_rank(severity).ok_or("无效的通知级别")?;
     let minimum = severity_rank(&cfg.min_severity).ok_or("无效的通知最低级别")?;
     if !cfg.enabled || rank < minimum || (!cfg.events.is_empty() && !cfg.events.iter().any(|e| e == event || e == "*")) {
         return Ok(DeliveryOutcome::Skipped);
     }
+    let (clean_title, clean_message) = sanitize_notification_fields(title, message);
     let plain = reveal_config(cfg, vault)?;
-    let request = build_request(&plain, event, title, message, severity, logger::unix_now_ms())?;
+    let request = build_request(&plain, event, &clean_title, &clean_message, severity, logger::unix_now_ms())?;
     validate_delivery(&cfg.provider, shared().execute(request).await?)?;
     logger::log(Level::Info, "notify", &format!("通知渠道 {} 已确认投递事件 {}", cfg.name, event));
     Ok(DeliveryOutcome::Sent)
@@ -170,14 +215,15 @@ pub async fn dispatch_notification(cfg: &NotificationConfig, vault: &Vault, even
 
 /// 手动测试推送：忽略 enabled/events/min_severity 过滤，直接验证凭据与网络连通性
 pub async fn send_test_notification(cfg: &NotificationConfig, vault: &Vault, title: &str, message: &str) -> Result<DeliveryOutcome, String> {
+    let (clean_title, clean_message) = sanitize_notification_fields(title, message);
     let plain = reveal_config(cfg, vault)?;
-    let request = build_request(&plain, "test", title, message, "info", logger::unix_now_ms())?;
+    let request = build_request(&plain, "test", &clean_title, &clean_message, "info", logger::unix_now_ms())?;
     validate_delivery(&cfg.provider, shared().execute(request).await?)?;
     logger::log(Level::Info, "notify", &format!("通知渠道 {} 测试推送已确认投递", cfg.name));
     Ok(DeliveryOutcome::Sent)
 }
 
-/// 向所有启用且匹配事件/级别过滤条件的通知渠道广播系统事件（单渠道异常仅记录日志不阻断其他渠道）
+/// 向所有启用且匹配事件/级别过滤条件的通知渠道广播系统事件（同时记录至站内收件箱；单渠道异常仅记录日志不阻断其他渠道）
 pub async fn broadcast_event(
     all_cfg: &crate::config::Config,
     vault: &Vault,
@@ -186,8 +232,10 @@ pub async fn broadcast_event(
     message: &str,
     severity: &str,
 ) {
+    let (clean_title, clean_message) = sanitize_notification_fields(title, message);
+    crate::daemon::inbox::record_global(event, severity, &clean_title, &clean_message, None);
     for ch in all_cfg.notifications.iter().filter(|c| c.enabled) {
-        if let Err(e) = dispatch_notification(ch, vault, event, title, message, severity).await {
+        if let Err(e) = dispatch_notification(ch, vault, event, &clean_title, &clean_message, severity).await {
             logger::log(
                 Level::Warn,
                 "notify",

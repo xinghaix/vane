@@ -1,6 +1,6 @@
 //! 系统监控低内存 / 高温告警阈值评估与冷却去重通知分发。
 use crate::config::Config;
-use crate::daemon::notify::{dispatch_notification, DeliveryOutcome};
+use crate::daemon::notify::broadcast_event;
 use crate::logger::{self, Level};
 use crate::monitor::procfs::SystemSnapshot;
 use crate::security::vault::Vault;
@@ -35,7 +35,7 @@ pub async fn evaluate_and_notify_alerts(
     let cooldown = m.alert_cooldown_secs.max(60);
     let now = snapshot.timestamp_unix;
 
-    // 1. 高温告警 (soc_temp_celsius > temp_alert_celsius)
+    // 1. 高温告警 (soc_temp_celsius >= temp_alert_celsius)
     if let Some(temp) = Some(snapshot.soc_temp_celsius).filter(|t| *t > 0.0 && *t >= m.temp_alert_celsius as f32) {
         if alert_state.allow_and_mark("high_temp", now, cooldown) {
             let msg = format!(
@@ -43,17 +43,7 @@ pub async fn evaluate_and_notify_alerts(
                 temp, m.temp_alert_celsius
             );
             logger::log(Level::Warn, "monitor", &msg);
-            for ch in &cfg.notifications {
-                match dispatch_notification(ch, vault, "high_temp", "Vane 高温告警", &msg, "critical").await {
-                    Ok(DeliveryOutcome::Sent) => {
-                        logger::log(Level::Info, "monitor", &format!("已向渠道 {} 投递高温告警", ch.name));
-                    }
-                    Ok(DeliveryOutcome::Skipped) => {}
-                    Err(e) => {
-                        logger::log(Level::Warn, "monitor", &format!("向渠道 {} 投递高温告警失败: {}", ch.name, e));
-                    }
-                }
-            }
+            broadcast_event(cfg, vault, "high_temp", "Vane 高温告警", &msg, "critical").await;
         }
     }
 
@@ -66,17 +56,7 @@ pub async fn evaluate_and_notify_alerts(
                 avail_mb, m.mem_low_mb
             );
             logger::log(Level::Warn, "monitor", &msg);
-            for ch in &cfg.notifications {
-                match dispatch_notification(ch, vault, "low_memory", "Vane 低内存告警", &msg, "warning").await {
-                    Ok(DeliveryOutcome::Sent) => {
-                        logger::log(Level::Info, "monitor", &format!("已向渠道 {} 投递低内存告警", ch.name));
-                    }
-                    Ok(DeliveryOutcome::Skipped) => {}
-                    Err(e) => {
-                        logger::log(Level::Warn, "monitor", &format!("向渠道 {} 投递低内存告警失败: {}", ch.name, e));
-                    }
-                }
-            }
+            broadcast_event(cfg, vault, "low_memory", "Vane 低内存告警", &msg, "warning").await;
         }
     }
 }

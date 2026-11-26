@@ -1,20 +1,26 @@
 //! 轻量 5/6 段 Cron 表达式解析器（秒 分 时 日 月 周）、未来运行时间精确预览、
-//! 任务级互斥锁（防重入叠加）、全动作真实执行器与独立进程组超时 SIGKILL 回收。
-use crate::config::{Config, CronAction, CronConfig};
+//! 任务级互斥锁（防重入叠加）、实时配置感知、即时取消、全动作真实执行器与
+//! `waitid(WNOWAIT)` + 独立进程组 SIGKILL 无竞态回收。
+use crate::config::{encode_secret_segment, Config, CronAction, CronConfig};
 use crate::daemon::notify::broadcast_event;
 use crate::docker::unix_client::{container_action, prune_images};
 use crate::logger::{self, breakdown, Level};
 use crate::net::http_client::{shared as http_shared, HttpRequest};
 use crate::security::vault::Vault;
+use arc_swap::ArcSwap;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
+
+const SAFE_EXEC_PATH: &str = "/usr/sbin:/sbin:/usr/bin:/bin";
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CronJobStatus {
@@ -26,15 +32,55 @@ pub struct CronJobStatus {
     pub running: bool,
 }
 
-#[derive(Default)]
 pub struct CronRuntime {
     statuses: RwLock<BTreeMap<String, CronJobStatus>>,
     locks: Mutex<BTreeMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    live_config: RwLock<Option<Arc<ArcSwap<Config>>>>,
+    cancel_token: Mutex<CancellationToken>,
+}
+
+impl Default for CronRuntime {
+    fn default() -> Self {
+        Self {
+            statuses: RwLock::new(BTreeMap::new()),
+            locks: Mutex::new(BTreeMap::new()),
+            live_config: RwLock::new(None),
+            cancel_token: Mutex::new(CancellationToken::new()),
+        }
+    }
 }
 
 impl CronRuntime {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// 绑定实时共享配置句柄，使计划任务在执行期始终读取最新的模块开关与安全策略（如 `modules.docker`、`admin.allow_cron_exec`）
+    pub fn set_live_config(&self, live: Arc<ArcSwap<Config>>) {
+        if let Ok(mut g) = self.live_config.write() {
+            *g = Some(live);
+        }
+    }
+
+    pub fn live_config(&self) -> Option<Arc<ArcSwap<Config>>> {
+        self.live_config.read().ok().and_then(|g| g.clone())
+    }
+
+    /// 获取当前世代的子取消令牌；调用 `cancel_all()` 时会立即取消所有已派发的子令牌
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token
+            .lock()
+            .map(|g| g.child_token())
+            .unwrap_or_else(|e| e.into_inner().child_token())
+    }
+
+    /// 立即取消所有运行中的计划任务并轮换新的世代令牌（供模块禁用/热重载/停机调用）
+    pub fn cancel_all(&self) {
+        let prev = match self.cancel_token.lock() {
+            Ok(mut g) => std::mem::replace(&mut *g, CancellationToken::new()),
+            Err(e) => std::mem::replace(&mut *e.into_inner(), CancellationToken::new()),
+        };
+        prev.cancel();
     }
 
     pub fn snapshot(&self) -> Vec<CronJobStatus> {
@@ -105,6 +151,22 @@ pub struct CronExecutionContext {
     pub vault: Arc<Vault>,
     pub runtime: Arc<CronRuntime>,
     pub rule_toggler: Option<RuleToggleFn>,
+}
+
+impl CronExecutionContext {
+    /// 获取当前最新配置（若 `runtime` 已绑定 `ArcSwap<Config>` 则动态加载实时快照，否则回退到静态快照）
+    pub fn current_config(&self) -> Arc<Config> {
+        if let Some(live) = self.runtime.live_config() {
+            live.load_full()
+        } else {
+            self.config.clone()
+        }
+    }
+
+    pub fn with_live_config(self, live: Arc<ArcSwap<Config>>) -> Self {
+        self.runtime.set_live_config(live);
+        self
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -189,8 +251,8 @@ pub fn due_seconds_window(last_tick: &mut Option<u64>, now_unix: u64) -> std::op
             now_unix..=now_unix
         }
         Some(prev) if now_unix <= prev => {
-            // 同一秒内或时钟微幅回拨：返回空区间 (1..=0) 避免重复触发
-            1..=0
+            // 同一秒内或时钟微幅回拨：返回空区间避免重复触发
+            std::ops::RangeInclusive::new(1, 0)
         }
         Some(prev) => {
             let start = (prev + 1).max(now_unix.saturating_sub(5));
@@ -257,6 +319,32 @@ fn parse_field_u64(s: &str, min: u32, max: u32) -> Result<u64, String> {
     Ok(mask)
 }
 
+struct CancelSignal {
+    runtime: Option<CancellationToken>,
+    caller: Option<CancellationToken>,
+}
+
+impl CancelSignal {
+    fn is_cancelled(&self) -> bool {
+        self.runtime.as_ref().is_some_and(CancellationToken::is_cancelled)
+            || self.caller.as_ref().is_some_and(CancellationToken::is_cancelled)
+    }
+
+    async fn cancelled(&self) {
+        match (&self.runtime, &self.caller) {
+            (Some(a), Some(b)) => {
+                tokio::select! {
+                    _ = a.cancelled() => {}
+                    _ = b.cancelled() => {}
+                }
+            }
+            (Some(a), None) => a.cancelled().await,
+            (None, Some(b)) => b.cancelled().await,
+            (None, None) => std::future::pending::<()>().await,
+        }
+    }
+}
+
 struct PgidGuard(i32);
 
 impl Drop for PgidGuard {
@@ -287,11 +375,50 @@ async fn read_bounded_and_drain<R: tokio::io::AsyncRead + Unpin>(mut reader: R, 
     out
 }
 
-async fn run_exec_isolated(job_name: &str, program: &str, args: &[String], cwd: &str, timeout: Duration) -> Result<String, String> {
+fn spawn_waitid_nowait(pid: i32) -> tokio::task::JoinHandle<io::Result<()>> {
+    tokio::task::spawn_blocking(move || {
+        let mut siginfo: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        loop {
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut siginfo,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+    })
+}
+
+enum ExecAbort {
+    TimedOut,
+    Cancelled,
+}
+
+async fn run_exec_isolated(
+    job_name: &str,
+    program: &str,
+    args: &[String],
+    cwd: &str,
+    timeout: Duration,
+    cancel: &CancelSignal,
+) -> Result<String, String> {
+    if cancel.is_cancelled() {
+        return Err(format!("任务 {} 已被取消", job_name));
+    }
     let mut cmd = Command::new(program);
     cmd.args(args)
-        .env_remove("VANE_MASTER_KEY")
-        .env_remove("VANE_MASTER_KEY_FILE")
+        .env_clear()
+        .env("PATH", SAFE_EXEC_PATH)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -306,45 +433,35 @@ async fn run_exec_isolated(job_name: &str, program: &str, args: &[String], cwd: 
     let pgid = child.id().unwrap_or(0) as i32;
     let mut pgid_guard = PgidGuard(pgid);
 
-    let io_fut = async {
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let r_out = async {
-            match stdout {
-                Some(s) => read_bounded_and_drain(s, 64 * 1024).await,
-                None => Vec::new(),
-            }
-        };
-        let r_err = async {
-            match stderr {
-                Some(s) => read_bounded_and_drain(s, 16 * 1024).await,
-                None => Vec::new(),
-            }
-        };
-        let (out_buf, err_buf) = tokio::join!(r_out, r_err);
-        // 在 wait() 回收主进程 PID 前清扫进程组中仍未退出的后代进程，消除 PID 复用竞态
-        if pgid > 1 && matches!(child.try_wait(), Ok(None)) {
-            unsafe {
-                let _ = libc::kill(-pgid, libc::SIGKILL);
-            }
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let r_out = async {
+        match stdout {
+            Some(s) => read_bounded_and_drain(s, 64 * 1024).await,
+            None => Vec::new(),
         }
-        let st = child.wait().await.map_err(|e| format!("等待子进程退出失败: {}", e))?;
-        Ok::<_, String>((st, out_buf, err_buf))
+    };
+    let r_err = async {
+        match stderr {
+            Some(s) => read_bounded_and_drain(s, 16 * 1024).await,
+            None => Vec::new(),
+        }
     };
 
-    match tokio::time::timeout(timeout, io_fut).await {
-        Ok(Ok((status, out_buf, err_buf))) => {
-            pgid_guard.0 = 0;
-            let stdout = logger::truncate_utf8(&String::from_utf8_lossy(&out_buf), 512);
-            if status.success() {
-                logger::log(Level::Info, "cron", &format!("任务 {} 执行成功: {}", job_name, stdout.trim()));
-                Ok(stdout)
-            } else {
-                let stderr = logger::truncate_utf8(&String::from_utf8_lossy(&err_buf), 512);
-                Err(format!("退出码 {:?}: {}", status.code(), stderr.trim()))
-            }
-        }
-        Ok(Err(e)) => {
+    // 阶段 1：有界读取 stdout/stderr，期间随时响应超时或取消信号
+    let io_res = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(ExecAbort::Cancelled),
+        _ = &mut deadline => Err(ExecAbort::TimedOut),
+        pair = async { tokio::join!(r_out, r_err) } => Ok(pair),
+    };
+
+    let (out_buf, err_buf) = match io_res {
+        Ok(pair) => pair,
+        Err(abort) => {
             if pgid > 1 {
                 unsafe {
                     let _ = libc::kill(-pgid, libc::SIGKILL);
@@ -353,18 +470,87 @@ async fn run_exec_isolated(job_name: &str, program: &str, args: &[String], cwd: 
             let _ = child.kill().await;
             let _ = child.wait().await;
             pgid_guard.0 = 0;
-            Err(e)
+            return Err(match abort {
+                ExecAbort::Cancelled => format!("任务 {} 已被取消并强制终止整个进程组", job_name),
+                ExecAbort::TimedOut => format!("任务 {} 超时 ({}s) 已强制终止整个进程组", job_name, timeout.as_secs()),
+            });
         }
-        Err(_) => {
-            if pgid > 1 {
+    };
+
+    // 阶段 2：使用 waitid(P_PID, pid, WEXITED | WNOWAIT) 等待主子进程退出但不回收 PID，
+    // 在持有僵尸 PID（彻底消除 PID 复用竞态）的前提下向整个进程组发送 SIGKILL 清理所有脱离后代进程，
+    // 随后再通过 child.wait() 回收并取得未被篡改的原始退出码！
+    if pgid > 1 {
+        let mut waitid_task = spawn_waitid_nowait(pgid);
+        let wait_abort = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
                 unsafe {
                     let _ = libc::kill(-pgid, libc::SIGKILL);
                 }
+                let _ = waitid_task.await;
+                Some(ExecAbort::Cancelled)
             }
+            _ = &mut deadline => {
+                unsafe {
+                    let _ = libc::kill(-pgid, libc::SIGKILL);
+                }
+                let _ = waitid_task.await;
+                Some(ExecAbort::TimedOut)
+            }
+            _ = &mut waitid_task => {
+                unsafe {
+                    let _ = libc::kill(-pgid, libc::SIGKILL);
+                }
+                None
+            }
+        };
+        if let Some(abort) = wait_abort {
             let _ = child.kill().await;
             let _ = child.wait().await;
             pgid_guard.0 = 0;
-            Err(format!("任务 {} 超时 ({}s) 已强制终止整个进程组", job_name, timeout.as_secs()))
+            return Err(match abort {
+                ExecAbort::Cancelled => format!("任务 {} 已被取消并强制终止整个进程组", job_name),
+                ExecAbort::TimedOut => format!("任务 {} 超时 ({}s) 已强制终止整个进程组", job_name, timeout.as_secs()),
+            });
+        }
+    }
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("等待子进程退出失败: {}", e))?;
+    pgid_guard.0 = 0;
+
+    let stdout_text = logger::truncate_utf8(&String::from_utf8_lossy(&out_buf), 512);
+    if status.success() {
+        logger::log(Level::Info, "cron", &format!("任务 {} 执行成功: {}", job_name, stdout_text.trim()));
+        Ok(stdout_text)
+    } else {
+        let stderr_text = logger::truncate_utf8(&String::from_utf8_lossy(&err_buf), 512);
+        Err(format!("退出码 {:?}: {}", status.code(), stderr_text.trim()))
+    }
+}
+
+fn reveal_cron_secret(vault: &Vault, canonical: &str, legacy: &str, value: &str) -> Result<String, String> {
+    vault.reveal_string_with_legacy(canonical, (legacy != canonical).then_some(legacy), value)
+}
+
+async fn run_cancellable_with_timeout<F, T>(
+    fut: F,
+    timeout: Duration,
+    cancel: &CancelSignal,
+    timeout_msg: String,
+    cancel_msg: String,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(cancel_msg),
+        res = tokio::time::timeout(timeout, fut) => {
+            res.map_err(|_| timeout_msg)?
         }
     }
 }
@@ -383,8 +569,20 @@ impl Drop for RunningResetGuard {
     }
 }
 
-/// 携带完整网关上下文执行单次计划任务（含任务级非重入锁、五类真实动作与失败告警通知）
-pub async fn execute_cron_job_with_ctx(job: &CronConfig, ctx: Option<&CronExecutionContext>) -> Result<String, String> {
+/// 携带完整网关上下文与可取消令牌执行单次计划任务（实时校验模块开关与 `admin.allow_cron_exec`）
+pub async fn execute_cron_job_cancellable(
+    job: &CronConfig,
+    ctx: Option<&CronExecutionContext>,
+    caller_cancel: Option<CancellationToken>,
+) -> Result<String, String> {
+    let cancel = CancelSignal {
+        runtime: ctx.map(|c| c.runtime.cancel_token()),
+        caller: caller_cancel,
+    };
+    if cancel.is_cancelled() {
+        return Err(format!("任务 {} 已被取消", job.name));
+    }
+
     let (_lock_guard, mut reset_guard) = if let Some(c) = ctx {
         let lock = c.runtime.job_lock(&job.name)?;
         match lock.try_lock_owned() {
@@ -409,39 +607,54 @@ pub async fn execute_cron_job_with_ctx(job: &CronConfig, ctx: Option<&CronExecut
 
     let started = std::time::Instant::now();
     let timeout = Duration::from_secs(job.timeout_secs.clamp(1, 86_400));
+    let cancel_msg = format!("任务 {} 已被取消", job.name);
 
     let res: Result<String, String> = async {
+        let live_cfg = ctx.map(|c| c.current_config());
+        if let Some(ref cfg) = live_cfg {
+            if !cfg.modules.cron {
+                return Err("计划任务模块已关闭，已中止执行".into());
+            }
+        }
+
         match &job.action {
             CronAction::DockerPruneImages { dangling_only } => {
                 let c = ctx.ok_or_else(|| "缺少 Docker 运行上下文".to_string())?;
-                if !c.config.modules.docker {
+                let live = c.current_config();
+                if !live.modules.docker {
                     Err("Docker 模块已关闭，无法执行镜像清理".into())
                 } else {
-                    tokio::time::timeout(timeout, prune_images(&c.config.admin.docker_socket, *dangling_only))
-                        .await
-                        .map_err(|_| format!("任务 {} 清理镜像超时", job.name))?
-                        .map(|raw| {
-                            let msg = format!(
-                                "Docker 镜像清理完成 (dangling_only={}): {}",
-                                dangling_only,
-                                logger::truncate_utf8(&raw, 240)
-                            );
-                            logger::log(Level::Info, "cron", &msg);
-                            msg
-                        })
+                    let raw = run_cancellable_with_timeout(
+                        prune_images(&live.admin.docker_socket, *dangling_only),
+                        timeout,
+                        &cancel,
+                        format!("任务 {} 清理镜像超时", job.name),
+                        cancel_msg.clone(),
+                    )
+                    .await?;
+                    let msg = format!(
+                        "Docker 镜像清理完成 (dangling_only={}): {}",
+                        dangling_only,
+                        logger::truncate_utf8(&raw, 240)
+                    );
+                    logger::log(Level::Info, "cron", &msg);
+                    Ok(msg)
                 }
             }
             CronAction::DockerRestartContainer { container } => {
                 let c = ctx.ok_or_else(|| "缺少 Docker 运行上下文".to_string())?;
-                if !c.config.modules.docker {
+                let live = c.current_config();
+                if !live.modules.docker {
                     Err("Docker 模块已关闭，无法重启容器".into())
                 } else {
-                    tokio::time::timeout(
+                    run_cancellable_with_timeout(
+                        container_action(&live.admin.docker_socket, &live.docker, container, "restart"),
                         timeout,
-                        container_action(&c.config.admin.docker_socket, &c.config.docker, container, "restart"),
+                        &cancel,
+                        format!("任务 {} 重启容器 {} 超时", job.name, container),
+                        cancel_msg.clone(),
                     )
-                    .await
-                    .map_err(|_| format!("任务 {} 重启容器 {} 超时", job.name, container))??;
+                    .await?;
                     let msg = format!("已成功重启容器 {}", container);
                     logger::log(Level::Info, "cron", &msg);
                     Ok(msg)
@@ -455,9 +668,14 @@ pub async fn execute_cron_job_with_ctx(job: &CronConfig, ctx: Option<&CronExecut
                 let toggler = ctx
                     .and_then(|c| c.rule_toggler.as_ref())
                     .ok_or_else(|| "缺少规则状态切换器上下文".to_string())?;
-                let msg = tokio::time::timeout(timeout, toggler(target_kind.clone(), rule.clone(), *enable))
-                    .await
-                    .map_err(|_| format!("任务 {} 切换规则状态超时", job.name))??;
+                let msg = run_cancellable_with_timeout(
+                    toggler(target_kind.clone(), rule.clone(), *enable),
+                    timeout,
+                    &cancel,
+                    format!("任务 {} 切换规则状态超时", job.name),
+                    cancel_msg.clone(),
+                )
+                .await?;
                 logger::log(Level::Info, "cron", &msg);
                 Ok(msg)
             }
@@ -468,15 +686,29 @@ pub async fn execute_cron_job_with_ctx(job: &CronConfig, ctx: Option<&CronExecut
                 body,
             } => {
                 let (plain_url, plain_body, plain_headers) = if let Some(c) = ctx {
-                    let u = c.vault.reveal_string(&format!("cron.{}.action.url", job.name), url)?;
-                    let b = c.vault.reveal_string(&format!("cron.{}.action.body", job.name), body)?;
+                    let enc_name = encode_secret_segment(&job.name);
+                    let u = reveal_cron_secret(
+                        &c.vault,
+                        &format!("cron.{}.action.url", enc_name),
+                        &format!("cron.{}.action.url", job.name),
+                        url,
+                    )?;
+                    let b = reveal_cron_secret(
+                        &c.vault,
+                        &format!("cron.{}.action.body", enc_name),
+                        &format!("cron.{}.action.body", job.name),
+                        body,
+                    )?;
                     let mut h = BTreeMap::new();
                     for (k, v) in headers {
-                        h.insert(
-                            k.clone(),
-                            c.vault
-                                .reveal_string(&format!("cron.{}.action.headers.{}", job.name, k), v)?,
-                        );
+                        let enc_k = encode_secret_segment(k);
+                        let pv = reveal_cron_secret(
+                            &c.vault,
+                            &format!("cron.{}.action.headers.{}", enc_name, enc_k),
+                            &format!("cron.{}.action.headers.{}", job.name, k),
+                            v,
+                        )?;
+                        h.insert(k.clone(), pv);
                     }
                     (u, b, h)
                 } else {
@@ -488,9 +720,14 @@ pub async fn execute_cron_job_with_ctx(job: &CronConfig, ctx: Option<&CronExecut
                 req.body = plain_body.into_bytes();
                 req.response_limit = 64 * 1024;
                 req.timeout = timeout.min(Duration::from_secs(60));
-                let resp = tokio::time::timeout(timeout, http_shared().execute(req))
-                    .await
-                    .map_err(|_| format!("定时 HTTP 请求 {} 超时", job.name))??;
+                let resp = run_cancellable_with_timeout(
+                    http_shared().execute(req),
+                    timeout,
+                    &cancel,
+                    format!("定时 HTTP 请求 {} 超时", job.name),
+                    cancel_msg.clone(),
+                )
+                .await?;
                 resp.ensure_success()?;
                 let snippet = logger::truncate_utf8(&String::from_utf8_lossy(&resp.body), 200);
                 let msg = format!("HTTP {} -> {} ({})", m, resp.status, snippet.trim());
@@ -498,7 +735,11 @@ pub async fn execute_cron_job_with_ctx(job: &CronConfig, ctx: Option<&CronExecut
                 Ok(msg)
             }
             CronAction::Exec { program, args, cwd } => {
-                run_exec_isolated(&job.name, program, args, cwd, timeout).await
+                let allow_exec = live_cfg.as_ref().is_some_and(|cfg| cfg.admin.allow_cron_exec);
+                if !allow_exec {
+                    return Err("安全策略拦截：admin.allow_cron_exec 未启用，禁止执行 CronAction::Exec 外部命令".into());
+                }
+                run_exec_isolated(&job.name, program, args, cwd, timeout, &cancel).await
             }
         }
     }
@@ -512,9 +753,10 @@ pub async fn execute_cron_job_with_ctx(job: &CronConfig, ctx: Option<&CronExecut
 
     if let (Err(ref err), Some(c)) = (&res, ctx) {
         logger::log(Level::Warn, "cron", &format!("计划任务 {} 执行失败: {}", job.name, err));
-        if job.notify_on_failure {
+        let notify_cfg = c.current_config();
+        if job.notify_on_failure && !cancel.is_cancelled() && notify_cfg.modules.cron {
             broadcast_event(
-                &c.config,
+                &notify_cfg,
                 &c.vault,
                 "cron_failure",
                 &format!("Vane 计划任务失败: {}", job.name),
@@ -528,7 +770,12 @@ pub async fn execute_cron_job_with_ctx(job: &CronConfig, ctx: Option<&CronExecut
     res
 }
 
-/// 无状态执行入口（用于纯外部命令测试）
+/// 携带完整网关上下文执行单次计划任务（含任务级非重入锁、五类真实动作与失败告警通知）
+pub async fn execute_cron_job_with_ctx(job: &CronConfig, ctx: Option<&CronExecutionContext>) -> Result<String, String> {
+    execute_cron_job_cancellable(job, ctx, None).await
+}
+
+/// 无状态执行入口（用于测试；无上下文时 `CronAction::Exec` 默认失败关闭）
 pub async fn execute_cron_job(job: &CronConfig) -> Result<String, String> {
     execute_cron_job_with_ctx(job, None).await
 }
@@ -538,6 +785,22 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn exec_ctx(allow_cron_exec: bool) -> (CronExecutionContext, Arc<ArcSwap<Config>>) {
+        let mut cfg = Config::default();
+        cfg.modules.cron = true;
+        cfg.admin.allow_cron_exec = allow_cron_exec;
+        let live = Arc::new(ArcSwap::from_pointee(cfg.clone()));
+        let rt = CronRuntime::new();
+        rt.set_live_config(live.clone());
+        let ctx = CronExecutionContext {
+            config: Arc::new(cfg),
+            vault: Arc::new(Vault::from_master(&[9u8; 32])),
+            runtime: rt,
+            rule_toggler: None,
+        };
+        (ctx, live)
+    }
 
     #[test]
     fn cron_parser_next_runs_and_half_hour_tz_work() {
@@ -568,8 +831,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exec_timeout_kills_descendant_process_group_and_prevents_overlap() {
-        let job = CronConfig {
+    async fn exec_requires_allow_cron_exec_clears_env_and_kills_detached_descendants_without_clobbering_exit() {
+        // 1. 默认 allow_cron_exec = false（或无上下文）必须拒绝执行 Exec
+        let job_echo = CronConfig {
+            name: "echo_env".into(),
+            enabled: true,
+            schedule: "0 * * * * *".into(),
+            timeout_secs: 5,
+            action: CronAction::Exec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "env".into()],
+                cwd: String::new(),
+            },
+            notify_on_failure: false,
+        };
+        assert!(execute_cron_job(&job_echo).await.is_err());
+        let (ctx_denied, _) = exec_ctx(false);
+        let err = execute_cron_job_with_ctx(&job_echo, Some(&ctx_denied))
+            .await
+            .unwrap_err();
+        assert!(err.contains("allow_cron_exec"));
+
+        // 2. 开启 allow_cron_exec 后执行，仅存在固定安全 PATH，不继承宿主环境
+        let (ctx_ok, _) = exec_ctx(true);
+        let env_out = execute_cron_job_with_ctx(&job_echo, Some(&ctx_ok)).await.unwrap();
+        assert!(env_out.contains("PATH=/usr/sbin:/sbin:/usr/bin:/bin"), "env_out={env_out}");
+        assert!(!env_out.contains("VANE_MASTER_KEY"));
+        assert!(!env_out.contains("HOME="));
+
+        // 3. 主进程正常退出 0 时，waitid(WNOWAIT) + kill(-pgid) 必须清扫脱离的后台后代且保留退出码 0
+        let pid_file = std::env::temp_dir().join(format!("vane_cron_bg_{}.pid", crate::config::random_nonce()));
+        let cmd_str = format!(
+            "sleep 30 >/dev/null 2>&1 & echo $! > \"{}\"; echo clean_ok",
+            pid_file.display()
+        );
+        let job_detached = CronConfig {
+            name: "detached_desc".into(),
+            enabled: true,
+            schedule: "0 * * * * *".into(),
+            timeout_secs: 5,
+            action: CronAction::Exec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), cmd_str],
+                cwd: String::new(),
+            },
+            notify_on_failure: false,
+        };
+        let out = execute_cron_job_with_ctx(&job_detached, Some(&ctx_ok)).await.unwrap();
+        assert!(out.contains("clean_ok"), "unexpected stdout: {out}");
+        if let Ok(pid_text) = std::fs::read_to_string(&pid_file) {
+            if let Ok(bg_pid) = pid_text.trim().parse::<i32>() {
+                let mut alive = true;
+                for _ in 0..25 {
+                    if unsafe { libc::kill(bg_pid, 0) } != 0 {
+                        alive = false;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                assert!(!alive, "detached descendant pid {} survived parent exit", bg_pid);
+            }
+        }
+        let _ = std::fs::remove_file(&pid_file);
+    }
+
+    #[tokio::test]
+    async fn exec_timeout_and_cancellation_kill_process_group_and_live_config_blocks_disabled_docker() {
+        let (ctx, live) = exec_ctx(true);
+
+        // 1. 超时强杀进程组
+        let job_slow = CronConfig {
             name: "slow_tree".into(),
             enabled: true,
             schedule: "0 * * * * *".into(),
@@ -581,8 +912,47 @@ mod tests {
             },
             notify_on_failure: false,
         };
-        let err = execute_cron_job(&job).await.unwrap_err();
+        let err = execute_cron_job_with_ctx(&job_slow, Some(&ctx)).await.unwrap_err();
         assert!(err.contains("超时"));
+
+        // 2. cancel_all 立即中止正在运行的外部命令
+        let job_cancel = CronConfig {
+            name: "cancel_tree".into(),
+            enabled: true,
+            schedule: "0 * * * * *".into(),
+            timeout_secs: 30,
+            action: CronAction::Exec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "sleep 30 & wait".into()],
+                cwd: String::new(),
+            },
+            notify_on_failure: false,
+        };
+        let ctx_c = ctx.clone();
+        let handle = tokio::spawn(async move { execute_cron_job_with_ctx(&job_cancel, Some(&ctx_c)).await });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        ctx.runtime.cancel_all();
+        let err_cancel = tokio::time::timeout(Duration::from_secs(3), handle)
+            .await
+            .expect("cancelled cron job should exit promptly")
+            .unwrap()
+            .unwrap_err();
+        assert!(err_cancel.contains("取消"), "unexpected cancel err: {err_cancel}");
+
+        // 3. 实时关闭 modules.docker 后，即使 ctx.config 中旧快照为 true，也必须立即拒绝 Docker 动作
+        let mut disabled_cfg = (**live.load()).clone();
+        disabled_cfg.modules.docker = false;
+        live.store(Arc::new(disabled_cfg));
+        let job_docker = CronConfig {
+            name: "prune_test".into(),
+            enabled: true,
+            schedule: "0 * * * * *".into(),
+            timeout_secs: 5,
+            action: CronAction::DockerPruneImages { dangling_only: true },
+            notify_on_failure: false,
+        };
+        let err_docker = execute_cron_job_with_ctx(&job_docker, Some(&ctx)).await.unwrap_err();
+        assert!(err_docker.contains("Docker 模块已关闭"));
     }
 
     #[tokio::test]
@@ -604,7 +974,9 @@ mod tests {
         let mut headers = BTreeMap::new();
         headers.insert(
             "x-cron-token".into(),
-            vault.seal("cron.ping_job.action.headers.x-cron-token", b"secret-123").unwrap(),
+            vault
+                .seal("cron.ping_job.action.headers.x-cron-token", b"secret-123")
+                .unwrap(),
         );
         let job = CronConfig {
             name: "ping_job".into(),
@@ -621,8 +993,10 @@ mod tests {
             },
             notify_on_failure: false,
         };
+        let mut cfg = Config::default();
+        cfg.modules.cron = true;
         let ctx = CronExecutionContext {
-            config: Arc::new(Config::default()),
+            config: Arc::new(cfg),
             vault,
             runtime: CronRuntime::new(),
             rule_toggler: None,

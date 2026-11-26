@@ -1,6 +1,9 @@
 <script>
   import Icons from './Icons.svelte';
-  import { copyText } from '../lib/helpers.js';
+  import TerminalPane from './TerminalPane.svelte';
+  import EditorDialog from './EditorDialog.svelte';
+  import ComboInput from './ComboInput.svelte';
+  import { deepClone } from '../lib/helpers.js';
 
   let {
     t,
@@ -9,519 +12,413 @@
     initialTarget = 'host',
     targetNonce = 0,
     containers = [],
+    maxSessions = 10,
     requireReauth = false,
+    dockerRequireReauth = false,
+    onUnlockModule = null,
+    settingsJson = null,
+    onSaveSettings = null,
+    askConfirm = null,
+    requestReauth = null,
     apiFetch,
     showToast,
   } = $props();
 
-  const ANSI_COLORS = {
-    30: '#475569',
-    31: '#f87171',
-    32: '#34d399',
-    33: '#fbbf24',
-    34: '#60a5fa',
-    35: '#c084fc',
-    36: '#22d3ee',
-    37: '#e2e8f0',
-    90: '#94a3b8',
-    91: '#fca5a5',
-    92: '#6ee7b7',
-    93: '#fde047',
-    94: '#93c5fd',
-    95: '#d8b4fe',
-    96: '#67e8f9',
-    97: '#f8fafc',
-  };
+  let termSettingsOpen = $state(false);
+  let termSettingsSaving = $state(false);
+  let termShellDraft = $state('auto');
+  let termCwdDraft = $state('/root');
+  let termIdleDraft = $state(900);
+  let termMaxDraft = $state(10);
 
-  function ansi256ToHex(n) {
-    const idx = Math.max(0, Math.min(255, n | 0));
-    if (idx < 8) return ANSI_COLORS[30 + idx] || '#e2e8f0';
-    if (idx < 16) return ANSI_COLORS[90 + (idx - 8)] || '#f8fafc';
-    if (idx < 232) {
-      const c = idx - 16;
-      const r = Math.floor(c / 36);
-      const g = Math.floor((c % 36) / 6);
-      const b = c % 6;
-      const map = [0, 95, 135, 175, 215, 255];
-      return `rgb(${map[r]},${map[g]},${map[b]})`;
-    }
-    const v = 8 + (idx - 232) * 10;
-    return `rgb(${v},${v},${v})`;
+  function openTermSettings() {
+    const wt = settingsJson?.web_terminal || {};
+    termShellDraft = String(wt.shell || 'auto');
+    termCwdDraft = String(wt.default_cwd || '/root');
+    termIdleDraft = Number(wt.idle_timeout_secs || 900);
+    termMaxDraft = Number(wt.max_sessions || 10);
+    termSettingsOpen = true;
   }
 
-  let target = $state('host');
-  let lastNonce = -1;
-  let reauthPassword = $state('');
-  let ptySocket = $state(null);
-  let connState = $state('disconnected'); // disconnected | connecting | connected
-  let rawScreen = $state('');
-  let lineInput = $state('');
-  let viewportEl = $state(null);
-  let gridCols = $state(100);
-  let gridRows = $state(28);
-  let resizeTimer = null;
+  async function saveTermSettings(e) {
+    e.preventDefault();
+    if (termSettingsSaving || !settingsJson || !onSaveSettings) return;
+    termSettingsSaving = true;
+    try {
+      const next = deepClone(settingsJson);
+      next.web_terminal = {
+        ...next.web_terminal,
+        shell: String(termShellDraft || '').trim() || 'auto',
+        default_cwd: String(termCwdDraft || '').trim() || '/root',
+        idle_timeout_secs: Math.max(60, Math.min(3600, Number(termIdleDraft) || 900)),
+        max_sessions: Math.max(1, Math.min(10, Number(termMaxDraft) || 10)),
+      };
+      if (await onSaveSettings(next)) {
+        termSettingsOpen = false;
+      }
+    } finally {
+      termSettingsSaving = false;
+    }
+  }
 
-  let runningAllowedContainers = $derived((containers || []).filter((c) => c.state === 'running' && !c.protected));
-  let hasCustomTargetOption = $derived(
-    target.startsWith('container:') &&
-      !runningAllowedContainers.some((c) => `container:${c.name || c.id}` === target)
+  let maxTabs = $derived(Math.min(10, Math.max(1, Number(maxSessions) || 10)));
+  let availableShells = $state([]);
+  let defaultHostShell = $state('bash');
+  let shellsLoaded = $state(false);
+
+  let nextTabId = 1;
+  let nextHostSeq = 1;
+  let lastHandledNonce = -1;
+
+  function makeTab(target = 'host', autoConnect = false) {
+    const id = nextTabId++;
+    const seq = target === 'host' ? nextHostSeq++ : 0;
+    return {
+      id,
+      seq,
+      initialTarget: target,
+      target,
+      shell: target === 'host' ? '' : 'auto',
+      connState: 'disconnected',
+      hasOutput: false,
+      unread: false,
+      customTitle: '',
+      autoConnect,
+    };
+  }
+
+  let tabs = $state([makeTab('host', false)]);
+  let activeTabId = $state(1);
+  let editingTabId = $state(0);
+  let editingTitle = $state('');
+
+  let connectedCount = $derived(
+    tabs.filter((tb) => tb.connState === 'connected' || tb.connState === 'connecting').length
   );
 
+  async function loadAvailableShells() {
+    try {
+      const r = await apiFetch('/api/pty/shells');
+      const list = Array.isArray(r.available) ? r.available : [];
+      availableShells = list;
+      defaultHostShell = r.default || (list.some((s) => s.id === 'bash') ? 'bash' : list[0]?.id || 'sh');
+    } catch {
+      availableShells = [
+        { id: 'bash', path: '/bin/bash' },
+        { id: 'sh', path: '/bin/sh' },
+      ];
+      defaultHostShell = 'bash';
+    } finally {
+      shellsLoaded = true;
+    }
+  }
+
+  $effect(() => {
+    if (visible && !shellsLoaded) {
+      loadAvailableShells();
+    }
+  });
+
+  // 从 Docker 容器页点击「终端」进入时：复用已有容器标签，或在未达上限时新开独立标签页，不打断宿主机终端
   $effect(() => {
     const nonce = targetNonce;
-    const nextTarget = initialTarget || 'host';
-    if (nonce !== lastNonce) {
-      lastNonce = nonce;
-      if (nextTarget !== target) {
-        if (ptySocket) {
-          ptySocket.close();
-          ptySocket = null;
-          connState = 'disconnected';
-        }
-        target = nextTarget;
-      }
+    const reqTarget = initialTarget || 'host';
+    if (nonce === lastHandledNonce) return;
+    lastHandledNonce = nonce;
+    if (nonce === 0 && reqTarget === 'host') return;
+
+    const existing = tabs.find((tb) => tb.target === reqTarget);
+    if (existing) {
+      selectTab(existing.id);
+      return;
     }
+
+    const active = tabs.find((tb) => tb.id === activeTabId);
+    const shouldAutoConnect = !requireReauth && !(reqTarget.startsWith('container:') && dockerRequireReauth);
+    if (active && active.connState === 'disconnected' && !active.hasOutput && active.target === 'host' && reqTarget !== 'host') {
+      const replaced = makeTab(reqTarget, shouldAutoConnect);
+      tabs = tabs.map((tb) => (tb.id === active.id ? replaced : tb));
+      activeTabId = replaced.id;
+      return;
+    }
+
+    if (tabs.length >= maxTabs) {
+      showToast(t.term.tabLimitReached.replace('{max}', String(maxTabs)), 'warn');
+      return;
+    }
+
+    const created = makeTab(reqTarget, shouldAutoConnect);
+    tabs = [...tabs, created];
+    activeTabId = created.id;
   });
 
-  $effect(() => {
-    return () => {
-      if (resizeTimer) clearTimeout(resizeTimer);
-      if (ptySocket) {
-        ptySocket.close();
-        ptySocket = null;
-      }
-    };
-  });
-
-  $effect(() => {
-    if (!viewportEl || typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(() => {
-      if (!visible) return;
-      if (resizeTimer) clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => {
-        resizeTimer = null;
-        const { cols, rows } = estimateGrid();
-        gridCols = cols;
-        gridRows = rows;
-        sendResize();
-      }, 100);
-    });
-    ro.observe(viewportEl);
-    return () => ro.disconnect();
-  });
-
-  $effect(() => {
-    if (!visible) return;
-    queueMicrotask(() => {
-      const { cols, rows } = estimateGrid();
-      gridCols = cols;
-      gridRows = rows;
-      sendResize();
-    });
-  });
-
-  function applyPtyChunk(current, raw) {
-    let str = String(raw || '').replace(/\r\n/g, '\n');
-
-    // 处理清屏控制序列 (\x1b[2J / \x1b[3J / \x1b[H\x1b[J)
-    const clearParts = str.split(/\x1b\[(?:2|3)J|\x1b\[H\x1b\[J/);
-    let buf = current;
-    if (clearParts.length > 1) {
-      buf = '';
-      str = clearParts[clearParts.length - 1];
+  function tabDisplayTitle(tb) {
+    if (tb.customTitle) return tb.customTitle;
+    if (tb.target && tb.target.startsWith('container:')) {
+      return tb.target.slice('container:'.length);
     }
-
-    // 剥离 OSC、字符集与非 SGR 的 CSI 控制序列，保留 \x1b[...m 配色转义
-    str = str
-      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
-      .replace(/\x1b\[[0-9;?]*[A-Za-ln-z]/g, '')
-      .replace(/\x1b\([A-Z0-9]|\x1b[=>NOM]/g, '');
-
-    if (str.includes('\r') || str.includes('\x08')) {
-      for (let i = 0; i < str.length; i++) {
-        const ch = str[i];
-        if (ch === '\x1b' && str[i + 1] === '[') {
-          const end = str.indexOf('m', i + 2);
-          if (end !== -1 && end - i <= 32) {
-            buf += str.slice(i, end + 1);
-            i = end;
-            continue;
-          }
-        }
-        if (ch === '\r') {
-          const nl = buf.lastIndexOf('\n');
-          buf = nl >= 0 ? buf.slice(0, nl + 1) : '';
-        } else if (ch === '\x08') {
-          const nl = buf.lastIndexOf('\n');
-          // 若当前行末尾不是转义符且有字符，则退格删除最后一个可见字符
-          if (buf.length > nl + 1) {
-            if (buf.endsWith('m')) {
-              const esc = buf.lastIndexOf('\x1b[');
-              if (esc > nl && /^\x1b\[[0-9;]*m$/.test(buf.slice(esc))) {
-                const beforeEsc = buf.slice(0, esc);
-                if (beforeEsc.length > nl + 1) {
-                  buf = beforeEsc.slice(0, -1) + buf.slice(esc);
-                }
-                continue;
-              }
-            }
-            buf = buf.slice(0, -1);
-          }
-        } else {
-          buf += ch;
-        }
-      }
-    } else {
-      buf += str;
-    }
-
-    const MAX_LEN = 65536;
-    if (buf.length > MAX_LEN) {
-      const cut = buf.indexOf('\n', buf.length - MAX_LEN);
-      buf = cut >= 0 ? buf.slice(cut + 1) : buf.slice(-MAX_LEN);
-    }
-    return buf;
+    return `${t.term.hostTab} #${tb.seq || tb.id}`;
   }
 
-  function parseAnsiSgr(text) {
-    if (!text) return [];
-    const segs = [];
-    const re = /\x1b\[([0-9;]*)m/g;
-    let lastIdx = 0;
-    let curColor = '';
-    let curBold = false;
-    let match;
-
-    while ((match = re.exec(text)) !== null) {
-      if (match.index > lastIdx) {
-        segs.push({ text: text.slice(lastIdx, match.index), color: curColor, bold: curBold });
-      }
-      const codes = match[1] ? match[1].split(';').map((n) => parseInt(n, 10)) : [0];
-      for (let i = 0; i < codes.length; i++) {
-        const c = codes[i];
-        if (Number.isNaN(c) || c === 0) {
-          curColor = '';
-          curBold = false;
-        } else if (c === 1) {
-          curBold = true;
-        } else if (c === 22) {
-          curBold = false;
-        } else if (c === 39) {
-          curColor = '';
-        } else if (c === 38 || c === 48) {
-          const mode = codes[i + 1];
-          if (mode === 5 && i + 2 < codes.length) {
-            if (c === 38 && !Number.isNaN(codes[i + 2])) {
-              curColor = ansi256ToHex(codes[i + 2]);
-            }
-            i += 2;
-          } else if (mode === 2 && i + 4 < codes.length) {
-            if (c === 38) {
-              const r = Math.max(0, Math.min(255, codes[i + 2] || 0));
-              const g = Math.max(0, Math.min(255, codes[i + 3] || 0));
-              const b = Math.max(0, Math.min(255, codes[i + 4] || 0));
-              curColor = `rgb(${r},${g},${b})`;
-            }
-            i += 4;
-          }
-        } else if (ANSI_COLORS[c]) {
-          curColor = ANSI_COLORS[c];
-        }
-      }
-      lastIdx = re.lastIndex;
-    }
-    if (lastIdx < text.length) {
-      segs.push({ text: text.slice(lastIdx), color: curColor, bold: curBold });
-    }
-    return segs;
+  function selectTab(id) {
+    activeTabId = id;
+    tabs = tabs.map((tb) => (tb.id === id && tb.unread ? { ...tb, unread: false } : tb));
   }
 
-  let segments = $derived(parseAnsiSgr(rawScreen));
-
-  function estimateGrid() {
-    if (!viewportEl || viewportEl.clientWidth <= 0 || viewportEl.clientHeight <= 0) {
-      return { cols: gridCols || 100, rows: gridRows || 28 };
+  function addNewTab() {
+    if (tabs.length >= maxTabs) {
+      showToast(t.term.tabLimitReached.replace('{max}', String(maxTabs)), 'warn');
+      return;
     }
-    const cols = Math.max(40, Math.min(240, Math.floor((viewportEl.clientWidth - 32) / 8)));
-    const rows = Math.max(16, Math.min(80, Math.floor((viewportEl.clientHeight - 32) / 19)));
-    return { cols, rows };
+    const created = makeTab('host', !requireReauth);
+    tabs = [...tabs, created];
+    activeTabId = created.id;
   }
 
-  function sendResize() {
-    const { cols, rows } = estimateGrid();
-    gridCols = cols;
-    gridRows = rows;
-    if (!ptySocket || ptySocket.readyState !== WebSocket.OPEN) return;
-    ptySocket.send(`\u0000resize:${JSON.stringify({ cols, rows })}`);
+  function removeTabNow(id) {
+    const idx = tabs.findIndex((tb) => tb.id === id);
+    if (idx < 0) return;
+    const remaining = tabs.filter((tb) => tb.id !== id);
+    if (remaining.length === 0) {
+      const fresh = makeTab('host', false);
+      tabs = [fresh];
+      activeTabId = fresh.id;
+      return;
+    }
+    tabs = remaining;
+    if (activeTabId === id) {
+      const fallback = remaining[Math.min(idx, remaining.length - 1)];
+      activeTabId = fallback.id;
+      tabs = tabs.map((tb) => (tb.id === fallback.id ? { ...tb, unread: false } : tb));
+    }
   }
 
-  async function connectPty() {
-    if (connState === 'connecting') return;
-    connState = 'connecting';
-    try {
-      const { cols, rows } = estimateGrid();
-      gridCols = cols;
-      gridRows = rows;
-      const { ticket } = await apiFetch('/api/pty/ticket', {
-        method: 'POST',
-        body: JSON.stringify({ target, reauth_password: reauthPassword }),
+  function requestCloseTab(tb) {
+    const isRunning = tb.connState === 'connected' || tb.connState === 'connecting';
+    if (isRunning && askConfirm) {
+      askConfirm({
+        title: t.term.closeTabConfirmTitle,
+        message: `${tabDisplayTitle(tb)} — ${t.term.closeTabConfirmDesc}`,
+        confirmLabel: t.term.closeTab,
+        danger: true,
+        onConfirm: () => removeTabNow(tb.id),
       });
-      reauthPassword = '';
-      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(
-        `${proto}//${location.host}/api/pty/ws?ticket=${encodeURIComponent(ticket)}&target=${encodeURIComponent(target)}&cols=${cols}&rows=${rows}`
-      );
-      rawScreen = '';
-      ws.onopen = () => {
-        connState = 'connected';
-        sendResize();
-        queueMicrotask(() => viewportEl?.focus());
-      };
-      ws.onmessage = (ev) => {
-        const shouldStick =
-          !viewportEl ||
-          viewportEl.scrollHeight - viewportEl.scrollTop - viewportEl.clientHeight < 48;
-        rawScreen = applyPtyChunk(rawScreen, ev.data);
-        if (shouldStick) {
-          queueMicrotask(() => {
-            if (viewportEl) viewportEl.scrollTop = viewportEl.scrollHeight;
-          });
-        }
-      };
-      ws.onerror = () => {
-        showToast(lang === 'en' ? 'PTY WebSocket connection error' : '终端 WebSocket 连接异常', 'error');
-      };
-      ws.onclose = () => {
-        if (ptySocket === ws) {
-          ptySocket = null;
-          connState = 'disconnected';
-        }
-      };
-      ptySocket = ws;
-    } catch (err) {
-      connState = 'disconnected';
-      showToast(err.message, 'error');
+      return;
     }
+    removeTabNow(tb.id);
   }
 
-  function reconnectPty() {
-    if (ptySocket) {
-      const old = ptySocket;
-      ptySocket = null;
-      connState = 'disconnected';
-      old.close();
-    }
-    connectPty();
+  function autofocus(node) {
+    node.focus();
+    node.select();
   }
 
-  function sendRaw(data) {
-    if (ptySocket && ptySocket.readyState === WebSocket.OPEN) {
-      ptySocket.send(data);
-    }
+  function startRenameTab(tb) {
+    editingTabId = tb.id;
+    editingTitle = tabDisplayTitle(tb);
   }
 
-  function submitLine(e) {
-    e.preventDefault();
-    if (!ptySocket) return;
-    sendRaw(lineInput + '\r');
-    lineInput = '';
+  function commitRenameTab() {
+    if (!editingTabId) return;
+    const nextTitle = editingTitle.trim().slice(0, 32);
+    const id = editingTabId;
+    editingTabId = 0;
+    tabs = tabs.map((tb) => (tb.id === id ? { ...tb, customTitle: nextTitle } : tb));
   }
 
-  function handleTerminalPaste(e) {
-    if (!ptySocket || ptySocket.readyState !== WebSocket.OPEN) return;
-    const pasted = e.clipboardData?.getData('text/plain');
-    if (pasted) {
-      e.preventDefault();
-      sendRaw(pasted);
-    }
+  function cancelRenameTab() {
+    editingTabId = 0;
   }
 
-  async function copyScreenOutput() {
-    const plain = rawScreen.replace(/\x1b\[[0-9;]*m/g, '');
-    if (!plain) return;
-    if (await copyText(plain)) showToast(t.copied, 'success');
-    else showToast(t.copyFailed, 'error');
+  function updateTabState(id, patch) {
+    const cur = tabs.find((tb) => tb.id === id);
+    if (!cur) return;
+    if (
+      cur.connState === patch.connState &&
+      cur.target === patch.target &&
+      cur.shell === patch.shell &&
+      cur.hasOutput === patch.hasOutput
+    ) {
+      return;
+    }
+    tabs = tabs.map((tb) => (tb.id === id ? { ...tb, ...patch } : tb));
   }
 
-  function handleTerminalKeydown(e) {
-    if (e.isComposing) return;
-    if (!ptySocket || ptySocket.readyState !== WebSocket.OPEN) return;
-    if (e.ctrlKey && !e.metaKey && !e.altKey) {
-      const k = e.key.toLowerCase();
-      if (k === 'c' && window.getSelection?.()?.toString()) {
-        return; // 允许用户复制选中的终端输出
-      }
-      if (k.length === 1 && k >= 'a' && k <= 'z') {
-        e.preventDefault();
-        if (k === 'l') rawScreen = '';
-        sendRaw(String.fromCharCode(k.charCodeAt(0) - 96));
-        return;
-      }
-    }
-    if (e.key === 'Enter') { e.preventDefault(); sendRaw('\r'); }
-    else if (e.key === 'Backspace') { e.preventDefault(); sendRaw('\x7f'); }
-    else if (e.key === 'Tab') { e.preventDefault(); sendRaw('\t'); }
-    else if (e.key === 'Escape') { e.preventDefault(); sendRaw('\x1b'); }
-    else if (e.key === 'Home') { e.preventDefault(); sendRaw('\x1b[H'); }
-    else if (e.key === 'End') { e.preventDefault(); sendRaw('\x1b[F'); }
-    else if (e.key === 'Delete') { e.preventDefault(); sendRaw('\x1b[3~'); }
-    else if (e.key === 'PageUp') { e.preventDefault(); sendRaw('\x1b[5~'); }
-    else if (e.key === 'PageDown') { e.preventDefault(); sendRaw('\x1b[6~'); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); sendRaw('\x1b[A'); }
-    else if (e.key === 'ArrowDown') { e.preventDefault(); sendRaw('\x1b[B'); }
-    else if (e.key === 'ArrowRight') { e.preventDefault(); sendRaw('\x1b[C'); }
-    else if (e.key === 'ArrowLeft') { e.preventDefault(); sendRaw('\x1b[D'); }
-    else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
-      e.preventDefault();
-      sendRaw(e.key);
-    }
+  function markTabUnread(id) {
+    if (id === activeTabId) return;
+    const cur = tabs.find((tb) => tb.id === id);
+    if (!cur || cur.unread) return;
+    tabs = tabs.map((tb) => (tb.id === id ? { ...tb, unread: true } : tb));
   }
 </script>
 
-<svelte:window onresize={sendResize} />
-
-<div class="card">
-  <div class="card-header">
-    <div>
-      <div class="card-title">
-        <span>{t.nav.web_terminal}</span>
-        <span class="badge {connState === 'connected' ? 'badge-ok' : connState === 'connecting' ? 'badge-warn' : 'badge-muted'}">
-          <span class="status-dot {connState === 'connected' ? 'ok' : connState === 'connecting' ? 'warn' : 'muted'}"></span>
-          <span>{connState === 'connected' ? t.term.connected : connState === 'connecting' ? t.term.connecting : t.term.disconnected}</span>
-        </span>
-        <span class="badge badge-muted mono">{gridCols}×{gridRows}</span>
-      </div>
-      <div style="font-size:12px;color:var(--text-secondary);">{t.term.subtitle}</div>
-    </div>
-    <form
-      class="btn-group"
-      onsubmit={(e) => {
-        e.preventDefault();
-        if (!ptySocket) connectPty();
-      }}
-    >
-      <select
-        class="control-compact"
-        style="width:210px;"
-        aria-label={t.term.hostShell}
-        bind:value={target}
-        disabled={Boolean(ptySocket)}
-      >
-        <option value="host">{t.term.hostShell}</option>
-        {#if hasCustomTargetOption}
-          <option value={target}>Docker: {target.slice('container:'.length)}</option>
-        {/if}
-        {#each runningAllowedContainers as c (c.id)}
-          <option value={`container:${c.name || c.id}`}>Docker: {c.name || c.id}</option>
-        {/each}
-      </select>
-      {#if requireReauth && !ptySocket}
-        <input
-          type="password"
-          class="control-compact"
-          style="width:165px;"
-          autocomplete="current-password"
-          aria-label={t.term.reauthPh}
-          placeholder={t.term.reauthPh}
-          bind:value={reauthPassword}
-        />
-      {/if}
-      {#if !ptySocket}
-        <button type="submit" class="btn btn-primary btn-sm" disabled={connState === 'connecting'}>
-          {connState === 'connecting' ? t.term.connecting : t.term.connect}
-        </button>
-      {:else}
-        <button type="button" class="btn btn-danger btn-sm" onclick={() => ptySocket?.close()}>
-          {t.term.disconnect}
-        </button>
-      {/if}
-    </form>
-  </div>
-
-  <!-- 触屏 / 快捷控制键栏（onmousedown preventDefault 防止抢走终端焦点） -->
-  {#if ptySocket || rawScreen}
-    <div class="btn-group" style="margin-bottom:10px;align-items:center;" aria-label={t.cfg.lblQuickKeys}>
-      {#if ptySocket}
-        <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b')}>Esc</button>
-        <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\t')}>Tab</button>
-        <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x03')}>Ctrl+C</button>
-        <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x04')}>Ctrl+D</button>
-        <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1a')}>Ctrl+Z</button>
-        <button
-          type="button"
-          class="btn btn-xs mono"
-          onmousedown={(e) => e.preventDefault()}
-          onclick={() => {
-            rawScreen = '';
-            sendRaw('\x0c');
+<div class="card pty-shell-card">
+  <!-- 多标签终端顶栏 -->
+  <div class="pty-tabbar">
+    <div class="pty-tab-list" role="tablist" aria-label={t.nav.web_terminal}>
+      {#each tabs as tb (tb.id)}
+        {@const isActive = tb.id === activeTabId}
+        <div
+          class="pty-tab {isActive ? 'active' : ''}"
+          onauxclick={(e) => {
+            if (e.button === 1) {
+              e.preventDefault();
+              requestCloseTab(tb);
+            }
           }}
         >
-          Ctrl+L
-        </button>
-        <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b[D')}>←</button>
-        <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b[A')}>↑</button>
-        <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b[B')}>↓</button>
-        <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b[C')}>→</button>
-      {/if}
-      <button type="button" class="btn btn-xs" onmousedown={(e) => e.preventDefault()} onclick={() => (rawScreen = '')}>
-        {t.cfg.lblClearScreen}
-      </button>
+          {#if editingTabId === tb.id}
+            <input
+              use:autofocus
+              type="text"
+              class="pty-tab-rename"
+              maxlength="32"
+              aria-label={t.term.renameHint}
+              bind:value={editingTitle}
+              onblur={commitRenameTab}
+              onkeydown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  commitRenameTab();
+                } else if (e.key === 'Escape') {
+                  e.preventDefault();
+                  cancelRenameTab();
+                }
+              }}
+            />
+          {:else}
+            <button
+              type="button"
+              role="tab"
+              aria-selected={isActive}
+              class="pty-tab-main"
+              title={t.term.renameHint}
+              onclick={() => selectTab(tb.id)}
+              ondblclick={() => startRenameTab(tb)}
+            >
+              <span
+                class="status-dot {tb.connState === 'connected'
+                  ? 'ok'
+                  : tb.connState === 'connecting'
+                    ? 'warn'
+                    : 'muted'}"
+              ></span>
+              {#if tb.target.startsWith('container:')}
+                <Icons name="docker" size={13} />
+              {/if}
+              <span class="pty-tab-title">{tabDisplayTitle(tb)}</span>
+              {#if tb.shell && tb.shell !== 'auto'}
+                <span class="pty-tab-shell mono">{tb.shell}</span>
+              {/if}
+              {#if tb.unread && !isActive}
+                <span class="pty-tab-unread" aria-label="Unread output"></span>
+              {/if}
+            </button>
+          {/if}
+          <button
+            type="button"
+            class="pty-tab-close"
+            title={t.term.closeTab}
+            aria-label={`${t.term.closeTab} ${tabDisplayTitle(tb)}`}
+            onclick={() => requestCloseTab(tb)}
+          >
+            <Icons name="x" size={12} />
+          </button>
+        </div>
+      {/each}
+
       <button
         type="button"
-        class="btn btn-xs"
-        disabled={!rawScreen}
-        onmousedown={(e) => e.preventDefault()}
-        onclick={copyScreenOutput}
+        class="pty-tab-add"
+        disabled={tabs.length >= maxTabs}
+        title={tabs.length >= maxTabs ? t.term.tabLimitReached.replace('{max}', String(maxTabs)) : t.term.newTab}
+        aria-label={t.term.newTab}
+        onclick={addNewTab}
       >
-        <Icons name="copy" size={12} />
-        <span>{t.cfg.lblCopyOut}</span>
-      </button>
-      <button
-        type="button"
-        class="btn btn-xs"
-        disabled={connState === 'connecting' || (requireReauth && !reauthPassword && !ptySocket)}
-        onclick={reconnectPty}
-      >
-        {t.cfg.lblReconnect}
+        <Icons name="plus" size={15} />
       </button>
     </div>
-  {/if}
 
-  <!-- 交互式 PTY 视口（支持直接键盘输入、粘贴文本、ANSI SGR/256/TrueColor 配色；下方保留命令栏兼容移动端输入法） -->
-  <div
-    bind:this={viewportEl}
-    role="textbox"
-    aria-multiline="true"
-    aria-label="PTY Terminal Viewport"
-    tabindex="0"
-    onkeydown={handleTerminalKeydown}
-    onpaste={handleTerminalPaste}
-    class="mono"
-    style="background:#05070a;color:#e2e8f0;padding:16px;border-radius:12px;min-height:340px;max-height:520px;overflow-y:auto;font-size:13px;line-height:1.45;white-space:pre-wrap;word-break:break-all;outline:none;border:1px solid var(--border-subtle);"
-  >
-    {#if segments.length > 0}
-      {#each segments as seg, i (i)}
-        {#if seg.color || seg.bold}
-          <span style={`${seg.color ? `color:${seg.color};` : ''}${seg.bold ? 'font-weight:700;' : ''}`}>{seg.text}</span>
-        {:else}
-          {seg.text}
-        {/if}
-      {/each}
-    {:else if !ptySocket}
-      <span style="color:#94a3b8;">{t.term.placeholder}</span>
-    {/if}
+    <div class="pty-tabbar-meta">
+      <span class="badge {connectedCount > 0 ? 'badge-ok' : 'badge-muted'} num">
+        {connectedCount} / {maxTabs}
+      </span>
+      {#if settingsJson && onSaveSettings}
+        <button type="button" class="btn btn-xs" onclick={openTermSettings}>
+          <Icons name="settings" size={12} />
+          <span>{lang === 'en' ? 'Settings' : '终端设置'}</span>
+        </button>
+      {/if}
+    </div>
   </div>
 
-  {#if ptySocket}
-    <form onsubmit={submitLine} style="display:flex;gap:8px;margin-top:12px;">
-      <input
-        type="text"
-        class="mono"
-        aria-label={t.term.inputPh}
-        bind:value={lineInput}
-        placeholder={t.term.inputPh}
-      />
-      <button type="submit" class="btn btn-primary">{t.term.send}</button>
-    </form>
-  {/if}
+  <!-- 各终端会话独立保活挂载（切换标签页不中断正在执行的后台命令） -->
+  <div class="pty-panes-wrap">
+    {#each tabs as tb (tb.id)}
+      <div style={tb.id === activeTabId ? '' : 'display:none;'}>
+        <TerminalPane
+          {t}
+          {lang}
+          active={visible && tb.id === activeTabId}
+          initialTarget={tb.initialTarget}
+          initialShell={tb.shell}
+          autoConnect={tb.autoConnect}
+          {availableShells}
+          {defaultHostShell}
+          {shellsLoaded}
+          {containers}
+          {requireReauth}
+          {dockerRequireReauth}
+          {onUnlockModule}
+          {requestReauth}
+          {apiFetch}
+          {showToast}
+          onStateChange={(patch) => updateTabState(tb.id, patch)}
+          onBackgroundActivity={() => markTabUnread(tb.id)}
+        />
+      </div>
+    {/each}
+  </div>
 </div>
+
+<!-- Web 终端专属设置弹窗 -->
+<EditorDialog
+  open={termSettingsOpen}
+  title={t.cfg.groupTerminal}
+  size="sm"
+  busy={termSettingsSaving}
+  {t}
+  {askConfirm}
+  onSubmit={saveTermSettings}
+  onClose={() => (termSettingsOpen = false)}
+>
+  <div class="field">
+    <label for="wt-mod-shell">{t.cfg.ptyShell}</label>
+    <ComboInput
+      id="wt-mod-shell"
+      placeholder="auto / bash / sh"
+      options={[
+        { value: 'auto', label: 'auto', sub: 'bash > sh' },
+        { value: 'bash', label: 'bash' },
+        { value: 'sh', label: 'sh' },
+        { value: '/bin/bash', label: '/bin/bash' },
+        { value: '/bin/sh', label: '/bin/sh' },
+      ]}
+      bind:value={termShellDraft}
+    />
+  </div>
+  <div class="field">
+    <label for="wt-mod-cwd">{t.cfg.ptyCwd}</label>
+    <input id="wt-mod-cwd" type="text" class="mono" bind:value={termCwdDraft} required />
+  </div>
+  <div class="form-grid">
+    <div class="field">
+      <label for="wt-mod-idle">{t.cfg.ptyIdle}</label>
+      <input id="wt-mod-idle" type="number" min="60" max="3600" bind:value={termIdleDraft} required />
+    </div>
+    <div class="field">
+      <label for="wt-mod-max">{t.cfg.ptyMaxSess}</label>
+      <input id="wt-mod-max" type="number" min="1" max="10" bind:value={termMaxDraft} required />
+    </div>
+  </div>
+</EditorDialog>

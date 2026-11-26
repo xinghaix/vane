@@ -2,7 +2,15 @@
   import Icons from './Icons.svelte';
   import SecretField from './SecretField.svelte';
   import HeaderRowsEditor from './HeaderRowsEditor.svelte';
+  import EditorDialog from './EditorDialog.svelte';
+  import Select from './Select.svelte';
+  import ComboInput from './ComboInput.svelte';
+  import FacetFilter from './FacetFilter.svelte';
+  import CronSchedulePicker from './CronSchedulePicker.svelte';
+  import { describeCronExpr, validateCronExpr } from '../lib/cron.js';
   import {
+    splitCsv,
+    joinCsv,
     splitLines,
     kvObjectToRows,
     rowsToKvObject,
@@ -44,6 +52,70 @@
   let saving = $state(false);
   let dockerQuery = $state('');
   let dockerStateFilter = $state('all'); // all | running | exited
+  let dockerSettingsOpen = $state(false);
+  let dockerSocketDraft = $state('/var/run/docker.sock');
+  let dockerProtectedCsv = $state('');
+  let dockerLogTailDraft = $state(200);
+  let dockerLogTsDraft = $state(false);
+  let logSettingsOpen = $state(false);
+  let logRingCapDraft = $state(300);
+
+  let containerNameOptions = $derived(
+    (containers || []).map((c) => ({ value: c.name || c.id, label: c.name || c.id, sub: c.image || '' }))
+  );
+
+  function openDockerSettings() {
+    if (!settingsJson) return;
+    dockerSocketDraft = String(settingsJson.admin?.docker_socket || '/var/run/docker.sock');
+    dockerProtectedCsv = joinCsv(settingsJson.docker?.protected_containers);
+    dockerLogTailDraft = Number(settingsJson.docker?.log_tail_default || 200);
+    dockerLogTsDraft = Boolean(settingsJson.docker?.log_timestamps);
+    dockerSettingsOpen = true;
+  }
+
+  async function saveDockerSettings(e) {
+    e.preventDefault();
+    if (saving || !settingsJson) return;
+    saving = true;
+    try {
+      const next = deepClone(settingsJson);
+      next.docker = {
+        ...next.docker,
+        protected_containers: splitCsv(dockerProtectedCsv),
+        log_tail_default: Math.max(10, Math.min(2000, Number(dockerLogTailDraft) || 200)),
+        log_timestamps: Boolean(dockerLogTsDraft),
+      };
+      if (await onSaveSettings(next)) {
+        dockerSettingsOpen = false;
+      }
+    } finally {
+      saving = false;
+    }
+  }
+
+  function openLogsSettings() {
+    if (!settingsJson) return;
+    logRingCapDraft = Number(settingsJson.system?.log_ring_capacity || logCapacity || 300);
+    logSettingsOpen = true;
+  }
+
+  async function saveLogsSettings(e) {
+    e.preventDefault();
+    if (saving || !settingsJson) return;
+    saving = true;
+    try {
+      const next = deepClone(settingsJson);
+      next.system = {
+        ...next.system,
+        log_ring_capacity: Math.max(50, Math.min(1000, Number(logRingCapDraft) || 300)),
+      };
+      if (await onSaveSettings(next)) {
+        logSettingsOpen = false;
+      }
+    } finally {
+      saving = false;
+    }
+  }
 
   // ---------------- Docker Logs Modal ----------------
   let logModalOpen = $state(false);
@@ -206,11 +278,7 @@
   let cronHttpBodyInput = $state('');
   let cronHttpBodyClear = $state(false);
   let cronHttpHeaderRows = $state([]);
-  let cronPreviewRuns = $state([]);
-  let cronPreviewError = $state('');
   let expandedCronOutput = $state({});
-  let cronPreviewTimer = null;
-  let cronPreviewSeq = 0;
 
   let ruleNamesForKind = $derived(
     cronDraft?.action?.target_kind === 'reverse_proxy'
@@ -222,69 +290,52 @@
     void mode;
     closeLogModal();
     cronDrawerOpen = false;
+    dockerSettingsOpen = false;
+    logSettingsOpen = false;
     dockerQuery = '';
     dockerStateFilter = 'all';
-    if (cronPreviewTimer) {
-      clearTimeout(cronPreviewTimer);
-      cronPreviewTimer = null;
-    }
   });
 
-  $effect(() => {
-    return () => {
-      if (cronPreviewTimer) clearTimeout(cronPreviewTimer);
-    };
-  });
-
-  async function refreshCronPreview(expr) {
-    const trimmed = String(expr || '').trim();
-    const seq = ++cronPreviewSeq;
-    if (!trimmed) {
-      cronPreviewRuns = [];
-      cronPreviewError = '';
-      return;
+  function cronActionLabel(kind) {
+    const en = lang === 'en';
+    switch (kind) {
+      case 'docker_prune_images':
+        return en ? 'Prune Docker Images' : '清理 Docker 镜像';
+      case 'docker_restart_container':
+        return en ? 'Restart Container' : '重启容器';
+      case 'rule_toggle':
+        return en ? 'Toggle Rule' : '开关规则';
+      case 'http_request':
+        return en ? 'HTTP Request' : 'HTTP 请求';
+      case 'exec':
+        return en ? 'Run Command' : '执行命令';
+      default:
+        return kind || '';
     }
-    try {
-      const r = await apiFetch(`/api/cron/preview?expr=${encodeURIComponent(trimmed)}`);
-      if (seq !== cronPreviewSeq) return;
-      if (r.valid) {
-        cronPreviewRuns = r.formatted || [];
-        cronPreviewError = '';
-      } else {
-        cronPreviewRuns = [];
-        cronPreviewError = r.error || (lang === 'en' ? 'Invalid cron expression' : 'Cron 表达式格式错误');
-      }
-    } catch (err) {
-      if (seq !== cronPreviewSeq) return;
-      cronPreviewRuns = [];
-      cronPreviewError = err.message || '';
-    }
-  }
-
-  function scheduleCronPreview(expr) {
-    if (cronPreviewTimer) clearTimeout(cronPreviewTimer);
-    if (!String(expr || '').trim()) {
-      cronPreviewSeq++;
-      cronPreviewRuns = [];
-      cronPreviewError = '';
-      return;
-    }
-    cronPreviewTimer = setTimeout(() => {
-      cronPreviewTimer = null;
-      refreshCronPreview(expr);
-    }, 300);
   }
 
   function cronActionSummary(action) {
     if (!action) return '';
+    const en = lang === 'en';
     if (action.kind === 'docker_prune_images') {
-      return action.dangling_only !== false ? 'dangling=true' : 'all unused';
+      return action.dangling_only !== false
+        ? en
+          ? 'Dangling images only'
+          : '仅清理悬空镜像'
+        : en
+          ? 'All unused images'
+          : '清理全部未用镜像';
     }
     if (action.kind === 'docker_restart_container') {
       return action.container || '';
     }
     if (action.kind === 'rule_toggle') {
-      return `${action.target_kind}/${action.rule || '?'} → ${action.enable ? 'ON' : 'OFF'}`;
+      const modName =
+        action.target_kind === 'reverse_proxy'
+          ? t.nav.reverse_proxy
+          : t.nav.port_forward;
+      const act = action.enable ? (en ? 'Enable' : '开启') : en ? 'Disable' : '关闭';
+      return `${act} ${modName} · ${action.rule || '?'}`;
     }
     if (action.kind === 'http_request') {
       return `${action.method || 'POST'} HTTP`;
@@ -297,19 +348,13 @@
   }
 
   function openCronDrawer(idx = -1) {
-    if (cronPreviewTimer) {
-      clearTimeout(cronPreviewTimer);
-      cronPreviewTimer = null;
-    }
-    cronPreviewRuns = [];
-    cronPreviewError = '';
     cronEditIdx = idx;
     const c = idx >= 0
       ? deepClone(settingsJson.cron[idx])
       : {
           name: `job_${(settingsJson?.cron?.length || 0) + 1}`,
           enabled: true,
-          schedule: '0 0 4 * * *',
+          schedule: '0 4 * * *',
           timeout_secs: 60,
           action: { kind: 'docker_prune_images', dangling_only: true },
           notify_on_failure: true,
@@ -324,7 +369,6 @@
     cronHttpBodyClear = false;
     cronHttpHeaderRows = c.action?.kind === 'http_request' ? kvObjectToRows(c.action.headers) : [];
     cronDrawerOpen = true;
-    refreshCronPreview(c.schedule);
   }
 
   function onCronKindChange() {
@@ -342,8 +386,8 @@
     } else if (cronActionKind === 'http_request') {
       cronDraft.action = { kind: 'http_request', method: 'POST', url: '', headers: {}, body: '' };
     } else {
-      cronDraft.action = { kind: 'exec', program: '/usr/bin/logger', args: ['vane-cron'], cwd: '' };
-      cronArgsLines = 'vane-cron';
+      cronDraft.action = { kind: 'exec', program: '', args: [], cwd: '' };
+      cronArgsLines = '';
     }
   }
 
@@ -353,6 +397,11 @@
     cronDraft.name = String(cronDraft.name || '').trim();
     if (!cronDraft.name) {
       showToast(lang === 'en' ? 'Job name is required' : '请填写任务名称', 'error');
+      return;
+    }
+    const schedCheck = validateCronExpr(cronDraft.schedule, lang);
+    if (!schedCheck.valid) {
+      showToast(schedCheck.error, 'error');
       return;
     }
     saving = true;
@@ -508,428 +557,477 @@
   }
 </script>
 
-<svelte:window
-  onkeydown={(e) => {
-    if (e.defaultPrevented || saving) return;
-    if (e.key === 'Escape') {
-      if (logModalOpen) closeLogModal();
-      else if (cronDrawerOpen) cronDrawerOpen = false;
-    }
-  }}
-/>
-
-<!-- ===================== Docker 容器管理 ===================== -->
+<!-- ===================== Docker 容器管理（对齐 Arcane Screenshot 1 无冗余嵌套） ===================== -->
 {#if mode === 'docker'}
-  <div class="card">
-    <div class="card-header">
-      <div>
-        <div class="card-title">{t.nav.docker}</div>
-        <div style="font-size:12px;color:var(--text-secondary);">{t.dk.subtitle}</div>
-      </div>
-      <div class="btn-group">
-        <button type="button" class="btn btn-sm btn-danger" disabled={busyKey === 'dk:prune'} onclick={triggerDockerPrune}>
-          {busyKey === 'dk:prune' ? '...' : t.dk.prune}
-        </button>
-        <button type="button" class="btn btn-sm" onclick={() => onRefresh()}>{t.refresh}</button>
+  <div class="page-section-bar">
+    <div>
+      <div class="page-section-desc">{t.dk.subtitle}</div>
+      {#if containers?.length}
+        <div class="stat-inline-strip num">
+          <span class="stat-inline-item"><span class="status-dot" style="background:var(--info);"></span><span class="stat-inline-num">{containers.length}</span><span>{t.all}</span></span>
+          <span class="stat-inline-item"><span class="status-dot ok"></span><span class="stat-inline-num">{runningContainersCount}</span><span>{t.statuses.running}</span></span>
+          <span class="stat-inline-item"><span class="status-dot muted"></span><span class="stat-inline-num">{exitedContainersCount}</span><span>{t.statuses.exited}</span></span>
+        </div>
+      {/if}
+    </div>
+    <div class="btn-group">
+      <button type="button" class="btn btn-sm" onclick={openDockerSettings}>
+        <Icons name="settings" size={14} />
+        <span>{lang === 'en' ? 'Docker Settings' : 'Docker 设置'}</span>
+      </button>
+      <button type="button" class="btn btn-sm btn-danger" disabled={busyKey === 'dk:prune'} onclick={triggerDockerPrune}>
+        {busyKey === 'dk:prune' ? '...' : t.dk.prune}
+      </button>
+    </div>
+  </div>
+
+  {#if dockerError}
+    <div class="banner banner-danger">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <Icons name="alert" size={16} />
+        <span class="mono" style="font-size:12.5px;">{dockerError}</span>
       </div>
     </div>
+  {/if}
 
-    {#if dockerError}
-      <div class="banner banner-danger">
-        <div style="display:flex;align-items:center;gap:8px;">
-          <Icons name="alert" size={16} />
-          <span class="mono" style="font-size:12.5px;">{dockerError}</span>
-        </div>
-      </div>
-    {/if}
-
-    {#if containers?.length}
-      <div class="toolbar">
+  {#if containers?.length}
+    <div class="toolbar">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:1;min-width:0;">
         <div class="search-wrap">
           <span class="search-icon"><Icons name="search" size={15} /></span>
           <input type="text" placeholder={t.search} aria-label={t.search} bind:value={dockerQuery} />
         </div>
-        <div class="btn-group">
-          <button type="button" class="chip {dockerStateFilter === 'all' ? 'active' : ''}" onclick={() => (dockerStateFilter = 'all')}>
-            {t.all} ({containers.length})
-          </button>
-          <button type="button" class="chip {dockerStateFilter === 'running' ? 'active' : ''}" onclick={() => (dockerStateFilter = 'running')}>
-            {t.statuses.running} ({runningContainersCount})
-          </button>
-          <button type="button" class="chip {dockerStateFilter === 'exited' ? 'active' : ''}" onclick={() => (dockerStateFilter = 'exited')}>
-            {t.statuses.exited} ({exitedContainersCount})
-          </button>
-        </div>
+        <FacetFilter
+          label={lang === 'en' ? 'State' : '状态'}
+          bind:value={dockerStateFilter}
+          options={[
+            { value: 'all', label: t.all, count: containers.length },
+            { value: 'running', label: t.statuses.running, count: runningContainersCount, tone: 'ok' },
+            { value: 'exited', label: t.statuses.exited, count: exitedContainersCount, tone: 'muted' },
+          ]}
+        />
       </div>
-    {/if}
+      <span class="mono" style="font-size:12px;color:var(--text-muted);">
+        {filteredContainers.length} / {containers.length}
+      </span>
+    </div>
+  {/if}
 
-    {#if !containers?.length}
-      {#if !dockerError}
-        <div class="empty-state">{t.dk.empty}</div>
-      {/if}
-    {:else if !filteredContainers.length}
-      <div class="empty-state">{t.common.noMatches}</div>
-    {:else}
-      <div style="display:grid;gap:10px;">
-        {#each filteredContainers as c (c.id)}
-          {@const protectedHint = c.protected
-            ? lang === 'en'
-              ? 'Protected container (configured in Settings)'
-              : '受保护容器（已在系统设置中锁定）'
-            : undefined}
-          <div class="subcard row-between">
-            <div style="min-width:0;flex:1;">
-              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                <span class="status-dot {c.state === 'running' ? 'ok' : c.state === 'exited' ? 'muted' : 'warn'}"></span>
-                <span style="font-weight:700;font-size:15px;">{c.name || c.id}</span>
-                <code class="mono" style="font-size:12px;color:var(--text-secondary);word-break:break-all;">{c.image}</code>
-                <span class="badge {c.state === 'running' ? 'badge-ok' : c.state === 'exited' ? 'badge-muted' : 'badge-warn'}">
-                  {translateRuntimeStatus(c.state, t)}
-                </span>
-                {#if c.protected}
-                  <span class="badge badge-info" title={protectedHint}>{t.dk.protected}</span>
-                {/if}
-              </div>
-              <div class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:4px;">
-                ID: {c.id} · {c.status}
-              </div>
-            </div>
-            <div class="btn-group">
-              {#if c.state !== 'running'}
-                <button
-                  type="button"
-                  class="btn btn-xs btn-primary"
-                  disabled={busyKey.startsWith(`dk:${c.id}`)}
-                  onclick={() => runContainerActionConfirmed(c, 'start')}
-                >
-                  {t.dk.start}
-                </button>
-              {:else}
-                <button
-                  type="button"
-                  class="btn btn-xs"
-                  title={protectedHint}
-                  disabled={c.protected || busyKey.startsWith(`dk:${c.id}`)}
-                  onclick={() => runContainerActionConfirmed(c, 'restart')}
-                >
-                  {t.dk.restart}
-                </button>
-                <button
-                  type="button"
-                  class="btn btn-xs btn-danger"
-                  title={protectedHint}
-                  disabled={c.protected || busyKey.startsWith(`dk:${c.id}`)}
-                  onclick={() => runContainerActionConfirmed(c, 'stop')}
-                >
-                  {t.dk.stop}
-                </button>
-                {#if webTerminalEnabled}
-                  <button
-                    type="button"
-                    class="btn btn-xs"
-                    title={protectedHint}
-                    disabled={c.protected}
-                    onclick={() => onOpenContainerTerminal(c.name || c.id)}
-                  >
-                    {t.dk.shell}
-                  </button>
-                {/if}
-              {/if}
-              <button type="button" class="btn btn-xs" onclick={() => viewContainerLogs(c)}>{t.dk.logs}</button>
-            </div>
-          </div>
-        {/each}
-      </div>
+  {#if !containers?.length}
+    {#if !dockerError}
+      <div class="empty-state">{t.dk.empty}</div>
     {/if}
-  </div>
+  {:else if !filteredContainers.length}
+    <div class="empty-state">{t.common.noMatches}</div>
+  {:else}
+    <div class="card" style="padding:10px 12px;">
+      <div class="arcane-table-wrap">
+        <table class="arcane-table">
+          <thead>
+            <tr>
+              <th>{lang === 'en' ? 'Container' : '名称'}</th>
+              <th>{lang === 'en' ? 'State' : '状态'}</th>
+              <th>{lang === 'en' ? 'Status' : '运行时间'}</th>
+              <th>{lang === 'en' ? 'Actions' : '操作'}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each filteredContainers as c (c.id)}
+              {@const protectedHint = c.protected
+                ? lang === 'en'
+                  ? 'Protected container (edit in Docker Settings)'
+                  : '受保护容器（可在右上角「Docker 设置」中调整）'
+                : undefined}
+              <tr>
+                <td>
+                  <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+                    <span
+                      style="width:32px;height:32px;border-radius:10px;background:{c.state === 'running' ? 'var(--accent-soft)' : 'var(--bg-elevated)'};color:{c.state === 'running' ? 'var(--accent)' : 'var(--text-muted)'};display:grid;place-items:center;flex-shrink:0;"
+                    >
+                      <Icons name="docker" size={16} />
+                    </span>
+                    <div style="min-width:0;">
+                      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                        <span style="font-weight:600;color:var(--text-primary);">{c.name || c.id}</span>
+                        {#if c.protected}
+                          <span class="badge badge-info" style="font-size:10.5px;padding:1px 7px;" title={protectedHint}>{t.dk.protected}</span>
+                        {/if}
+                      </div>
+                      <div class="mono" style="font-size:11.5px;color:var(--text-muted);max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                        {c.image}
+                      </div>
+                    </div>
+                  </div>
+                </td>
+                <td>
+                  <span class="badge {c.state === 'running' ? 'badge-ok' : c.state === 'exited' ? 'badge-muted' : 'badge-warn'}">
+                    {translateRuntimeStatus(c.state, t)}
+                  </span>
+                </td>
+                <td>
+                  <div class="mono" style="font-size:12px;color:var(--text-secondary);">{c.status}</div>
+                  <div class="mono" style="font-size:11px;color:var(--text-muted);">{String(c.id || '').slice(0, 12)}</div>
+                </td>
+                <td>
+                  <div class="btn-group" style="justify-content:flex-end;">
+                    {#if c.state !== 'running'}
+                      <button
+                        type="button"
+                        class="btn btn-xs btn-primary"
+                        disabled={busyKey.startsWith(`dk:${c.id}`)}
+                        onclick={() => runContainerActionConfirmed(c, 'start')}
+                      >
+                        {t.dk.start}
+                      </button>
+                    {:else}
+                      <button
+                        type="button"
+                        class="btn btn-xs"
+                        title={protectedHint}
+                        disabled={c.protected || busyKey.startsWith(`dk:${c.id}`)}
+                        onclick={() => runContainerActionConfirmed(c, 'restart')}
+                      >
+                        {t.dk.restart}
+                      </button>
+                      <button
+                        type="button"
+                        class="btn btn-xs btn-danger"
+                        title={protectedHint}
+                        disabled={c.protected || busyKey.startsWith(`dk:${c.id}`)}
+                        onclick={() => runContainerActionConfirmed(c, 'stop')}
+                      >
+                        {t.dk.stop}
+                      </button>
+                      {#if webTerminalEnabled}
+                        <button
+                          type="button"
+                          class="btn btn-xs"
+                          title={protectedHint}
+                          disabled={c.protected}
+                          onclick={() => onOpenContainerTerminal(c.name || c.id)}
+                        >
+                          {t.dk.shell}
+                        </button>
+                      {/if}
+                    {/if}
+                    <button type="button" class="btn btn-xs" onclick={() => viewContainerLogs(c)}>{t.dk.logs}</button>
+                  </div>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {/if}
 {/if}
 
 <!-- ===================== Cron 计划任务 ===================== -->
 {#if mode === 'cron' && settingsJson}
-  <div class="card">
-    <div class="card-header">
-      <div>
-        <div class="card-title">{t.nav.cron}</div>
-        <div style="font-size:12px;color:var(--text-secondary);">{t.cronPage.subtitle}</div>
-      </div>
-      <button type="button" class="btn btn-primary btn-sm" onclick={() => openCronDrawer(-1)}>
-        <Icons name="plus" size={14} />
-        <span>{t.add}</span>
-      </button>
+  {@const crTotal = settingsJson.cron?.length || 0}
+  {@const crOn = (settingsJson.cron || []).filter((x) => x.enabled).length}
+  <div class="page-section-bar">
+    <div>
+      <div class="page-section-desc">{t.cronPage.subtitle}</div>
+      {#if crTotal > 0}
+        <div class="stat-inline-strip num">
+          <span class="stat-inline-item"><span class="status-dot" style="background:var(--info);"></span><span class="stat-inline-num">{crTotal}</span><span>{t.all}</span></span>
+          <span class="stat-inline-item"><span class="status-dot ok"></span><span class="stat-inline-num">{crOn}</span><span>{t.enabled}</span></span>
+          <span class="stat-inline-item"><span class="status-dot muted"></span><span class="stat-inline-num">{crTotal - crOn}</span><span>{t.disabled}</span></span>
+        </div>
+      {/if}
     </div>
+    <button type="button" class="btn btn-primary btn-sm" onclick={() => openCronDrawer(-1)}>
+      <Icons name="plus" size={14} />
+      <span>{t.add}</span>
+    </button>
+  </div>
 
-    {#if !settingsJson.cron?.length}
-      <div class="empty-state">{t.common.empty}</div>
-    {:else}
-      <div style="display:grid;gap:12px;">
-        {#each settingsJson.cron as job, idx (job.name)}
-          {@const st = (dashboard?.cron || []).find((x) => x.name === job.name)}
-          {@const summary = cronActionSummary(job.action)}
-          {@const outStr = st?.last_output || ''}
-          {@const isLongOut = outStr.length > 120 || outStr.includes('\n')}
-          {@const isExpanded = Boolean(expandedCronOutput[job.name])}
-          <div class="subcard">
-            <div class="row-between">
-              <div style="min-width:0;flex:1;">
-                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                  <span class="status-dot {job.enabled ? (st?.status === 'failed' ? 'danger' : 'ok') : 'muted'}"></span>
-                  <span style="font-weight:700;font-size:15px;">{job.name}</span>
-                  <span class="badge badge-info mono">{job.schedule}</span>
-                  <span class="badge badge-muted">{job.action.kind}</span>
-                  <span class="badge badge-muted mono">{job.timeout_secs || 60}s</span>
-                  {#if job.notify_on_failure}
-                    <span class="badge badge-info">{lang === 'en' ? 'Notify' : '失败告警'}</span>
-                  {/if}
-                  {#if st}
-                    <span class="badge {st.running ? 'badge-info' : st.status === 'ok' ? 'badge-ok' : st.status === 'failed' ? 'badge-danger' : 'badge-warn'}">
-                      {st.running ? t.statuses.running : translateRuntimeStatus(st.status, t)}
+  {#if !crTotal}
+    <div class="empty-state">{t.common.empty}</div>
+  {:else}
+    <div class="card" style="padding:10px 12px;">
+      <div class="arcane-table-wrap">
+        <table class="arcane-table">
+          <thead>
+            <tr>
+              <th>{t.cronPage.jobName}</th>
+              <th>{lang === 'en' ? 'Schedule' : '调度'}</th>
+              <th>{lang === 'en' ? 'Last Run' : '最近执行'}</th>
+              <th>{lang === 'en' ? 'Actions' : '操作'}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each settingsJson.cron as job, idx (job.name)}
+              {@const st = (dashboard?.cron || []).find((x) => x.name === job.name)}
+              {@const summary = cronActionSummary(job.action)}
+              {@const outStr = st?.last_output || ''}
+              {@const isLongOut = outStr.length > 90 || outStr.includes('\n')}
+              {@const isExpanded = Boolean(expandedCronOutput[job.name])}
+              <tr>
+                <td>
+                  <div style="display:flex;align-items:center;gap:10px;min-width:0;">
+                    <span class="icon-tile sm {job.enabled ? (st?.status === 'failed' ? 'danger' : '') : 'muted'}">
+                      <Icons name="cron" size={14} />
                     </span>
-                  {/if}
-                </div>
-                {#if summary}
-                  <div class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:4px;word-break:break-all;">
-                    {summary}
+                    <div style="min-width:0;">
+                      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                        <span style="font-weight:600;">{job.name}</span>
+                        <span class="badge badge-muted" style="font-size:10.5px;">{cronActionLabel(job.action.kind)}</span>
+                        {#if job.notify_on_failure}
+                          <span class="badge badge-info" style="font-size:10.5px;">{lang === 'en' ? 'Notify' : '失败告警'}</span>
+                        {/if}
+                      </div>
+                      {#if summary}
+                        <div style="font-size:11.5px;color:var(--text-muted);max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                          {summary}
+                        </div>
+                      {/if}
+                    </div>
                   </div>
-                {/if}
-                {#if st?.last_run_unix}
-                  <div class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:5px;">
-                    <span>Last: {formatUnixTime(st.last_run_unix)} ({st.last_duration_ms}ms)</span>
-                    {#if outStr}
-                      <span> · {isLongOut && !isExpanded ? `${outStr.slice(0, 120)}…` : outStr}</span>
+                </td>
+                <td>
+                  <div style="display:flex;flex-direction:column;gap:3px;align-items:flex-start;">
+                    <span style="font-size:12.5px;font-weight:500;color:var(--text-primary);">
+                      {describeCronExpr(job.schedule, lang) || job.schedule}
+                    </span>
+                    <span class="port-pill mono" style="font-size:11px;">
+                      <span class="port-pill-lead">{job.schedule}</span>
+                      <span>{job.timeout_secs || 60}s</span>
+                    </span>
+                  </div>
+                </td>
+                <td>
+                  <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                    {#if st}
+                      <span class="badge {st.running ? 'badge-info' : st.status === 'ok' ? 'badge-ok' : st.status === 'failed' ? 'badge-danger' : 'badge-warn'}">
+                        {st.running ? t.statuses.running : translateRuntimeStatus(st.status, t)}
+                      </span>
+                    {:else}
+                      <span class="badge badge-muted">{t.statuses.idle}</span>
+                    {/if}
+                    {#if st?.last_run_unix}
+                      <span class="mono" style="font-size:11.5px;color:var(--text-muted);">
+                        {formatUnixTime(st.last_run_unix)} ({st.last_duration_ms}ms)
+                      </span>
+                    {/if}
+                  </div>
+                  {#if outStr}
+                    <div class="mono" style="font-size:11px;color:var(--text-secondary);margin-top:4px;max-width:320px;word-break:break-word;">
+                      {isLongOut && !isExpanded ? `${outStr.slice(0, 90)}…` : outStr}
                       {#if isLongOut}
                         <button
                           type="button"
                           class="btn btn-ghost btn-xs"
-                          style="margin-left:4px;min-height:22px;padding:0 6px;"
+                          style="min-height:20px;padding:0 5px;"
                           onclick={() => (expandedCronOutput = { ...expandedCronOutput, [job.name]: !isExpanded })}
                         >
                           {isExpanded ? (lang === 'en' ? 'Collapse' : '收起') : (lang === 'en' ? 'Expand' : '展开')}
                         </button>
                       {/if}
-                      <button
-                        type="button"
-                        class="btn btn-ghost btn-xs"
-                        style="margin-left:2px;min-height:22px;padding:0 6px;"
-                        aria-label={t.copy}
-                        onclick={() => handleCopyText(outStr)}
-                      >
-                        <Icons name="copy" size={12} />
-                      </button>
-                    {/if}
+                    </div>
+                  {/if}
+                </td>
+                <td>
+                  <div class="btn-group" style="justify-content:flex-end;">
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={job.enabled}
+                      aria-label={`Toggle ${job.name}`}
+                      class="switch switch-xs"
+                      disabled={busyToggleKey === `cron:${idx}`}
+                      onclick={() => toggleCronEnabled(idx)}
+                    >
+                      <span class="switch-thumb"></span>
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-xs btn-primary"
+                      title={!job.enabled ? t.cronPage.disabledRunHint : ''}
+                      disabled={!job.enabled || Boolean(st?.running) || busyKey === `cron:${job.name}`}
+                      onclick={() => runCronNow(job.name)}
+                    >
+                      {st?.running || busyKey === `cron:${job.name}` ? '...' : t.cronPage.runNow}
+                    </button>
+                    <button type="button" class="btn btn-xs" onclick={() => openCronDrawer(idx)}>{t.edit}</button>
+                    <button type="button" class="btn btn-xs btn-danger" onclick={() => deleteCron(idx)}>{t.delete}</button>
                   </div>
-                {/if}
-              </div>
-              <div class="btn-group">
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={job.enabled}
-                  aria-label={`Toggle ${job.name}`}
-                  class="switch"
-                  disabled={busyToggleKey === `cron:${idx}`}
-                  onclick={() => toggleCronEnabled(idx)}
-                >
-                  <span class="switch-thumb"></span>
-                </button>
-                <button
-                  type="button"
-                  class="btn btn-xs btn-primary"
-                  disabled={Boolean(st?.running) || busyKey === `cron:${job.name}`}
-                  onclick={() => runCronNow(job.name)}
-                >
-                  {st?.running || busyKey === `cron:${job.name}` ? '...' : t.cronPage.runNow}
-                </button>
-                <button type="button" class="btn btn-xs" onclick={() => openCronDrawer(idx)}>{t.edit}</button>
-                <button type="button" class="btn btn-xs btn-danger" onclick={() => deleteCron(idx)}>{t.delete}</button>
-              </div>
-            </div>
-          </div>
-        {/each}
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
       </div>
+    </div>
+  {/if}
+{/if}
+
+<!-- ===================== 运行日志（Arcane 分面筛选 + 结构化控制台） ===================== -->
+{#if mode === 'logs'}
+  <div class="toolbar">
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:1;min-width:0;">
+      <div class="search-wrap" style="max-width:260px;">
+        <span class="search-icon"><Icons name="search" size={14} /></span>
+        <input type="text" placeholder={t.search} aria-label={t.search} bind:value={logQuery} />
+      </div>
+      <FacetFilter
+        label={lang === 'en' ? 'Module' : '模块'}
+        value={logModuleFilter || 'all'}
+        options={[
+          { value: 'all', label: t.logsPage.allModules },
+          ...logModules.map((m) => ({ value: m, label: m })),
+        ]}
+        onchange={(val) => onChangeLogFilter?.(logLevelFilter, val === 'all' ? '' : val)}
+      />
+      <FacetFilter
+        label={lang === 'en' ? 'Level' : '级别'}
+        value={logLevelFilter || 'all'}
+        options={[
+          { value: 'all', label: 'ALL' },
+          { value: 'info', label: 'INFO+', tone: 'ok' },
+          { value: 'warn', label: 'WARN+', tone: 'warn' },
+          { value: 'error', label: 'ERROR', tone: 'danger' },
+        ]}
+        onchange={(val) => onChangeLogFilter?.(val === 'all' ? '' : val, logModuleFilter)}
+      />
+      <span class="mono" style="font-size:12px;color:var(--text-muted);">
+        {filteredLogs.length} / {logCapacity}
+      </span>
+    </div>
+    <div class="btn-group">
+      <button type="button" class="btn btn-sm" onclick={() => (logNewestFirst = !logNewestFirst)}>
+        {logNewestFirst ? t.logsPage.newestFirst : t.logsPage.oldestFirst}
+      </button>
+      <button type="button" class="btn btn-sm {logLiveTail ? 'btn-primary' : ''}" onclick={() => (logLiveTail = !logLiveTail)}>
+        {#if logLiveTail}<span class="status-dot" style="background:#fff;width:6px;height:6px;"></span>{/if}
+        <span>{t.logsPage.liveTail}</span>
+      </button>
+      <button
+        type="button"
+        class="btn btn-sm"
+        disabled={!filteredLogs.length}
+        onclick={() => handleCopyText(formatLogLines(filteredLogs))}
+      >
+        <Icons name="copy" size={13} />
+        <span>{t.copy}</span>
+      </button>
+      <button
+        type="button"
+        class="btn btn-sm"
+        disabled={!filteredLogs.length}
+        onclick={() => downloadTextFile(`vane-logs-${new Date().toISOString().slice(0, 10)}.log`, formatLogLines(filteredLogs))}
+      >
+        <Icons name="download" size={13} />
+        <span>{t.logsPage.exportLog}</span>
+      </button>
+      <button type="button" class="btn btn-sm" onclick={openLogsSettings}>
+        <Icons name="settings" size={13} />
+        <span>{lang === 'en' ? 'Settings' : '日志设置'}</span>
+      </button>
+      <button type="button" class="btn btn-sm btn-danger" onclick={clearAllLogs}>{t.logsPage.clear}</button>
+    </div>
+  </div>
+
+  <div bind:this={sysLogsEl} class="log-console mono">
+    {#if !filteredLogs.length}
+      <div class="empty-state" style="border:none;background:transparent;">{t.logsPage.empty}</div>
+    {:else}
+      {#each filteredLogs as entry (entry.seq)}
+        <div class="log-entry">
+          <span style="color:var(--text-muted);white-space:nowrap;">{formatUnixTime(entry.ts)}</span>
+          <span
+            class="badge {entry.level === 'error' ? 'badge-danger' : entry.level === 'warn' ? 'badge-warn' : entry.level === 'info' ? 'badge-ok' : 'badge-muted'}"
+            style="font-size:10px;padding:1px 6px;justify-content:center;"
+          >
+            {entry.level.toUpperCase()}
+          </span>
+          <span style="color:var(--info);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{entry.module}</span>
+          <span style="word-break:break-word;color:var(--text-primary);">{entry.message}</span>
+        </div>
+      {/each}
     {/if}
   </div>
 {/if}
 
-<!-- ===================== 运行日志 ===================== -->
-{#if mode === 'logs'}
-  <div class="card">
-    <div class="card-header">
-      <div>
-        <span class="card-title">{t.nav.logs}</span>
-        <span class="mono" style="font-size:11.5px;color:var(--text-muted);margin-left:8px;">
-          {filteredLogs.length} / {logCapacity}
-        </span>
-      </div>
-      <div class="btn-group">
-        <div class="search-wrap" style="min-width:170px;max-width:220px;">
-          <span class="search-icon"><Icons name="search" size={14} /></span>
-          <input type="text" class="control-compact" placeholder={t.search} aria-label={t.search} bind:value={logQuery} />
-        </div>
-        <select
-          class="control-compact"
-          style="width:130px;padding:4px 8px;"
-          aria-label={t.logsPage.allModules}
-          value={logModuleFilter}
-          onchange={(e) => onChangeLogFilter?.(logLevelFilter, e.currentTarget.value)}
-        >
-          <option value="">{t.logsPage.allModules}</option>
-          {#each logModules as modName (modName)}
-            <option value={modName}>{modName}</option>
-          {/each}
-        </select>
-        <select
-          class="control-compact"
-          style="width:105px;padding:4px 8px;"
-          aria-label="Log Level"
-          value={logLevelFilter}
-          onchange={(e) => onChangeLogFilter?.(e.currentTarget.value, logModuleFilter)}
-        >
-          <option value="">ALL</option>
-          <option value="info">INFO+</option>
-          <option value="warn">WARN+</option>
-          <option value="error">ERROR</option>
-        </select>
-        <button type="button" class="btn btn-sm" onclick={() => (logNewestFirst = !logNewestFirst)}>
-          {logNewestFirst ? t.logsPage.newestFirst : t.logsPage.oldestFirst}
-        </button>
-        <button type="button" class="btn btn-sm {logLiveTail ? 'btn-primary' : ''}" onclick={() => (logLiveTail = !logLiveTail)}>
-          {t.logsPage.liveTail}
-        </button>
-        <button
-          type="button"
-          class="btn btn-sm"
-          disabled={!filteredLogs.length}
-          onclick={() => handleCopyText(formatLogLines(filteredLogs))}
-        >
-          <Icons name="copy" size={13} />
-          <span>{t.copy}</span>
-        </button>
-        <button
-          type="button"
-          class="btn btn-sm"
-          disabled={!filteredLogs.length}
-          onclick={() => downloadTextFile(`vane-logs-${new Date().toISOString().slice(0, 10)}.log`, formatLogLines(filteredLogs))}
-        >
-          <Icons name="download" size={13} />
-          <span>{t.logsPage.exportLog}</span>
-        </button>
-        <button type="button" class="btn btn-sm btn-danger" onclick={clearAllLogs}>{t.logsPage.clear}</button>
-      </div>
+<!-- 容器日志弹窗 -->
+<EditorDialog
+  open={logModalOpen}
+  title={`${t.dk.logs} · ${logModalContainerName}`}
+  size="lg"
+  form={false}
+  confirmDiscard={false}
+  {t}
+  onClose={closeLogModal}
+>
+  <div style="display:flex;flex-direction:column;gap:12px;height:100%;">
+    <div class="btn-group" style="flex-wrap:wrap;">
+      <input
+        type="text"
+        class="control-compact"
+        style="width:160px;"
+        placeholder={t.dk.filterLogs}
+        aria-label={t.dk.filterLogs}
+        bind:value={logModalQuery}
+      />
+      <Select
+        compact
+        style="width:116px;"
+        ariaLabel={t.dk.lines}
+        bind:value={logModalLines}
+        options={(TAIL_OPTIONS.includes(logModalLines) ? TAIL_OPTIONS : [logModalLines, ...TAIL_OPTIONS].sort((a, b) => a - b)).map((n) => ({
+          value: n,
+          label: `${n} ${t.dk.lines}`,
+        }))}
+        onchange={() => reloadContainerLogs(false)}
+      />
+      <button
+        type="button"
+        class="btn btn-sm {logModalAutoRefresh ? 'btn-primary' : ''}"
+        onclick={() => (logModalAutoRefresh = !logModalAutoRefresh)}
+      >
+        {t.cfg.lblAutoRefresh}
+      </button>
+      <button
+        type="button"
+        class="btn btn-sm"
+        disabled={!filteredContainerLogText}
+        onclick={() => handleCopyText(filteredContainerLogText)}
+      >
+        {t.copy}
+      </button>
+      <button
+        type="button"
+        class="btn btn-sm"
+        disabled={!filteredContainerLogText}
+        onclick={() => downloadTextFile(`${logModalContainerName}.log`, filteredContainerLogText)}
+      >
+        {t.download}
+      </button>
+      <button type="button" class="btn btn-sm" disabled={logModalLoading} onclick={() => reloadContainerLogs(false)}>
+        {logModalLoading ? '...' : t.refresh}
+      </button>
     </div>
 
-    <div
-      bind:this={sysLogsEl}
+    <pre
+      bind:this={logModalPreEl}
       class="mono"
-      style="background:var(--bg-elevated);padding:14px;border-radius:12px;max-height:560px;overflow-y:auto;font-size:12px;line-height:1.65;"
-    >
-      {#if !filteredLogs.length}
-        <div style="color:var(--text-muted);">{t.logsPage.empty}</div>
-      {:else}
-        {#each filteredLogs as entry (entry.seq)}
-          <div class="log-row">
-            <span style="color:var(--text-muted);">#{entry.seq} {formatUnixTime(entry.ts)}</span>
-            <span style="color:{logLevelColor(entry.level)};font-weight:600;">
-              [{entry.level.toUpperCase()}]
-            </span>
-            <span style="color:var(--info);">[{entry.module}]</span>
-            <span>{entry.message}</span>
-          </div>
-        {/each}
-      {/if}
-    </div>
+      style="background:#05070a;color:#e2e8f0;padding:14px;border-radius:12px;font-size:12px;white-space:pre-wrap;word-break:break-all;flex:1;min-height:260px;max-height:66dvh;overflow-y:auto;margin:0;"
+    >{logModalLoading && !logModalText ? t.common.loading : filteredContainerLogText || '(empty)'}</pre>
   </div>
-{/if}
+</EditorDialog>
 
-<!-- 容器日志抽屉 -->
-{#if logModalOpen}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) closeLogModal(); }}>
-    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={`Logs ${logModalContainerName}`}>
-      <div class="drawer-header">
-        <div class="card-title" style="min-width:0;overflow:hidden;text-overflow:ellipsis;">
-          {t.dk.logs} · {logModalContainerName}
-        </div>
-        <button type="button" class="btn btn-sm" onclick={closeLogModal}>{t.close}</button>
-      </div>
-      <div class="drawer-body" style="display:flex;flex-direction:column;gap:12px;">
-        <div class="btn-group" style="flex-wrap:wrap;">
-          <input
-            type="text"
-            class="control-compact"
-            style="width:160px;"
-            placeholder={t.dk.filterLogs}
-            aria-label={t.dk.filterLogs}
-            bind:value={logModalQuery}
-          />
-          <select
-            class="control-compact"
-            style="width:110px;"
-            aria-label={t.dk.lines}
-            bind:value={logModalLines}
-            onchange={() => reloadContainerLogs(false)}
-          >
-            {#each TAIL_OPTIONS.includes(logModalLines) ? TAIL_OPTIONS : [logModalLines, ...TAIL_OPTIONS].sort((a, b) => a - b) as n (n)}
-              <option value={n}>{n} {t.dk.lines}</option>
-            {/each}
-          </select>
-          <button
-            type="button"
-            class="btn btn-sm {logModalAutoRefresh ? 'btn-primary' : ''}"
-            onclick={() => (logModalAutoRefresh = !logModalAutoRefresh)}
-          >
-            {t.cfg.lblAutoRefresh}
-          </button>
-          <button
-            type="button"
-            class="btn btn-sm"
-            disabled={!filteredContainerLogText}
-            onclick={() => handleCopyText(filteredContainerLogText)}
-          >
-            {t.copy}
-          </button>
-          <button
-            type="button"
-            class="btn btn-sm"
-            disabled={!filteredContainerLogText}
-            onclick={() => downloadTextFile(`${logModalContainerName}.log`, filteredContainerLogText)}
-          >
-            {t.download}
-          </button>
-          <button type="button" class="btn btn-sm" disabled={logModalLoading} onclick={() => reloadContainerLogs(false)}>
-            {logModalLoading ? '...' : t.refresh}
-          </button>
-        </div>
-
-        <pre
-          bind:this={logModalPreEl}
-          class="mono"
-          style="background:#05070a;color:#e2e8f0;padding:14px;border-radius:12px;font-size:12px;white-space:pre-wrap;word-break:break-all;flex:1;min-height:240px;max-height:68vh;overflow-y:auto;margin:0;"
-        >{logModalLoading && !logModalText ? t.common.loading : filteredContainerLogText || '(empty)'}</pre>
-      </div>
-    </div>
-  </div>
-{/if}
-
-<!-- Cron 编辑抽屉 -->
-{#if cronDrawerOpen && cronDraft}
-  <datalist id="cron-containers-list">
-    {#each containers || [] as c (c.id)}
-      <option value={c.name || c.id}>{c.image}</option>
-    {/each}
-  </datalist>
-  <datalist id="cron-rules-list">
-    {#each ruleNamesForKind as rn (rn)}
-      <option value={rn}></option>
-    {/each}
-  </datalist>
-
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) cronDrawerOpen = false; }}>
-    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.nav.cron}>
-    <form style="display:contents;" onsubmit={saveCron}>
-      <div class="drawer-header">
-        <div class="card-title">{cronEditIdx >= 0 ? t.edit : t.add} · {t.nav.cron}</div>
-        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => (cronDrawerOpen = false)}>{t.cancel}</button>
-      </div>
-      <div class="drawer-body">
+<!-- Cron 编辑弹窗 -->
+<EditorDialog
+  open={cronDrawerOpen && Boolean(cronDraft)}
+  title={`${cronEditIdx >= 0 ? t.edit : t.add} · ${t.nav.cron}`}
+  size="md"
+  busy={saving}
+  {t}
+  {askConfirm}
+  onSubmit={saveCron}
+  onClose={() => (cronDrawerOpen = false)}
+>
         <div class="form-grid">
           <div class="field">
             <label for="cr-name">{t.cronPage.jobName}</label>
@@ -941,46 +1039,32 @@
           </div>
         </div>
 
-        <div class="field">
-          <label for="cr-sched">{t.cronPage.expr}</label>
-          <input
-            id="cr-sched"
-            type="text"
-            class="mono"
-            bind:value={cronDraft.schedule}
-            oninput={(e) => scheduleCronPreview(e.currentTarget.value)}
-            required
-          />
-          <div class="btn-group" style="margin-top:4px;">
-            {#each [['0 0 4 * * *', '04:00 Daily'], ['0 */30 * * * *', '30m'], ['0 0 3 * * 0', 'Sun 03:00']] as [expr, label] (expr)}
-              <button
-                type="button"
-                class="btn btn-xs"
-                onclick={() => {
-                  cronDraft.schedule = expr;
-                  refreshCronPreview(expr);
-                }}
-              >
-                {label}
-              </button>
-            {/each}
-          </div>
-          {#if cronPreviewError}
-            <div style="font-size:12px;color:var(--danger);margin-top:4px;">{cronPreviewError}</div>
-          {:else if cronPreviewRuns.length}
-            <div class="mono" style="font-size:11px;color:var(--accent);margin-top:4px;">Next: {cronPreviewRuns.join(' · ')}</div>
-          {/if}
-        </div>
+        <CronSchedulePicker bind:value={cronDraft.schedule} {lang} {t} {apiFetch} />
 
         <div class="field">
           <label for="cr-kind">{t.cronPage.actionType}</label>
-          <select id="cr-kind" bind:value={cronActionKind} onchange={onCronKindChange}>
-            <option value="docker_prune_images">docker_prune_images</option>
-            <option value="docker_restart_container">docker_restart_container</option>
-            <option value="rule_toggle">rule_toggle</option>
-            <option value="http_request">http_request</option>
-            <option value="exec">exec</option>
-          </select>
+          <Select
+            id="cr-kind"
+            bind:value={cronActionKind}
+            options={
+              lang === 'en'
+                ? [
+                    { value: 'docker_prune_images', label: 'Prune Unused Docker Images' },
+                    { value: 'docker_restart_container', label: 'Restart Docker Container' },
+                    { value: 'rule_toggle', label: 'Enable / Disable Proxy or Forward Rule' },
+                    { value: 'http_request', label: 'Send HTTP / Webhook Request' },
+                    { value: 'exec', label: 'Run Local Program Command' },
+                  ]
+                : [
+                    { value: 'docker_prune_images', label: '清理无用 Docker 镜像' },
+                    { value: 'docker_restart_container', label: '定时重启 Docker 容器' },
+                    { value: 'rule_toggle', label: '定时开关转发 / 反代规则' },
+                    { value: 'http_request', label: '发送 HTTP / Webhook 请求' },
+                    { value: 'exec', label: '执行本地程序命令' },
+                  ]
+            }
+            onchange={onCronKindChange}
+          />
         </div>
 
         {#if (cronDraft.action.kind === 'docker_prune_images' || cronDraft.action.kind === 'docker_restart_container') && !settingsJson?.modules?.docker}
@@ -998,26 +1082,32 @@
         {:else if cronDraft.action.kind === 'docker_restart_container'}
           <div class="field">
             <label for="cr-cnt">{t.cronPage.container}</label>
-            <input id="cr-cnt" type="text" class="mono" list="cron-containers-list" bind:value={cronDraft.action.container} required />
+            <ComboInput
+              id="cr-cnt"
+              options={(containers || []).map((c) => ({ value: c.name || c.id, label: c.name || c.id, sub: c.image || '' }))}
+              bind:value={cronDraft.action.container}
+              required
+            />
           </div>
         {:else if cronDraft.action.kind === 'rule_toggle'}
           <div class="form-grid">
             <div class="field">
               <label for="cr-rtk">{t.cronPage.targetMod}</label>
-              <select
+              <Select
                 id="cr-rtk"
                 bind:value={cronDraft.action.target_kind}
+                options={[
+                  { value: 'port_forward', label: t.nav.port_forward },
+                  { value: 'reverse_proxy', label: t.nav.reverse_proxy },
+                ]}
                 onchange={() => {
                   if (cronDraft?.action) cronDraft.action.rule = '';
                 }}
-              >
-                <option value="port_forward">port_forward</option>
-                <option value="reverse_proxy">reverse_proxy</option>
-              </select>
+              />
             </div>
             <div class="field">
               <label for="cr-rtn">{t.cronPage.targetRule}</label>
-              <input id="cr-rtn" type="text" class="mono" list="cron-rules-list" bind:value={cronDraft.action.rule} required />
+              <ComboInput id="cr-rtn" options={ruleNamesForKind} bind:value={cronDraft.action.rule} required />
             </div>
           </div>
           <label class="check-row"><input type="checkbox" bind:checked={cronDraft.action.enable} /> {t.cronPage.setEnable}</label>
@@ -1025,14 +1115,12 @@
           <div class="form-grid">
             <div class="field">
               <label for="cr-hm">{t.cronPage.httpMethod}</label>
-              <select id="cr-hm" bind:value={cronDraft.action.method}>
-                <option value="GET">GET</option>
-                <option value="POST">POST</option>
-                <option value="PUT">PUT</option>
-                <option value="PATCH">PATCH</option>
-                <option value="DELETE">DELETE</option>
-                <option value="HEAD">HEAD</option>
-              </select>
+              <Select
+                id="cr-hm"
+                mono
+                bind:value={cronDraft.action.method}
+                options={['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD']}
+              />
             </div>
             <SecretField
               id="cr-hu"
@@ -1056,6 +1144,14 @@
           />
           <HeaderRowsEditor label={t.cronPage.httpHeaders} bind:rows={cronHttpHeaderRows} secret={true} {t} />
         {:else}
+          {#if !settingsJson?.admin?.allow_cron_exec}
+            <div class="banner banner-warn" style="margin-bottom:12px;">
+              <div style="display:flex;align-items:flex-start;gap:8px;">
+                <Icons name="alert" size={15} />
+                <span style="font-size:12.5px;">{t.cronPage.execDisabledBanner}</span>
+              </div>
+            </div>
+          {/if}
           <div class="form-grid">
             <div class="field">
               <label for="cr-prg">{t.cronPage.program}</label>
@@ -1068,7 +1164,12 @@
           </div>
           <div class="field">
             <label for="cr-arg">{t.cronPage.args}</label>
-            <textarea id="cr-arg" class="mono" bind:value={cronArgsLines}></textarea>
+            <textarea
+              id="cr-arg"
+              class="mono"
+              placeholder={lang === 'en' ? 'One argument per line (optional)' : '每行一个参数（可选）'}
+              bind:value={cronArgsLines}
+            ></textarea>
           </div>
         {/if}
 
@@ -1076,12 +1177,61 @@
           <label class="check-row"><input type="checkbox" bind:checked={cronDraft.enabled} /> {t.enabled}</label>
           <label class="check-row"><input type="checkbox" bind:checked={cronDraft.notify_on_failure} /> {t.cronPage.notifyFail}</label>
         </div>
-      </div>
-      <div class="drawer-footer">
-        <button type="button" class="btn" disabled={saving} onclick={() => (cronDrawerOpen = false)}>{t.cancel}</button>
-        <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
-      </div>
-    </form>
-    </div>
+</EditorDialog>
+
+<!-- Docker 模块专属设置弹窗 -->
+<EditorDialog
+  open={dockerSettingsOpen}
+  title={t.cfg.groupDocker}
+  size="sm"
+  busy={saving}
+  {t}
+  {askConfirm}
+  onSubmit={saveDockerSettings}
+  onClose={() => (dockerSettingsOpen = false)}
+>
+  <div class="field">
+    <label for="dk-mod-sock" style="display:inline-flex;align-items:center;gap:6px;">
+      <span>{t.cfg.dockerSocket}</span>
+      <span class="badge badge-muted" style="font-size:10px;padding:1px 6px;">{t.cfg.configFileOnlyBadge}</span>
+    </label>
+    <input id="dk-mod-sock" type="text" class="mono" value={dockerSocketDraft} readonly disabled />
+    <div class="field-hint">{t.cfg.dockerSocketReadonlyHint}</div>
   </div>
-{/if}
+  <div class="field">
+    <label for="dk-mod-prot">{t.cfg.lblProtectedContainers}</label>
+    <ComboInput
+      id="dk-mod-prot"
+      multiple
+      placeholder="vane, openwrt-core"
+      options={containerNameOptions}
+      bind:value={dockerProtectedCsv}
+    />
+  </div>
+  <div class="field">
+    <label for="dk-mod-tail">{t.cfg.dkTail}</label>
+    <input id="dk-mod-tail" type="number" min="10" max="2000" bind:value={dockerLogTailDraft} required />
+  </div>
+  <label class="check-row">
+    <input type="checkbox" bind:checked={dockerLogTsDraft} />
+    <span>{t.cfg.dkTs}</span>
+  </label>
+</EditorDialog>
+
+<!-- 运行日志设置弹窗 -->
+<EditorDialog
+  open={logSettingsOpen}
+  title={lang === 'en' ? 'System Log Settings' : '运行日志设置'}
+  size="sm"
+  busy={saving}
+  {t}
+  {askConfirm}
+  onSubmit={saveLogsSettings}
+  onClose={() => (logSettingsOpen = false)}
+>
+  <div class="field">
+    <label for="lg-mod-cap">{t.cfg.lblLogRing}</label>
+    <input id="lg-mod-cap" type="number" min="50" max="1000" bind:value={logRingCapDraft} required />
+    <div class="field-hint">{t.cfg.descLogRing}</div>
+  </div>
+</EditorDialog>

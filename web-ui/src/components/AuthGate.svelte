@@ -1,6 +1,6 @@
 <script>
   import Icons from './Icons.svelte';
-  import { copyText } from '../lib/helpers.js';
+  import { getPasskeyAssertion, isPasskeySupported } from '../lib/webauthn.js';
 
   let {
     t,
@@ -8,18 +8,20 @@
     toggleLang,
     authenticated,
     mustChangePassword,
+    initialSetup = false,
     username,
     passwordLoginEnabled = true,
     totpEnabled = false,
-    hasEd25519Keys = false,
-    ed25519KeyIds = [],
+    passkeyEnabled = false,
+    hasPasskeys = false,
     connError = '',
     onRetryStatus,
     apiFetch,
-    showToast,
     onAuthenticated,
     onLogout,
   } = $props();
+
+  let canUsePasskey = $derived(Boolean(passkeyEnabled && hasPasskeys && !initialSetup && isPasskeySupported()));
 
   let loginMode = $state('password');
   let loginUser = $state('admin');
@@ -28,15 +30,6 @@
   let loginTotp = $state('');
   let loginError = $state('');
   let busy = $state(false);
-
-  // Ed25519 挑战签名状态
-  let selectedKeyId = $state('');
-  let challengeNonceB64 = $state('');
-  let challengeOrigin = $state('');
-  let challengeExpiresAt = $state(0);
-  let challengeRemainSecs = $state(0);
-  let privateSeedInput = $state('');
-  let manualSigB64 = $state('');
 
   // 首次强制改密状态
   let curPassword = $state('');
@@ -48,16 +41,36 @@
 
   $effect(() => {
     if (username && loginUser === 'admin') loginUser = username;
-    if (!passwordLoginEnabled && hasEd25519Keys) loginMode = 'ed25519';
-    else if (!hasEd25519Keys && loginMode === 'ed25519') loginMode = 'password';
-    if (ed25519KeyIds.length > 0 && !ed25519KeyIds.includes(selectedKeyId)) {
-      selectedKeyId = ed25519KeyIds[0];
-      challengeNonceB64 = '';
-      challengeOrigin = '';
+    if (!passwordLoginEnabled && canUsePasskey && loginMode === 'password') {
+      loginMode = 'passkey';
+    } else if (!canUsePasskey && loginMode === 'passkey') {
+      loginMode = 'password';
     }
   });
 
-  // 退出登录或返回登录页时彻底清空内存中残留密码/私钥种子与错误提示
+  async function submitPasskeyLogin() {
+    if (busy) return;
+    busy = true;
+    loginError = '';
+    try {
+      const opts = await apiFetch('/api/auth/passkey/login/options', {
+        method: 'POST',
+        body: '{}',
+      });
+      const assertion = await getPasskeyAssertion(opts, lang);
+      const st = await apiFetch('/api/auth/passkey/login/verify', {
+        method: 'POST',
+        body: JSON.stringify(assertion),
+      });
+      await onAuthenticated?.(st);
+    } catch (err) {
+      loginError = err.message;
+    } finally {
+      busy = false;
+    }
+  }
+
+  // 退出登录或返回登录页时彻底清空内存中残留密码与错误提示
   $effect(() => {
     if (!authenticated) {
       curPassword = '';
@@ -65,27 +78,7 @@
       newPassword = '';
       confirmPassword = '';
       pwChangeError = '';
-      privateSeedInput = '';
-      manualSigB64 = '';
     }
-  });
-
-  $effect(() => {
-    if (!challengeNonceB64 || !challengeExpiresAt) {
-      challengeRemainSecs = 0;
-      return;
-    }
-    const tick = () => {
-      const rem = Math.max(0, Math.ceil((challengeExpiresAt - Date.now()) / 1000));
-      challengeRemainSecs = rem;
-      if (rem === 0) {
-        challengeNonceB64 = '';
-        challengeOrigin = '';
-      }
-    };
-    tick();
-    const timer = setInterval(tick, 1000);
-    return () => clearInterval(timer);
   });
 
   let effectiveUsername = $derived(newUsername.trim() || username);
@@ -104,139 +97,6 @@
   let pwAllValid = $derived(
     pwChecks.lenOk && pwChecks.hasAlpha && pwChecks.hasDigitOrPunct && pwChecks.notDefault && pwChecks.matchConfirm
   );
-
-  function b64ToBytes(b64) {
-    const bin = atob(b64.trim());
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-  }
-
-  function bytesToB64(bytes) {
-    let s = '';
-    const u8 = new Uint8Array(bytes);
-    for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
-    return btoa(s);
-  }
-
-  function parseSeed32(text) {
-    const clean = text.trim();
-    if (/^[0-9a-fA-F]{64}$/.test(clean)) {
-      const out = new Uint8Array(32);
-      for (let i = 0; i < 32; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
-      return out;
-    }
-    const raw = b64ToBytes(clean);
-    if (raw.length === 32) return raw;
-    if (raw.length === 64) return raw.slice(0, 32);
-    throw new Error(lang === 'en' ? 'Expected 32-byte Ed25519 seed (64 hex chars or Base64)' : '请输入 32 字节 Ed25519 私钥种子（64 位十六进制或 Base64）');
-  }
-
-  async function signEd25519InBrowser(seed32, messageBytes) {
-    const pkcs8Prefix = new Uint8Array([
-      0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06,
-      0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
-    ]);
-    const pkcs8 = new Uint8Array(48);
-    pkcs8.set(pkcs8Prefix, 0);
-    pkcs8.set(seed32, 16);
-    try {
-      const key = await crypto.subtle.importKey('pkcs8', pkcs8, { name: 'Ed25519' }, false, ['sign']);
-      const sig = await crypto.subtle.sign({ name: 'Ed25519' }, key, messageBytes);
-      return bytesToB64(sig);
-    } catch {
-      throw new Error(t.webCryptoUnsupported);
-    } finally {
-      pkcs8.fill(0);
-      seed32.fill(0);
-    }
-  }
-
-  function buildChallengePayload(nonceBytes, keyId, origin) {
-    const enc = new TextEncoder();
-    const p1 = enc.encode('vane-ed25519-auth-v1|');
-    const p2 = enc.encode(`|${keyId}|${origin}`);
-    const out = new Uint8Array(p1.length + nonceBytes.length + p2.length);
-    out.set(p1, 0);
-    out.set(nonceBytes, p1.length);
-    out.set(p2, p1.length + nonceBytes.length);
-    return out;
-  }
-
-  async function fetchChallengeInternal() {
-    if (!selectedKeyId) return false;
-    const r = await apiFetch('/api/auth/challenge', {
-      method: 'POST',
-      body: JSON.stringify({ key_id: selectedKeyId }),
-    });
-    challengeNonceB64 = r.nonce_b64;
-    challengeOrigin = r.canonical_origin;
-    challengeExpiresAt = Date.now() + 60_000;
-    return true;
-  }
-
-  async function requestEd25519Challenge() {
-    loginError = '';
-    if (!selectedKeyId) return;
-    busy = true;
-    try {
-      await fetchChallengeInternal();
-    } catch (err) {
-      loginError = err.message;
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function copyChallengeField(val) {
-    if (await copyText(val)) showToast?.(t.copied, 'success');
-    else showToast?.(t.copyFailed, 'error');
-  }
-
-  async function submitEd25519Login(e) {
-    e.preventDefault();
-    loginError = '';
-    busy = true;
-    let calledVerifyApi = false;
-    try {
-      if (!challengeNonceB64) {
-        const ok = await fetchChallengeInternal();
-        if (!ok || !challengeNonceB64) return;
-      }
-      let sigB64 = manualSigB64.trim();
-      if (!sigB64 && privateSeedInput.trim()) {
-        const seed = parseSeed32(privateSeedInput);
-        const nonceBytes = b64ToBytes(challengeNonceB64);
-        const msg = buildChallengePayload(nonceBytes, selectedKeyId, challengeOrigin);
-        sigB64 = await signEd25519InBrowser(seed, msg);
-      }
-      if (!sigB64) {
-        throw new Error(lang === 'en' ? 'Provide private seed or Base64 signature' : '请提供私钥种子或粘贴签名结果');
-      }
-      calledVerifyApi = true;
-      const st = await apiFetch('/api/auth/login-ed25519', {
-        method: 'POST',
-        body: JSON.stringify({
-          key_id: selectedKeyId,
-          nonce_b64: challengeNonceB64,
-          signature_b64: sigB64,
-        }),
-      });
-      challengeNonceB64 = '';
-      challengeExpiresAt = 0;
-      manualSigB64 = '';
-      await onAuthenticated(st);
-    } catch (err) {
-      loginError = err.message;
-      if (calledVerifyApi) {
-        challengeNonceB64 = '';
-        challengeExpiresAt = 0;
-      }
-    } finally {
-      privateSeedInput = '';
-      busy = false;
-    }
-  }
 
   async function submitPasswordLogin(e) {
     e.preventDefault();
@@ -312,25 +172,27 @@
         </div>
       {/if}
 
-      {#if passwordLoginEnabled && hasEd25519Keys}
-        <div class="pill-tabs" role="tablist" style="width:100%;margin-bottom:16px;display:grid;grid-template-columns:1fr 1fr;">
+      {#if passwordLoginEnabled && canUsePasskey}
+        <div class="pill-tabs" role="tablist" style="width:100%;margin-bottom:16px;display:flex;">
           <button
             type="button"
             role="tab"
             aria-selected={loginMode === 'password'}
             class="pill-tab {loginMode === 'password' ? 'active' : ''}"
-            onclick={() => loginMode = 'password'}
+            style="flex:1;"
+            onclick={() => { loginMode = 'password'; loginError = ''; }}
           >
             {t.pwLoginTab}
           </button>
           <button
             type="button"
             role="tab"
-            aria-selected={loginMode === 'ed25519'}
-            class="pill-tab {loginMode === 'ed25519' ? 'active' : ''}"
-            onclick={() => loginMode = 'ed25519'}
+            aria-selected={loginMode === 'passkey'}
+            class="pill-tab {loginMode === 'passkey' ? 'active' : ''}"
+            style="flex:1;"
+            onclick={() => { loginMode = 'passkey'; loginError = ''; }}
           >
-            {t.keyLoginTab}
+            {t.passkeyLoginTab}
           </button>
         </div>
       {/if}
@@ -343,18 +205,20 @@
       {/if}
 
       {#if loginMode === 'password' && passwordLoginEnabled}
-        <form onsubmit={submitPasswordLogin}>
+        <form method="post" action="/api/auth/login" onsubmit={submitPasswordLogin}>
           <div class="field">
             <label for="login-user">{t.username}</label>
-            <input id="login-user" type="text" bind:value={loginUser} autocomplete="username" required />
+            <input id="login-user" name="username" type="text" bind:value={loginUser} autocomplete="username" required />
           </div>
           <div class="field">
             <label for="login-pass">{t.password}</label>
             <div style="position:relative;display:flex;align-items:center;">
               <input
                 id="login-pass"
+                name="password"
                 type={showLoginPass ? 'text' : 'password'}
                 style="padding-right:42px;"
+                placeholder={initialSetup ? t.passwordInitialHint : t.passwordPlaceholder}
                 bind:value={loginPass}
                 autocomplete="current-password"
                 required
@@ -375,8 +239,10 @@
               <label for="login-totp">{t.totpCode}</label>
               <input
                 id="login-totp"
+                name="otp"
                 type="text"
                 class="mono"
+                inputmode="numeric"
                 autocomplete="one-time-code"
                 placeholder="123456 / xxxx-xxxx-xxxx-xxxx"
                 bind:value={loginTotp}
@@ -388,65 +254,36 @@
             <Icons name="lock" size={15} />
             <span>{t.loginBtn}</span>
           </button>
-        </form>
-      {:else}
-        <form onsubmit={submitEd25519Login}>
-          <div class="field">
-            <label for="key-id-sel">{t.keyIdLabel}</label>
-            <select
-              id="key-id-sel"
-              bind:value={selectedKeyId}
-              onchange={() => { challengeNonceB64 = ''; challengeOrigin = ''; challengeExpiresAt = 0; }}
-            >
-              {#each ed25519KeyIds as kid (kid)}
-                <option value={kid}>{kid}</option>
-              {/each}
-            </select>
-          </div>
-          <div style="margin-bottom:12px;">
-            <button type="button" class="btn btn-sm" style="width:100%;" onclick={requestEd25519Challenge} disabled={busy}>
-              {t.getChallenge}
-            </button>
-          </div>
-          {#if challengeNonceB64}
-            <div class="subcard mono" style="font-size:11px;margin-bottom:12px;word-break:break-all;display:grid;gap:6px;">
-              <div class="row-between">
-                <span>Origin: {challengeOrigin}</span>
-                <span class="badge badge-info num">{challengeRemainSecs}s</span>
-              </div>
-              <div class="row-between">
-                <span style="min-width:0;flex:1;">Nonce: {challengeNonceB64}</span>
-                <button type="button" class="btn btn-xs" onclick={() => copyChallengeField(challengeNonceB64)}>
-                  {t.copy}
-                </button>
-              </div>
-              <div style="font-size:10.5px;color:var(--text-muted);">
-                Format: vane-ed25519-auth-v1|&lt;raw_32B_nonce&gt;|{selectedKeyId}|{challengeOrigin}
-              </div>
+          {#if canUsePasskey}
+            <div style="display:flex;align-items:center;gap:10px;margin:14px 0 12px;color:var(--text-muted);font-size:12px;">
+              <span style="flex:1;height:1px;background:var(--border-subtle);"></span>
+              <span>{t.passkeyOrDivider}</span>
+              <span style="flex:1;height:1px;background:var(--border-subtle);"></span>
             </div>
+            <button type="button" class="btn" style="width:100%;" disabled={busy} onclick={submitPasskeyLogin}>
+              <Icons name="passkey" size={16} />
+              <span>{busy ? '...' : t.passkeyLoginBtn}</span>
+            </button>
           {/if}
-          <div class="field">
-            <label for="ed-seed">{t.signWithKey}</label>
-            <input
-              id="ed-seed"
-              type="password"
-              class="mono"
-              autocomplete="new-password"
-              spellcheck="false"
-              autocapitalize="off"
-              bind:value={privateSeedInput}
-              placeholder="64-char hex or Base64 32B seed"
-            />
-          </div>
-          <div class="field">
-            <label for="ed-sig">{t.orManualSig}</label>
-            <input id="ed-sig" type="text" class="mono" autocomplete="off" spellcheck="false" bind:value={manualSigB64} placeholder="Base64 Ed25519 signature" />
-          </div>
-          <button type="submit" class="btn btn-primary" style="width:100%;" disabled={busy}>
-            <Icons name="key" size={15} />
-            <span>{t.verifyKeyBtn}</span>
-          </button>
         </form>
+      {:else if canUsePasskey}
+        <div class="subcard" style="text-align:center;padding:22px 16px;margin-bottom:14px;">
+          <div style="width:48px;height:48px;border-radius:14px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;margin:0 auto 10px;">
+            <Icons name="passkey" size={24} />
+          </div>
+          <div style="font-size:14px;font-weight:700;margin-bottom:4px;">{t.passkeyLoginBtn}</div>
+          <div style="font-size:12px;color:var(--text-secondary);">{t.reauth.passkeyReadyDesc}</div>
+        </div>
+        <button type="button" class="btn btn-primary" style="width:100%;" disabled={busy} onclick={submitPasskeyLogin}>
+          <Icons name="passkey" size={16} />
+          <span>{busy ? '...' : t.passkeyLoginBtn}</span>
+        </button>
+      {:else}
+        <div class="banner banner-warn" style="margin-bottom:12px;">
+          {lang === 'en'
+            ? 'Password login is disabled. Open this console via the HTTPS domain where your Passkey is registered.'
+            : '当前已关闭密码登录，请使用已绑定通行密钥的 HTTPS 域名访问并完成免密登录。'}
+        </div>
       {/if}
     </div>
   </div>

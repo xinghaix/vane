@@ -2,7 +2,12 @@
   import Icons from './Icons.svelte';
   import SecretField from './SecretField.svelte';
   import HeaderRowsEditor from './HeaderRowsEditor.svelte';
+  import EditorDialog from './EditorDialog.svelte';
+  import Select from './Select.svelte';
+  import ComboInput from './ComboInput.svelte';
+  import SystemUpdatePanel from './SystemUpdatePanel.svelte';
   import { renderQrSvgDataUri } from '../lib/qrcode.js';
+  import { createPasskeyCredential, detectPasskeyDefaultName, isIpHostname, isPasskeySupported } from '../lib/webauthn.js';
   import {
     splitCsv,
     joinCsv,
@@ -13,22 +18,40 @@
     downloadBlob,
     downloadTextFile,
     uint8ToBase64,
+    formatUnixTime,
     resolveSecretInput,
   } from '../lib/helpers.js';
 
   let {
     t,
     lang,
+    onSelectLang,
+    themeMode = 'auto',
+    onSelectThemeMode,
+    oledMode = false,
+    onToggleOledMode,
+    accentColor = 'emerald',
+    onSelectAccentColor,
+    accentPresets = [],
+    sidebarCollapsed = false,
+    onToggleSidebar,
+    pwaState = { standalone: false, canPrompt: false, iosSafari: false, secureContext: false },
+    onInstallPwa = null,
     modules,
+    moduleReauth = {},
+    isModuleLocked = () => false,
+    onNavigate = null,
     settingsJson,
     networkInfo = null,
     subTab = 'general',
     onSubTabChange,
     onToggleModule,
+    onToggleModuleReauth,
     onSaveSettings,
     onAuthRefresh,
     onBackupRestored,
     askConfirm,
+    requestReauth,
     apiFetch,
     showToast,
     onRefresh,
@@ -37,27 +60,24 @@
   let saving = $state(false);
   let secBusy = $state('');
   let backupBusy = $state('');
-  let ifaceNames = $derived((networkInfo?.interfaces || []).map((i) => i.iface));
+  let ifaceOptions = $derived(
+    (networkInfo?.interfaces || []).map((i) => {
+      const ips = [...(i.ipv4 || []), ...(i.ipv6 || [])];
+      return { value: i.iface, label: i.iface, sub: ips.slice(0, 2).join(', ') };
+    })
+  );
 
   async function handleCopy(text) {
     if (await copyText(text)) showToast(t.copied, 'success');
     else showToast(t.copyFailed, 'error');
   }
 
-  function toggleCsvIface(csv, iface) {
-    const items = splitCsv(csv);
-    if (items.includes(iface)) return joinCsv(items.filter((x) => x !== iface));
-    return joinCsv([...items, iface]);
-  }
-
-  // ---------------- 1. 通用与系统草稿（独立草稿状态，不直接修改 settingsJson） ----------------
+  // ---------------- 1. 全局核心与共用基础设置草稿（独立草稿状态，不触碰各子模块内嵌配置） ----------------
   let generalDraft = $state(null);
   let wanIfacesCsv = $state('');
   let lanIfacesCsv = $state('');
-  let monIfacesCsv = $state('');
   let listenLanCsv = $state('');
   let extraOriginsCsv = $state('');
-  let protectedContainersCsv = $state('');
   let syncedGeneralSig = $state('');
 
   function pickGeneralState(src, csvOverrides = null) {
@@ -66,14 +86,10 @@
     const adm = src.admin || {};
     const fw = src.firewall || {};
     const sec = src.security || {};
-    const mon = src.monitor || {};
-    const wt = src.web_terminal || {};
-    const dk = src.docker || {};
     return {
       system: {
         timezone_offset: String(sys.timezone_offset ?? 'UTC'),
         worker_threads: Number(sys.worker_threads ?? 2),
-        log_ring_capacity: Number(sys.log_ring_capacity ?? 300),
         global_max_conns: Number(sys.global_max_conns ?? 512),
       },
       admin: {
@@ -82,7 +98,6 @@
         canonical_origin: String(adm.canonical_origin ?? ''),
         listen_lan: csvOverrides ? splitCsv(csvOverrides.listenLanCsv) : (adm.listen_lan || []),
         extra_allowed_origins: csvOverrides ? splitCsv(csvOverrides.extraOriginsCsv) : (adm.extra_allowed_origins || []),
-        docker_socket: String(adm.docker_socket ?? '/var/run/docker.sock'),
         tls_cert_path: String(adm.tls_cert_path ?? ''),
         tls_key_path: String(adm.tls_key_path ?? ''),
       },
@@ -99,27 +114,6 @@
         http_header_timeout_secs: Number(sec.http_header_timeout_secs ?? 10),
         kernel_ban_offload: Boolean(sec.kernel_ban_offload),
       },
-      monitor: {
-        interfaces: csvOverrides ? splitCsv(csvOverrides.monIfacesCsv) : (mon.interfaces || []),
-        sample_interval_secs: Number(mon.sample_interval_secs ?? 2),
-        temp_alert_celsius: Number(mon.temp_alert_celsius ?? 85),
-        mem_low_mb: Number(mon.mem_low_mb ?? 32),
-        alert_cooldown_secs: Number(mon.alert_cooldown_secs ?? 1800),
-        thermal_path: String(mon.thermal_path ?? ''),
-        top_processes: Number(mon.top_processes ?? 10),
-      },
-      web_terminal: {
-        shell: String(wt.shell ?? 'auto'),
-        default_cwd: String(wt.default_cwd ?? '/root'),
-        idle_timeout_secs: Number(wt.idle_timeout_secs ?? 900),
-        max_sessions: Number(wt.max_sessions ?? 2),
-        require_reauth: Boolean(wt.require_reauth),
-      },
-      docker: {
-        protected_containers: csvOverrides ? splitCsv(csvOverrides.protectedContainersCsv) : (dk.protected_containers || []),
-        log_tail_default: Number(dk.log_tail_default ?? 200),
-        log_timestamps: Boolean(dk.log_timestamps),
-      },
     };
   }
 
@@ -130,10 +124,8 @@
     generalDraft = deepClone(snap);
     wanIfacesCsv = joinCsv(src.firewall?.wan_interfaces);
     lanIfacesCsv = joinCsv(src.firewall?.lan_interfaces);
-    monIfacesCsv = joinCsv(src.monitor?.interfaces);
     listenLanCsv = joinCsv(src.admin?.listen_lan);
     extraOriginsCsv = joinCsv(src.admin?.extra_allowed_origins);
-    protectedContainersCsv = joinCsv(src.docker?.protected_containers);
   }
 
   $effect(() => {
@@ -152,21 +144,30 @@
     return `${origin}${normalizedPath}`;
   }
 
-  let currentGeneralSig = $derived(
+  let sharedDnsVisible = $derived(Boolean(modules?.ddns || modules?.acme));
+  let dnsProviderNames = $derived(Object.keys(settingsJson?.dns_providers || {}));
+  let fwDeps = $derived([
+    { label: t.nav.reverse_proxy, active: Boolean(modules?.reverse_proxy) },
+    { label: t.nav.port_forward, active: Boolean(modules?.port_forward) },
+    { label: t.nav.ddns, active: Boolean(modules?.ddns) },
+    { label: 'Fail2Ban', active: Boolean(generalDraft?.security?.kernel_ban_offload) },
+  ]);
+  let anyFwDepActive = $derived(fwDeps.some((d) => d.active));
+
+  let draftPicked = $derived(
     generalDraft
-      ? JSON.stringify(
-          pickGeneralState(generalDraft, {
-            listenLanCsv,
-            extraOriginsCsv,
-            wanIfacesCsv,
-            lanIfacesCsv,
-            monIfacesCsv,
-            protectedContainersCsv,
-          })
-        )
-      : ''
+      ? pickGeneralState(generalDraft, {
+          listenLanCsv,
+          extraOriginsCsv,
+          wanIfacesCsv,
+          lanIfacesCsv,
+        })
+      : null
   );
-  let generalDirty = $derived(Boolean(generalDraft && syncedGeneralSig && currentGeneralSig !== syncedGeneralSig));
+  let basePicked = $derived(settingsJson ? pickGeneralState(settingsJson) : null);
+  let generalDirty = $derived(
+    Boolean(draftPicked && basePicked && JSON.stringify(draftPicked) !== JSON.stringify(basePicked))
+  );
 
   let savedEntryUrl = $derived(
     formatEntryUrl(settingsJson?.admin?.secret_path, settingsJson?.admin?.canonical_origin)
@@ -191,19 +192,13 @@
       extraOriginsCsv,
       wanIfacesCsv,
       lanIfacesCsv,
-      monIfacesCsv,
-      protectedContainersCsv,
     });
     picked.system.timezone_offset = picked.system.timezone_offset.trim() || 'UTC';
     const rawSp = picked.admin.secret_path.trim();
     picked.admin.secret_path = !rawSp ? '/' : rawSp.startsWith('/') ? rawSp : `/${rawSp}`;
     picked.admin.canonical_origin = picked.admin.canonical_origin.trim();
-    picked.admin.docker_socket = picked.admin.docker_socket.trim() || '/var/run/docker.sock';
     picked.admin.tls_cert_path = picked.admin.tls_cert_path.trim();
     picked.admin.tls_key_path = picked.admin.tls_key_path.trim();
-    picked.monitor.thermal_path = picked.monitor.thermal_path.trim();
-    picked.web_terminal.shell = picked.web_terminal.shell.trim() || 'auto';
-    picked.web_terminal.default_cwd = picked.web_terminal.default_cwd.trim() || '/root';
 
     if (Boolean(picked.admin.tls_cert_path) !== Boolean(picked.admin.tls_key_path)) {
       showToast(
@@ -241,16 +236,13 @@
       next.admin = { ...next.admin, ...picked.admin };
       next.firewall = { ...next.firewall, ...picked.firewall };
       next.security = { ...next.security, ...picked.security };
-      next.monitor = { ...next.monitor, ...picked.monitor };
-      next.web_terminal = { ...next.web_terminal, ...picked.web_terminal };
-      next.docker = { ...next.docker, ...picked.docker };
       await onSaveSettings(next);
     } finally {
       saving = false;
     }
   }
 
-  // ---------------- 2. 安全中心：修改密码 / TOTP / Ed25519 ----------------
+  // ---------------- 2. 安全中心：修改密码 / TOTP / 通行密钥 ----------------
   let curPw = $state('');
   let newPw = $state('');
   let confirmPw = $state('');
@@ -258,8 +250,9 @@
   let totpSetupData = $state(null);
   let totpVerifyCode = $state('');
   let issuedRecoveryCodes = $state([]);
-  let newKeyId = $state('');
-  let newKeyPub = $state('');
+  let newPasskeyName = $state('');
+  const passkeyBrowserOk = isPasskeySupported();
+  const passkeyOnRawIp = isIpHostname();
 
   // ---------------- 4. 加密备份与恢复（声明提前以便切 tab 清理敏感态） ----------------
   let backupPass = $state('');
@@ -320,22 +313,16 @@
     }
   }
 
-  async function downloadAdminCert() {
-    if (secBusy) return;
-    secBusy = 'cert';
-    try {
-      const res = await fetch('/api/auth/ca-cert');
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
-      const blob = await res.blob();
-      downloadBlob(blob, 'vane-admin.crt');
-    } catch (err) {
-      showToast(err.message, 'error');
-    } finally {
-      secBusy = '';
-    }
+  function maskTotpSecret(secret) {
+    const s = String(secret || '');
+    if (s.length <= 8) return '••••••••';
+    return `${s.slice(0, 4)}••••••••${s.slice(-4)}`;
+  }
+
+  function maskOtpAuthUri(uri) {
+    const s = String(uri || '');
+    const q = s.indexOf('?');
+    return q > 0 ? `${s.slice(0, q)}?secret=••••••••` : 'otpauth://totp/••••';
   }
 
   async function updateAdminCredentials(e) {
@@ -367,9 +354,20 @@
 
   async function startTotpSetup() {
     if (secBusy) return;
+    const tok = await requestReauth({
+      title: t.reauth.totpSetupTitle,
+      description: t.reauth.totpSetupDesc,
+      actionLabel: t.cfg.totpSetup,
+      requireMfa: true,
+    });
+    if (!tok) return;
     secBusy = 'totp-setup';
     try {
-      totpSetupData = await apiFetch('/api/auth/totp/setup', { method: 'POST' });
+      totpSetupData = await apiFetch('/api/auth/totp/setup', {
+        method: 'POST',
+        headers: { 'x-vane-reauth-token': tok },
+        body: JSON.stringify({ reauth_token: tok }),
+      });
       issuedRecoveryCodes = [];
     } catch (err) {
       showToast(err.message, 'error');
@@ -381,11 +379,19 @@
   async function confirmTotpEnable(e) {
     e.preventDefault();
     if (secBusy) return;
+    const tok = await requestReauth({
+      title: t.reauth.totpEnableTitle,
+      description: t.reauth.totpEnableDesc,
+      actionLabel: t.cfg.totpEnable,
+      requireMfa: true,
+    });
+    if (!tok) return;
     secBusy = 'totp-enable';
     try {
       const r = await apiFetch('/api/auth/totp/enable', {
         method: 'POST',
-        body: JSON.stringify({ code: totpVerifyCode.trim() }),
+        headers: { 'x-vane-reauth-token': tok },
+        body: JSON.stringify({ code: totpVerifyCode.trim(), reauth_token: tok }),
       });
       totpSetupData = null;
       totpVerifyCode = '';
@@ -402,9 +408,20 @@
 
   async function regenerateRecoveryCodes() {
     if (secBusy) return;
+    const tok = await requestReauth({
+      title: t.reauth.totpRegenTitle,
+      description: t.reauth.totpRegenDesc,
+      actionLabel: t.cfg.totpRegen,
+      requireMfa: true,
+    });
+    if (!tok) return;
     secBusy = 'totp-regen';
     try {
-      const r = await apiFetch('/api/auth/totp/recovery-codes', { method: 'POST' });
+      const r = await apiFetch('/api/auth/totp/recovery-codes', {
+        method: 'POST',
+        headers: { 'x-vane-reauth-token': tok },
+        body: JSON.stringify({ reauth_token: tok }),
+      });
       issuedRecoveryCodes = r.recovery_codes || [];
       showToast(lang === 'en' ? 'Recovery codes regenerated' : '已重新生成一次性恢复码', 'success');
       await onAuthRefresh?.();
@@ -416,13 +433,37 @@
     }
   }
 
-  async function disableTotp() {
+  function confirmThenRun(opts, action) {
+    askConfirm({
+      ...opts,
+      onConfirm: () => {
+        queueMicrotask(() => {
+          action();
+        });
+      },
+    });
+  }
+
+  async function disableTotpWithReauth() {
     if (secBusy) return;
+    const tok = await requestReauth({
+      title: t.reauth.disableTotpTitle,
+      description: t.reauth.disableTotpDesc,
+      actionLabel: t.cfg.totpDisable,
+      requireMfa: true,
+    });
+    if (!tok) return;
     secBusy = 'totp-disable';
     try {
-      await apiFetch('/api/auth/totp/disable', { method: 'POST' });
+      await apiFetch('/api/auth/totp/disable', {
+        method: 'POST',
+        headers: { 'x-vane-reauth-token': tok },
+        body: JSON.stringify({ reauth_token: tok }),
+      });
       issuedRecoveryCodes = [];
-      showToast(lang === 'en' ? 'TOTP disabled' : '已关闭 TOTP 二步验证', 'success');
+      totpSetupData = null;
+      totpVerifyCode = '';
+      showToast(lang === 'en' ? 'TOTP disabled and credentials cleared' : '已关闭 TOTP 二步验证并彻底清空旧密钥与恢复码', 'success');
       await onAuthRefresh?.();
       await onRefresh();
     } catch (err) {
@@ -436,11 +477,18 @@
     if (secBusy || !settingsJson) return;
     const currentlyEnabled = Boolean(settingsJson.admin.password_login_enabled);
     const exec = async () => {
+      const tok = await requestReauth({
+        title: currentlyEnabled ? t.reauth.disablePasswordLoginTitle : t.reauth.enablePasswordLoginTitle,
+        description: currentlyEnabled ? t.reauth.disablePasswordLoginDesc : t.reauth.enablePasswordLoginDesc,
+        actionLabel: t.reauth.verifyBtn,
+        requireMfa: true,
+      });
+      if (!tok) return;
       secBusy = 'pw-toggle';
       try {
         const next = deepClone(settingsJson);
         next.admin.password_login_enabled = !currentlyEnabled;
-        if (await onSaveSettings(next)) {
+        if (await onSaveSettings(next, [], { 'x-vane-reauth-token': tok })) {
           await onAuthRefresh?.();
         }
       } finally {
@@ -448,30 +496,48 @@
       }
     };
     if (currentlyEnabled) {
-      askConfirm({
-        title: t.cfg.disablePwConfirmTitle,
-        message: t.cfg.disablePwConfirmDesc,
-        confirmLabel: t.confirmAction,
-        danger: true,
-        onConfirm: exec,
-      });
+      confirmThenRun(
+        {
+          title: t.cfg.disablePwConfirmTitle,
+          message: t.cfg.disablePwConfirmDesc,
+          confirmLabel: t.confirmAction,
+          danger: true,
+        },
+        exec
+      );
     } else {
       exec();
     }
   }
 
-  async function addEd25519Key(e) {
-    e.preventDefault();
-    if (secBusy) return;
-    secBusy = 'ed-add';
+  async function registerPasskey(e) {
+    e?.preventDefault?.();
+    if (secBusy || !passkeyBrowserOk || passkeyOnRawIp) return;
+    const label = newPasskeyName.trim() || detectPasskeyDefaultName();
+    const tok = await requestReauth({
+      title: t.reauth.passkeyRegisterTitle,
+      description: t.reauth.passkeyRegisterDesc,
+      actionLabel: t.reauth.verifyBtn,
+      requireMfa: true,
+    });
+    if (!tok) return;
+    secBusy = 'pk-add';
     try {
-      await apiFetch('/api/auth/ed25519/keys', {
+      const opts = await apiFetch('/api/auth/passkey/register/options', {
         method: 'POST',
-        body: JSON.stringify({ id: newKeyId.trim(), pubkey: newKeyPub.trim() }),
+        headers: { 'x-vane-reauth-token': tok },
+        body: JSON.stringify({ reauth_token: tok }),
       });
-      newKeyId = '';
-      newKeyPub = '';
-      showToast(lang === 'en' ? 'Ed25519 key added' : '已添加授权 Ed25519 公钥', 'success');
+      const att = await createPasskeyCredential(opts, lang);
+      await apiFetch('/api/auth/passkey/register/verify', {
+        method: 'POST',
+        body: JSON.stringify({ name: label, ...att }),
+      });
+      newPasskeyName = '';
+      showToast(
+        lang === 'en' ? `Passkey "${label}" registered & enabled` : `通行密钥「${label}」已成功绑定并自动开启`,
+        'success'
+      );
       await onAuthRefresh?.();
       await onRefresh();
     } catch (err) {
@@ -481,12 +547,59 @@
     }
   }
 
-  async function deleteEd25519Key(id) {
-    if (secBusy) return;
-    secBusy = `ed-del:${id}`;
+  async function disableAllPasskeysWithReauth() {
+    if (secBusy || !settingsJson) return;
+    if (!settingsJson.admin.password_login_enabled) {
+      showToast(t.cfg.passkeyLastAuthHint, 'warn');
+      return;
+    }
+    const tok = await requestReauth({
+      title: t.reauth.disablePasskeyTitle,
+      description: t.reauth.disablePasskeyDesc,
+      actionLabel: t.cfg.passkeyDisableAllBtn,
+      requireMfa: true,
+    });
+    if (!tok) return;
+    secBusy = 'pk-toggle';
     try {
-      await apiFetch(`/api/auth/ed25519/keys/${encodeURIComponent(id)}`, { method: 'DELETE' });
-      showToast(`${t.delete}: ${id}`, 'success');
+      await apiFetch('/api/auth/passkey/toggle', {
+        method: 'POST',
+        headers: { 'x-vane-reauth-token': tok },
+        body: JSON.stringify({ enabled: false, reauth_token: tok }),
+      });
+      showToast(
+        lang === 'en' ? 'Passkeys disabled and all saved keys cleared' : '已关闭通行密钥并彻底清空全部已保存密钥',
+        'success'
+      );
+      await onAuthRefresh?.();
+      await onRefresh();
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      secBusy = '';
+    }
+  }
+
+  async function deletePasskeyWithReauth(id, name) {
+    if (secBusy || !settingsJson) return;
+    if (!settingsJson.admin.password_login_enabled && (settingsJson.admin.passkeys?.length || 0) <= 1) {
+      showToast(t.cfg.passkeyLastAuthHint, 'warn');
+      return;
+    }
+    const tok = await requestReauth({
+      title: t.reauth.deletePasskeyTitle,
+      description: t.reauth.deletePasskeyDesc.replace('{name}', name),
+      actionLabel: t.delete,
+      requireMfa: true,
+    });
+    if (!tok) return;
+    secBusy = `pk-del:${id}`;
+    try {
+      await apiFetch(`/api/auth/passkey/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        headers: { 'x-vane-reauth-token': tok },
+      });
+      showToast(`${t.delete}: ${name}`, 'success');
       await onAuthRefresh?.();
       await onRefresh();
     } catch (err) {
@@ -509,6 +622,7 @@
     'low_memory',
     'cron_failure',
     'module_circuit_open',
+    'system_update',
   ];
 
   let notifDrawerOpen = $state(false);
@@ -678,8 +792,19 @@
   }
 
   // ---------------- 4. 备份操作函数 ----------------
-  const MAX_BACKUP_BYTES = 16 * 1024 * 1024;
-  const BACKUP_MAGIC = 'VANEBAK1';
+  const MAX_BACKUP_BYTES = 6 * 1024 * 1024;
+  const BACKUP_MAGICS = new Set(['VANEBAK1', 'VANEBAK2']);
+
+  let bkPassBytes = $derived(textEncoder.encode(backupPass).length);
+  let bkChecks = $derived({
+    lenOk: bkPassBytes >= 8 && bkPassBytes <= 128,
+    hasAlpha: /[A-Za-z]/.test(backupPass),
+    hasDigitOrPunct: /[0-9!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/.test(backupPass),
+    matchConfirm: backupPass.length > 0 && backupPass === backupPassConfirm,
+  });
+  let bkPassValid = $derived(
+    bkChecks.lenOk && bkChecks.hasAlpha && bkChecks.hasDigitOrPunct && bkChecks.matchConfirm
+  );
 
   function b64ToUint8(b64) {
     const bin = atob(b64);
@@ -710,11 +835,23 @@
       showToast(t.cfg.bkPwMismatch, 'error');
       return;
     }
+    if (!bkPassValid) {
+      showToast(t.cfg.bkPwWeak, 'error');
+      return;
+    }
+    const tok = await requestReauth({
+      title: t.reauth.backupExportTitle,
+      description: t.reauth.backupExportDesc,
+      actionLabel: t.cfg.bkExportBtn,
+      requireMfa: true,
+    });
+    if (!tok) return;
     backupBusy = 'export';
     try {
       const r = await apiFetch('/api/backup/export', {
         method: 'POST',
-        body: JSON.stringify({ password: backupPass }),
+        headers: { 'x-vane-reauth-token': tok },
+        body: JSON.stringify({ password: backupPass, reauth_token: tok }),
       });
       const bytes = b64ToUint8(r.backup_blob);
       const blob = new Blob([bytes], { type: 'application/octet-stream' });
@@ -748,7 +885,7 @@
       const u8 = new Uint8Array(reader.result);
       let magic = '';
       for (let i = 0; i < Math.min(8, u8.length); i++) magic += String.fromCharCode(u8[i]);
-      if (magic !== BACKUP_MAGIC) {
+      if (!BACKUP_MAGICS.has(magic)) {
         showToast(t.cfg.bkBadMagic, 'error');
         if (restoreFileInput) restoreFileInput.value = '';
         return;
@@ -759,13 +896,30 @@
     reader.readAsArrayBuffer(file);
   }
 
-  async function doImportEncryptedBackup() {
+  async function doImportEncryptedBackup(allowSecurityDowngrade = false) {
     if (backupBusy) return;
+    const tok = await requestReauth({
+      title: t.reauth.backupImportTitle,
+      description: t.reauth.backupImportDesc,
+      actionLabel: allowSecurityDowngrade ? t.cfg.bkDowngradeConfirmBtn : t.cfg.bkImportBtn,
+      requireMfa: true,
+    });
+    if (!tok) return;
     backupBusy = 'import';
+    let downgradePrompt = null;
     try {
+      const payload = {
+        backup_blob: restoreBlobB64,
+        password: restorePass,
+        reauth_token: tok,
+      };
+      if (allowSecurityDowngrade) {
+        payload.allow_security_downgrade = true;
+      }
       const res = await apiFetch('/api/backup/import', {
         method: 'POST',
-        body: JSON.stringify({ backup_blob: restoreBlobB64, password: restorePass }),
+        headers: { 'x-vane-reauth-token': tok },
+        body: JSON.stringify(payload),
       });
       restorePass = '';
       restoreBlobB64 = '';
@@ -790,22 +944,47 @@
       await onAuthRefresh?.();
       await onRefresh();
     } catch (err) {
-      showToast(err.message, 'error');
+      const isDowngrade =
+        !allowSecurityDowngrade &&
+        (err?.status === 409 ||
+          err?.code === 'SECURITY_DOWNGRADE_CONFIRM_REQUIRED' ||
+          Array.isArray(err?.data?.downgrades));
+      if (isDowngrade) {
+        const list = Array.isArray(err?.data?.downgrades) ? err.data.downgrades.filter(Boolean) : [];
+        const details = list.length
+          ? `\n• ${list.join('\n• ')}`
+          : err?.data?.message
+            ? `\n${err.data.message}`
+            : '';
+        downgradePrompt = {
+          title: t.cfg.bkDowngradeConfirmTitle,
+          message: `${t.cfg.bkDowngradeConfirmDesc}${details}`,
+          confirmLabel: t.cfg.bkDowngradeConfirmBtn,
+          danger: true,
+        };
+      } else {
+        showToast(err.message, 'error');
+      }
     } finally {
       backupBusy = '';
+    }
+    if (downgradePrompt) {
+      confirmThenRun(downgradePrompt, () => doImportEncryptedBackup(true));
     }
   }
 
   function importEncryptedBackup(e) {
     e.preventDefault();
     if (!restoreBlobB64 || backupBusy) return;
-    askConfirm({
-      title: t.cfg.bkImportTitle,
-      message: `${restoreFileName ? `${restoreFileName} — ` : ''}${t.cfg.bkImportConfirm}`,
-      confirmLabel: t.cfg.bkImportBtn,
-      danger: true,
-      onConfirm: doImportEncryptedBackup,
-    });
+    confirmThenRun(
+      {
+        title: t.cfg.bkImportTitle,
+        message: `${restoreFileName ? `${restoreFileName} — ` : ''}${t.cfg.bkImportConfirm}`,
+        confirmLabel: t.cfg.bkImportBtn,
+        danger: true,
+      },
+      () => doImportEncryptedBackup(false)
+    );
   }
 
   async function loadSanitizedToml() {
@@ -822,107 +1001,306 @@
   }
 </script>
 
-<svelte:window
-  onkeydown={(e) => {
-    if (e.defaultPrevented || saving) return;
-    if (e.key === 'Escape' && notifDrawerOpen) notifDrawerOpen = false;
-  }}
-/>
-
-<datalist id="settings-iface-list">
-  {#each ifaceNames as name (name)}
-    <option value={name}></option>
-  {/each}
-</datalist>
-
 {#if settingsJson}
-  <!-- 顶部子面板导航 -->
-  <div style="margin-bottom:18px;">
-    <div class="pill-tabs" role="tablist">
-      <button type="button" role="tab" aria-selected={subTab === 'general'} class="pill-tab {subTab === 'general' ? 'active' : ''}" onclick={() => onSubTabChange?.('general')}>
-        {t.cfg.tabGeneral}
-      </button>
-      <button type="button" role="tab" aria-selected={subTab === 'security'} class="pill-tab {subTab === 'security' ? 'active' : ''}" onclick={() => onSubTabChange?.('security')}>
-        {t.cfg.tabSecurity}
-      </button>
-      <button type="button" role="tab" aria-selected={subTab === 'notifications'} class="pill-tab {subTab === 'notifications' ? 'active' : ''}" onclick={() => onSubTabChange?.('notifications')}>
-        {t.cfg.tabNotifications} ({settingsJson.notifications?.length || 0})
-      </button>
-      <button type="button" role="tab" aria-selected={subTab === 'backup'} class="pill-tab {subTab === 'backup' ? 'active' : ''}" onclick={() => onSubTabChange?.('backup')}>
-        {t.cfg.tabBackup}
-      </button>
-    </div>
+  <!-- 顶部子面板导航（Arcane 风格带图标下划线标签栏） -->
+  <div class="underline-tabs" role="tablist">
+    <button type="button" role="tab" aria-selected={subTab === 'general'} class="underline-tab {subTab === 'general' ? 'active' : ''}" onclick={() => onSubTabChange?.('general')}>
+      <Icons name="sliders" size={15} />
+      <span>{t.cfg.tabGeneral}</span>
+    </button>
+    <button type="button" role="tab" aria-selected={subTab === 'appearance'} class="underline-tab {subTab === 'appearance' ? 'active' : ''}" onclick={() => onSubTabChange?.('appearance')}>
+      <Icons name="palette" size={15} />
+      <span>{t.cfg.tabAppearance}</span>
+    </button>
+    <button type="button" role="tab" aria-selected={subTab === 'security'} class="underline-tab {subTab === 'security' ? 'active' : ''}" onclick={() => onSubTabChange?.('security')}>
+      <Icons name="shield" size={15} />
+      <span>{t.cfg.tabSecurity}</span>
+    </button>
+    <button type="button" role="tab" aria-selected={subTab === 'notifications'} class="underline-tab {subTab === 'notifications' ? 'active' : ''}" onclick={() => onSubTabChange?.('notifications')}>
+      <Icons name="bell" size={15} />
+      <span>{t.cfg.tabNotifications}</span>
+      {#if settingsJson.notifications?.length}
+        <span class="badge badge-muted num" style="font-size:10.5px;padding:0 6px;">{settingsJson.notifications.length}</span>
+      {/if}
+    </button>
+    <button type="button" role="tab" aria-selected={subTab === 'backup'} class="underline-tab {subTab === 'backup' ? 'active' : ''}" onclick={() => onSubTabChange?.('backup')}>
+      <Icons name="database" size={15} />
+      <span>{t.cfg.tabBackup}</span>
+    </button>
+    <button type="button" role="tab" aria-selected={subTab === 'update'} class="underline-tab {subTab === 'update' ? 'active' : ''}" onclick={() => onSubTabChange?.('update')}>
+      <Icons name="refresh" size={15} />
+      <span>{t.cfg.tabUpdate}</span>
+    </button>
   </div>
 
-  <!-- 1. 模块启停与系统/防火墙设置 -->
-  {#if subTab === 'general'}
-    <div class="card" style="margin-bottom:18px;">
-      <div class="card-header">
-        <div>
-          <div class="card-title">{t.cfg.modulesTitle}</div>
-          <div style="font-size:12px;color:var(--text-secondary);">{t.cfg.modulesDesc}</div>
+  <!-- 0. 个性化设置：外观模式、主题色、界面语言与侧边栏布局 -->
+  {#if subTab === 'appearance'}
+    <div class="bento-grid-2">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title"><Icons name="palette" size={16} />{t.cfg.appearanceThemeTitle}</div>
+            <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">{t.cfg.appearanceThemeDesc}</div>
+          </div>
+        </div>
+
+        <div class="section-label" style="margin-top:0;">{t.themeModeLabel}</div>
+        <div class="appearance-mode-grid" style="margin-bottom:16px;">
+          {#each [
+            { id: 'auto', icon: 'contrast', label: t.themeAuto, desc: t.cfg.themeAutoDesc },
+            { id: 'light', icon: 'sun', label: t.themeLight, desc: t.cfg.themeLightDesc },
+            { id: 'dark', icon: 'moon', label: t.themeDark, desc: t.cfg.themeDarkDesc },
+          ] as m (m.id)}
+            <button
+              type="button"
+              class="appearance-option {themeMode === m.id ? 'active' : ''}"
+              aria-pressed={themeMode === m.id}
+              onclick={() => onSelectThemeMode?.(m.id)}
+            >
+              <span class="appearance-option-icon"><Icons name={m.icon} size={17} /></span>
+              <div style="min-width:0;flex:1;">
+                <div style="font-weight:700;font-size:13.5px;">{m.label}</div>
+                <div style="font-size:11.5px;color:var(--text-muted);margin-top:2px;">{m.desc}</div>
+              </div>
+            </button>
+          {/each}
+        </div>
+
+        <div class="section-label">{t.themeAccentLabel}</div>
+        <div class="accent-grid">
+          {#each accentPresets as ap (ap.id)}
+            <button
+              type="button"
+              class="accent-card {accentColor === ap.id ? 'active' : ''}"
+              aria-pressed={accentColor === ap.id}
+              onclick={() => onSelectAccentColor?.(ap.id)}
+            >
+              <span class="accent-swatch-dot" style={`background:${ap.color};`}>
+                {#if accentColor === ap.id}
+                  <Icons name="check" size={13} />
+                {/if}
+              </span>
+              <span>{t.accents?.[ap.id] || ap.id}</span>
+            </button>
+          {/each}
         </div>
       </div>
-      <div class="bento-grid" style="margin-bottom:0;">
-        {#each [
-          ['reverse_proxy', t.nav.reverse_proxy],
-          ['port_forward', t.nav.port_forward],
-          ['ddns', t.nav.ddns],
-          ['acme', t.nav.acme],
-          ['stun', t.nav.stun],
-          ['web_terminal', t.nav.web_terminal],
-          ['cron', t.nav.cron],
-          ['docker', t.nav.docker],
-        ] as [key, title] (key)}
-          <div class="subcard row-between">
-            <div style="display:flex;align-items:center;gap:8px;">
-              <Icons name={key} size={16} />
-              <span style="font-weight:600;font-size:14px;">{title}</span>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title"><Icons name="ddns" size={16} />{t.cfg.appearanceLangTitle}</div>
+            <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">{t.cfg.appearanceLangDesc}</div>
+          </div>
+        </div>
+
+        <div class="section-label" style="margin-top:0;">{t.cfg.lblLanguage}</div>
+        <div class="appearance-lang-grid" style="margin-bottom:18px;">
+          {#each [
+            { id: 'zh', label: '简体中文', sub: 'Chinese (Simplified)' },
+            { id: 'en', label: 'English', sub: 'English (US)' },
+          ] as item (item.id)}
+            <button
+              type="button"
+              class="appearance-option {lang === item.id ? 'active' : ''}"
+              aria-pressed={lang === item.id}
+              onclick={() => onSelectLang?.(item.id)}
+            >
+              <span class="appearance-option-icon mono" style="font-size:12.5px;font-weight:700;">
+                {item.id === 'zh' ? '中' : 'EN'}
+              </span>
+              <div style="min-width:0;flex:1;">
+                <div style="font-weight:700;font-size:13.5px;">{item.label}</div>
+                <div style="font-size:11.5px;color:var(--text-muted);margin-top:2px;">{item.sub}</div>
+              </div>
+              {#if lang === item.id}
+                <Icons name="check" size={15} />
+              {/if}
+            </button>
+          {/each}
+        </div>
+
+        <div class="section-label">{lang === 'en' ? 'Display & Layout' : '显示与导航布局'}</div>
+        <div class="settings-list">
+          <div class="settings-row switch-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">{t.cfg.oledModeLabel}</span>
+              <div class="settings-row-desc">{t.cfg.oledModeDesc}</div>
             </div>
-            <div style="display:flex;align-items:center;gap:10px;">
-              <span class="badge {modules[key] ? 'badge-ok' : 'badge-muted'}">{modules[key] ? t.enabled : t.disabled}</span>
+            <div class="settings-row-control">
               <button
                 type="button"
                 class="switch"
                 role="switch"
-                aria-checked={Boolean(modules[key])}
-                aria-label={title}
-                onclick={() => onToggleModule(key)}
+                aria-checked={Boolean(oledMode)}
+                aria-label={t.cfg.oledModeLabel}
+                onclick={() => onToggleOledMode?.()}
               >
                 <span class="switch-thumb"></span>
               </button>
             </div>
+          </div>
+          <div class="settings-row switch-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">{t.cfg.sidebarCollapseLabel}</span>
+              <div class="settings-row-desc">{t.cfg.sidebarCollapseDesc}</div>
+            </div>
+            <div class="settings-row-control">
+              <button
+                type="button"
+                class="switch"
+                role="switch"
+                aria-checked={Boolean(sidebarCollapsed)}
+                aria-label={t.cfg.sidebarCollapseLabel}
+                onclick={() => onToggleSidebar?.()}
+              >
+                <span class="switch-thumb"></span>
+              </button>
+            </div>
+          </div>
+          <div class="settings-row switch-row">
+            <div class="settings-row-info">
+              <span class="settings-row-label">{t.cfg.pwaInstallLabel}</span>
+              <div class="settings-row-desc">
+                {#if pwaState?.standalone}
+                  {t.cfg.pwaInstallDesc}
+                {:else if pwaState?.canPrompt}
+                  {t.cfg.pwaInstallDesc}
+                {:else if pwaState?.iosSafari}
+                  {t.cfg.pwaIosGuide}
+                {:else}
+                  {t.cfg.pwaHttpsHint}
+                {/if}
+              </div>
+            </div>
+            <div class="settings-row-control">
+              {#if pwaState?.standalone}
+                <span class="badge badge-ok">
+                  <Icons name="check" size={12} />
+                  <span>{t.cfg.pwaInstalledBadge}</span>
+                </span>
+              {:else if pwaState?.canPrompt && onInstallPwa}
+                <button type="button" class="btn btn-primary btn-sm" onclick={() => onInstallPwa()}>
+                  <Icons name="download" size={14} />
+                  <span>{t.cfg.pwaInstallBtn}</span>
+                </button>
+              {:else}
+                <span class="badge badge-muted">PWA</span>
+              {/if}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  <!-- 1. 子功能模块中心 + 全局核心与共用基础设置（各子模块专属参数已内聚至对应模块页面） -->
+  {#if subTab === 'general'}
+    <div class="card" style="margin-bottom:22px;">
+      <div class="card-header">
+        <div>
+          <div class="card-title">{t.cfg.modulesTitle}</div>
+          <div style="font-size:12px;color:var(--text-secondary);">
+            {lang === 'en'
+              ? 'Toggle sub-modules or enable step-up re-auth locks. Each module manages its own dedicated settings directly inside its page.'
+              : '按需启停子模块或开启二次验证锁；各模块的专属参数可直接进入对应模块页面内调整。'}
+          </div>
+        </div>
+      </div>
+      <div class="modules-grid">
+        {#each [
+          { key: 'reverse_proxy', title: t.nav.reverse_proxy, sharedTag: t.cfg.moduleSharedTagFw },
+          { key: 'port_forward', title: t.nav.port_forward, sharedTag: t.cfg.moduleSharedTagFw },
+          { key: 'ddns', title: t.nav.ddns, sharedTag: t.cfg.moduleSharedTagFwDns },
+          { key: 'acme', title: t.nav.acme, sharedTag: t.cfg.moduleSharedTagDns },
+          { key: 'stun', title: t.nav.stun, sharedTag: '' },
+          { key: 'web_terminal', title: t.nav.web_terminal, sharedTag: '' },
+          { key: 'cron', title: t.nav.cron, sharedTag: '' },
+          { key: 'docker', title: t.nav.docker, sharedTag: '' },
+        ] as mod (mod.key)}
+          {@const key = mod.key}
+          {@const title = mod.title}
+          {@const modOn = Boolean(modules[key])}
+          {@const reauthOn = Boolean(moduleReauth?.[key])}
+          {@const modLocked = Boolean(modOn && isModuleLocked(key))}
+          <div class="subcard module-card">
+            <div class="row-between">
+              <div style="display:flex;align-items:center;gap:8px;min-width:0;">
+                <Icons name={key} size={16} />
+                <span style="font-weight:600;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{title}</span>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px;flex-shrink:0;">
+                <span class="badge {modOn ? 'badge-ok' : 'badge-muted'}">{modOn ? t.enabled : t.disabled}</span>
+                <button
+                  type="button"
+                  class="switch"
+                  role="switch"
+                  aria-checked={modOn}
+                  aria-label={title}
+                  onclick={() => onToggleModule(key)}
+                >
+                  <span class="switch-thumb"></span>
+                </button>
+              </div>
+            </div>
+            <div class="module-card-reauth {reauthOn ? 'active' : ''} {!modOn ? 'disabled' : ''}">
+              <span style="display:inline-flex;align-items:center;gap:6px;min-width:0;">
+                <Icons name={reauthOn ? (modLocked ? 'lock' : 'unlock') : 'shield'} size={13} />
+                <span>{t.cfg.moduleReauthLabel}</span>
+                {#if modOn && reauthOn}
+                  <span class="badge {modLocked ? 'badge-muted' : 'badge-ok'}" style="font-size:10px;padding:1px 6px;">
+                    {modLocked ? (lang === 'en' ? 'Locked' : '已锁定') : (lang === 'en' ? 'Unlocked' : '已解锁')}
+                  </span>
+                {/if}
+              </span>
+              <button
+                type="button"
+                class="switch switch-xs"
+                role="switch"
+                disabled={!modOn}
+                aria-checked={reauthOn}
+                aria-label={`${title} ${t.cfg.moduleReauthLabel}`}
+                onclick={() => onToggleModuleReauth?.(key)}
+              >
+                <span class="switch-thumb"></span>
+              </button>
+            </div>
+            {#if modOn && (mod.sharedTag || onNavigate)}
+              <div class="module-card-foot">
+                <span class="module-card-summary">{mod.sharedTag || ' '}</span>
+                {#if onNavigate}
+                  <button type="button" class="btn btn-ghost btn-xs" style="padding:0 6px;color:var(--text-secondary);" onclick={() => onNavigate(key)}>
+                    <span>{t.cfg.moduleOpenViewBtn}</span>
+                    <Icons name="chevron_right" size={12} />
+                  </button>
+                {/if}
+              </div>
+            {/if}
           </div>
         {/each}
       </div>
     </div>
 
     {#if generalDraft}
-      <form class="card" onsubmit={saveGeneralSettings}>
-        <div class="card-header">
-          <span class="card-title">{t.cfg.sysTitle}</span>
+      <form onsubmit={saveGeneralSettings}>
+        <!-- 板块二：总体系统设置（全局核心，始终可见，不受单子模块启停/锁限制） -->
+        <div class="settings-tier-head">
+          <div>
+            <div class="settings-tier-title">{t.cfg.globalTierTitle}</div>
+            <div class="settings-tier-desc">{t.cfg.globalTierDesc}</div>
+          </div>
           <div class="btn-group">
             {#if generalDirty}
               <button type="button" class="btn btn-sm" onclick={() => syncGeneralDraft(settingsJson)}>
                 {t.common.discardChanges}
               </button>
             {/if}
-            <button type="submit" class="btn btn-primary btn-sm" disabled={saving}>{saving ? '...' : t.saveSettings}</button>
+            <button type="submit" class="btn btn-primary btn-sm" disabled={saving || !generalDirty}>
+              <Icons name="save" size={14} />
+              <span>{saving ? '...' : t.saveSettings}</span>
+            </button>
           </div>
         </div>
-
-        {#if generalDirty}
-          <div class="banner banner-info">
-            <div style="display:flex;align-items:center;gap:8px;font-weight:600;">
-              <Icons name="info" size={16} />
-              <span>{t.common.unsavedChanges}</span>
-            </div>
-            <div class="btn-group">
-              <button type="button" class="btn btn-xs" onclick={() => syncGeneralDraft(settingsJson)}>{t.common.discardChanges}</button>
-              <button type="submit" class="btn btn-xs btn-primary" disabled={saving}>{t.saveSettings}</button>
-            </div>
-          </div>
-        {/if}
 
         <div class="banner banner-warn">
           <div style="display:flex;align-items:flex-start;gap:10px;">
@@ -933,7 +1311,7 @@
               {#if savedEntryUrl}
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:8px;">
                   <span style="font-size:12px;color:var(--text-secondary);">{t.cfg.savedEntryUrl}:</span>
-                  <code class="mono" style="background:var(--bg-elevated);padding:2px 8px;border-radius:6px;border:1px solid var(--border-subtle);">{savedEntryUrl}</code>
+                  <code class="mono" style="background:var(--bg-elevated);padding:2px 8px;border-radius:8px;border:1px solid var(--border-subtle);">{savedEntryUrl}</code>
                   <button type="button" class="btn btn-xs" onclick={() => handleCopy(savedEntryUrl)}>
                     <Icons name="copy" size={12} />
                     <span>{t.copy}</span>
@@ -943,7 +1321,7 @@
               {#if draftEntryUrl && draftEntryUrl !== savedEntryUrl}
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px;">
                   <span style="font-size:12px;color:var(--warn);font-weight:600;">{t.cfg.previewEntryUrl}:</span>
-                  <code class="mono" style="background:var(--bg-elevated);padding:2px 8px;border-radius:6px;border:1px solid var(--warn);">{draftEntryUrl}</code>
+                  <code class="mono" style="background:var(--bg-elevated);padding:2px 8px;border-radius:8px;border:1px solid var(--warn);">{draftEntryUrl}</code>
                   <button type="button" class="btn btn-xs" onclick={() => handleCopy(draftEntryUrl)}>
                     <Icons name="copy" size={12} />
                     <span>{t.copy}</span>
@@ -954,226 +1332,332 @@
           </div>
         </div>
 
-        <!-- Core & Admin Listener -->
-        <div class="section-label">{t.cfg.groupCore}</div>
-        <div class="form-grid">
-          <div class="field">
-            <label for="st-ttl">{t.cfg.lblSessionTtl}</label>
-            <input id="st-ttl" type="number" min="300" max="86400" bind:value={generalDraft.admin.session_ttl_secs} required />
+        <!-- 分组 1：核心运行与管理入口（总体） -->
+        <section class="settings-section">
+          <div class="settings-section-head">
+            <div>
+              <h3 class="settings-section-title">{t.cfg.groupCore}</h3>
+            </div>
           </div>
-          <div class="field">
-            <label for="st-maxc">{t.cfg.lblGlobalConns}</label>
-            <input id="st-maxc" type="number" min="64" max="4096" bind:value={generalDraft.system.global_max_conns} required />
+          <div class="settings-list">
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label class="settings-row-label" for="st-ttl">{t.cfg.lblSessionTtl}</label>
+                <div class="settings-row-desc">{t.cfg.descSessionTtl}</div>
+              </div>
+              <div class="settings-row-control">
+                <input id="st-ttl" type="number" min="300" max="86400" bind:value={generalDraft.admin.session_ttl_secs} required />
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label class="settings-row-label" for="st-maxc">{t.cfg.lblGlobalConns}</label>
+                <div class="settings-row-desc">{t.cfg.descGlobalConns}</div>
+              </div>
+              <div class="settings-row-control">
+                <input id="st-maxc" type="number" min="64" max="4096" bind:value={generalDraft.system.global_max_conns} required />
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label class="settings-row-label" for="st-tz">{t.cfg.lblTimezone}</label>
+                <div class="settings-row-desc">UTC / auto / +08:00</div>
+              </div>
+              <div class="settings-row-control">
+                <input id="st-tz" type="text" class="mono" bind:value={generalDraft.system.timezone_offset} />
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label class="settings-row-label" for="st-wk" style="display:inline-flex;align-items:center;gap:6px;">
+                  <span>{t.cfg.workerThreads}</span>
+                  <span class="badge badge-warn" style="font-size:10px;padding:1px 6px;">{t.common.restartReqBadge}</span>
+                </label>
+                <div class="settings-row-desc">{t.cfg.descWorkerThreads}</div>
+              </div>
+              <div class="settings-row-control">
+                <input id="st-wk" type="number" min="1" max="8" bind:value={generalDraft.system.worker_threads} required />
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label class="settings-row-label" for="st-sp">{t.cfg.lblSecretPath}</label>
+                <div class="settings-row-desc">{t.cfg.descSecretPath}</div>
+              </div>
+              <div class="settings-row-control">
+                <div style="display:flex;gap:8px;align-items:center;">
+                  <input id="st-sp" type="text" class="mono" placeholder="/ or /_vane_..." bind:value={generalDraft.admin.secret_path} />
+                  <button type="button" class="btn btn-xs" style="flex-shrink:0;" onclick={generateRandomSecretPath}>
+                    {t.cfg.genRandomPath}
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label class="settings-row-label" for="st-org" style="display:inline-flex;align-items:center;gap:6px;">
+                  <span>{t.cfg.lblCanonicalOrigin}</span>
+                  <span class="badge badge-warn" style="font-size:10px;padding:1px 6px;">{t.common.restartReqBadge}</span>
+                </label>
+                <div class="settings-row-desc">{t.cfg.descCanonicalOrigin}</div>
+              </div>
+              <div class="settings-row-control">
+                <input id="st-org" type="text" class="mono" bind:value={generalDraft.admin.canonical_origin} />
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label class="settings-row-label" for="st-ll" style="display:inline-flex;align-items:center;gap:6px;">
+                  <span>{t.cfg.lblListenLan}</span>
+                  <span class="badge badge-warn" style="font-size:10px;padding:1px 6px;">{t.common.restartReqBadge}</span>
+                </label>
+                <div class="settings-row-desc">{t.cfg.descListenLan}</div>
+              </div>
+              <div class="settings-row-control">
+                <input id="st-ll" type="text" class="mono" bind:value={listenLanCsv} />
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label class="settings-row-label" for="st-eo">{t.cfg.extraOrigins}</label>
+                <div class="settings-row-desc">{t.cfg.descExtraOrigins}</div>
+              </div>
+              <div class="settings-row-control">
+                <input id="st-eo" type="text" class="mono" placeholder="https://192.168.1.1:5173" bind:value={extraOriginsCsv} />
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label class="settings-row-label" for="st-tcert" style="display:inline-flex;align-items:center;gap:6px;">
+                  <span>{t.cfg.tlsCertPath}</span>
+                  <span class="badge badge-warn" style="font-size:10px;padding:1px 6px;">{t.common.restartReqBadge}</span>
+                </label>
+                <div class="settings-row-desc">{t.cfg.tlsKeyPath}</div>
+              </div>
+              <div class="settings-row-control">
+                <input id="st-tcert" type="text" class="mono" placeholder="/etc/vane/admin.crt" bind:value={generalDraft.admin.tls_cert_path} />
+                <input id="st-tkey" type="text" class="mono" placeholder="/etc/vane/admin.key" bind:value={generalDraft.admin.tls_key_path} />
+              </div>
+            </div>
           </div>
-          <div class="field">
-            <label for="st-tz">{t.cfg.lblTimezone} (UTC / auto / +08:00)</label>
-            <input id="st-tz" type="text" class="mono" bind:value={generalDraft.system.timezone_offset} />
+        </section>
+
+        <!-- 分组 2：安全防爆破与协议超时（总体） -->
+        <section class="settings-section">
+          <div class="settings-section-head">
+            <h3 class="settings-section-title">{t.cfg.groupSecurity}</h3>
           </div>
-          <div class="field">
-            <label for="st-ring">{t.cfg.lblLogRing}</label>
-            <input id="st-ring" type="number" min="50" max="1000" bind:value={generalDraft.system.log_ring_capacity} required />
+          <div class="settings-list">
+            <div class="settings-row switch-row">
+              <div class="settings-row-info">
+                <span class="settings-row-label">{t.cfg.lblKernelBan}</span>
+                <div class="settings-row-desc">{t.cfg.descKernelBan}</div>
+              </div>
+              <div class="settings-row-control">
+                <button
+                  type="button"
+                  class="switch"
+                  role="switch"
+                  aria-checked={Boolean(generalDraft.security.kernel_ban_offload)}
+                  aria-label={t.cfg.lblKernelBan}
+                  onclick={() => (generalDraft.security.kernel_ban_offload = !generalDraft.security.kernel_ban_offload)}
+                >
+                  <span class="switch-thumb"></span>
+                </button>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label class="settings-row-label" for="st-f2b">{t.cfg.lblMaxFailures}</label>
+                <div class="settings-row-desc">{t.cfg.lblBanDuration}</div>
+              </div>
+              <div class="settings-row-control" style="flex-direction:row;gap:8px;">
+                <input id="st-f2b" type="number" min="3" max="20" bind:value={generalDraft.security.max_login_failures} required />
+                <input id="st-bds" type="number" min="60" max="86400" bind:value={generalDraft.security.ban_duration_secs} required />
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label class="settings-row-label" for="st-tlshs">{t.cfg.tlsHsTimeout} / {t.cfg.hdrTimeout}</label>
+                <div class="settings-row-desc">{lang === 'en' ? 'TLS (2~30s) · HTTP Header (3~60s)' : '握手超时 (2~30秒) · 请求头超时 (3~60秒)'}</div>
+              </div>
+              <div class="settings-row-control" style="flex-direction:row;gap:8px;">
+                <input id="st-tlshs" type="number" min="2" max="30" bind:value={generalDraft.security.tls_handshake_timeout_secs} required />
+                <input id="st-hdrt" type="number" min="3" max="60" bind:value={generalDraft.security.http_header_timeout_secs} required />
+              </div>
+            </div>
           </div>
-          <div class="field">
-            <label for="st-wk">
-              {t.cfg.workerThreads}
-              <span class="badge badge-warn" style="margin-left:6px;font-size:10px;">{t.common.restartReqBadge}</span>
-            </label>
-            <input id="st-wk" type="number" min="1" max="8" bind:value={generalDraft.system.worker_threads} required />
+        </section>
+
+        <!-- 板块三：多模块共用基础设置（显式展示跨模块共用关系） -->
+        <div class="settings-tier-head" style="margin-top:26px;">
+          <div>
+            <div class="settings-tier-title">{t.cfg.sharedTierTitle}</div>
+            <div class="settings-tier-desc">{t.cfg.sharedTierDesc}</div>
           </div>
-          <div class="field">
-            <div class="row-between" style="gap:6px;">
-              <label for="st-sp" style="margin:0;">{t.cfg.lblSecretPath}</label>
-              <button type="button" class="btn btn-ghost btn-xs" style="min-height:22px;padding:0 6px;" onclick={generateRandomSecretPath}>
-                {t.cfg.genRandomPath}
+        </div>
+
+        <section class="settings-section">
+          <div class="settings-section-head">
+            <div>
+              <h3 class="settings-section-title">{t.cfg.groupFirewall}</h3>
+              <div class="shared-dep-strip">
+                <span class="shared-dep-label">{t.cfg.sharedByLabel}:</span>
+                {#each fwDeps as dep (dep.label)}
+                  <span class="shared-dep-pill {dep.active ? 'active' : ''}">
+                    <span class="status-dot {dep.active ? 'ok' : 'muted'}" style="width:6px;height:6px;box-shadow:none;"></span>
+                    <span>{dep.label}</span>
+                  </span>
+                {/each}
+              </div>
+            </div>
+          </div>
+          {#if !anyFwDepActive}
+            <div class="banner banner-info" style="margin-bottom:10px;font-size:12.5px;">
+              <div style="display:flex;align-items:center;gap:8px;">
+                <Icons name="info" size={15} />
+                <span>{t.cfg.sharedFirewallUnusedHint}</span>
+              </div>
+            </div>
+          {/if}
+          <div class="settings-list">
+            <div class="settings-row switch-row">
+              <div class="settings-row-info">
+                <span class="settings-row-label">{t.cfg.lblFwAuto}</span>
+                <div class="settings-row-desc">{t.cfg.descFwAuto}</div>
+              </div>
+              <div class="settings-row-control">
+                <button
+                  type="button"
+                  class="switch"
+                  role="switch"
+                  aria-checked={Boolean(generalDraft.firewall.auto_manage)}
+                  aria-label={t.cfg.lblFwAuto}
+                  onclick={() => (generalDraft.firewall.auto_manage = !generalDraft.firewall.auto_manage)}
+                >
+                  <span class="switch-thumb"></span>
+                </button>
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label class="settings-row-label" for="st-fwb" style="display:inline-flex;align-items:center;gap:6px;">
+                  <span>{t.cfg.lblFwBackend}</span>
+                  <span class="badge badge-warn" style="font-size:10px;padding:1px 6px;">{t.common.restartReqBadge}</span>
+                </label>
+                <div class="settings-row-desc">{t.cfg.descFwBackend}</div>
+              </div>
+              <div class="settings-row-control">
+                <Select
+                  id="st-fwb"
+                  bind:value={generalDraft.firewall.backend}
+                  options={[
+                    { value: 'auto', label: lang === 'en' ? 'Auto Detect (Recommended)' : '自动识别（推荐）' },
+                    { value: 'nftables', label: 'nftables (OpenWrt fw4)' },
+                    { value: 'iptables_legacy', label: 'iptables (Legacy)' },
+                    { value: 'iptables_nft', label: 'iptables-nft' },
+                  ]}
+                />
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label class="settings-row-label" for="st-wan">{t.cfg.lblWanIfaces}</label>
+                <div class="settings-row-desc">{t.cfg.descWanIfaces}</div>
+              </div>
+              <div class="settings-row-control">
+                <ComboInput id="st-wan" multiple placeholder="pppoe-wan" options={ifaceOptions} bind:value={wanIfacesCsv} />
+              </div>
+            </div>
+            <div class="settings-row">
+              <div class="settings-row-info">
+                <label class="settings-row-label" for="st-lan">{t.cfg.lblLanIfaces}</label>
+                <div class="settings-row-desc">{t.cfg.descLanIfaces}</div>
+              </div>
+              <div class="settings-row-control">
+                <ComboInput id="st-lan" multiple placeholder="br-lan" options={ifaceOptions} bind:value={lanIfacesCsv} />
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {#if sharedDnsVisible}
+          {@const dnsTargetTab = modules.ddns ? 'ddns' : 'acme'}
+          <section class="settings-section">
+            <div class="settings-section-head">
+              <div>
+                <h3 class="settings-section-title">{t.cfg.sharedDnsTitle}</h3>
+                <div class="shared-dep-strip">
+                  <span class="shared-dep-label">{t.cfg.sharedByLabel}:</span>
+                  <span class="shared-dep-pill {modules.ddns ? 'active' : ''}">
+                    <span class="status-dot {modules.ddns ? 'ok' : 'muted'}" style="width:6px;height:6px;box-shadow:none;"></span>
+                    <span>{t.nav.ddns}</span>
+                  </span>
+                  <span class="shared-dep-pill {modules.acme ? 'active' : ''}">
+                    <span class="status-dot {modules.acme ? 'ok' : 'muted'}" style="width:6px;height:6px;box-shadow:none;"></span>
+                    <span>{t.nav.acme}</span>
+                  </span>
+                </div>
+              </div>
+              {#if onNavigate}
+                <button type="button" class="btn btn-sm" onclick={() => onNavigate(dnsTargetTab)}>
+                  <Icons name="key" size={13} />
+                  <span>{t.cfg.sharedDnsManageBtn}</span>
+                  <Icons name="chevron_right" size={13} />
+                </button>
+              {/if}
+            </div>
+            <div class="settings-list">
+              <div class="settings-row switch-row">
+                <div class="settings-row-info">
+                  <span class="settings-row-label">
+                    {dnsProviderNames.length
+                      ? t.cfg.sharedDnsCount.replace('{n}', String(dnsProviderNames.length))
+                      : t.cfg.sharedDnsEmpty}
+                  </span>
+                  <div class="settings-row-desc">{t.cfg.sharedDnsDesc}</div>
+                </div>
+                <div class="settings-row-control" style="flex-direction:row;flex-wrap:wrap;justify-content:flex-end;gap:6px;">
+                  {#each dnsProviderNames.slice(0, 6) as pName (pName)}
+                    <span class="badge badge-muted mono">{pName}</span>
+                  {/each}
+                  {#if dnsProviderNames.length > 6}
+                    <span class="badge badge-muted num">+{dnsProviderNames.length - 6}</span>
+                  {/if}
+                </div>
+              </div>
+            </div>
+          </section>
+        {/if}
+
+        {#if generalDirty}
+          <div class="floating-save-bar">
+            <span style="display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;">
+              <Icons name="info" size={15} />
+              <span>{t.common.unsavedChanges}</span>
+            </span>
+            <div class="btn-group">
+              <button type="button" class="btn btn-sm" onclick={() => syncGeneralDraft(settingsJson)}>
+                {t.common.discardChanges}
+              </button>
+              <button type="submit" class="btn btn-primary btn-sm" disabled={saving}>
+                <Icons name="save" size={14} />
+                <span>{saving ? '...' : t.saveSettings}</span>
               </button>
             </div>
-            <input id="st-sp" type="text" class="mono" placeholder="/ or /_vane_..." bind:value={generalDraft.admin.secret_path} />
           </div>
-          <div class="field">
-            <label for="st-org">
-              {t.cfg.lblCanonicalOrigin}
-              <span class="badge badge-warn" style="margin-left:6px;font-size:10px;">{t.common.restartReqBadge}</span>
-            </label>
-            <input id="st-org" type="text" class="mono" bind:value={generalDraft.admin.canonical_origin} />
-          </div>
-          <div class="field">
-            <label for="st-ll">
-              {t.cfg.lblListenLan}
-              <span class="badge badge-warn" style="margin-left:6px;font-size:10px;">{t.common.restartReqBadge}</span>
-            </label>
-            <input id="st-ll" type="text" class="mono" bind:value={listenLanCsv} />
-          </div>
-          <div class="field">
-            <label for="st-eo">{t.cfg.extraOrigins}</label>
-            <input id="st-eo" type="text" class="mono" placeholder="https://192.168.1.1:5173" bind:value={extraOriginsCsv} />
-          </div>
-          <div class="field">
-            <label for="st-dks">{t.cfg.dockerSocket}</label>
-            <input id="st-dks" type="text" class="mono" bind:value={generalDraft.admin.docker_socket} />
-          </div>
-          <div class="field">
-            <label for="st-tcert">
-              {t.cfg.tlsCertPath}
-              <span class="badge badge-warn" style="margin-left:6px;font-size:10px;">{t.common.restartReqBadge}</span>
-            </label>
-            <input id="st-tcert" type="text" class="mono" placeholder="/etc/vane/admin.crt" bind:value={generalDraft.admin.tls_cert_path} />
-          </div>
-          <div class="field">
-            <label for="st-tkey">{t.cfg.tlsKeyPath}</label>
-            <input id="st-tkey" type="text" class="mono" placeholder="/etc/vane/admin.key" bind:value={generalDraft.admin.tls_key_path} />
-          </div>
-        </div>
-
-        <!-- Firewall & Fail2Ban -->
-        <div class="section-label">{t.cfg.groupFirewall}</div>
-        <div class="form-grid">
-          <div class="field">
-            <label for="st-fwb">
-              {t.cfg.lblFwBackend}
-              <span class="badge badge-warn" style="margin-left:6px;font-size:10px;">{t.common.restartReqBadge}</span>
-            </label>
-            <select id="st-fwb" bind:value={generalDraft.firewall.backend}>
-              <option value="auto">auto (fw4 nftables / fw3 iptables)</option>
-              <option value="nftables">nftables (OpenWrt fw4)</option>
-              <option value="iptables_legacy">iptables_legacy</option>
-              <option value="iptables_nft">iptables_nft</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="st-wan">{t.cfg.lblWanIfaces}</label>
-            <input id="st-wan" type="text" list="settings-iface-list" class="mono" placeholder="pppoe-wan" bind:value={wanIfacesCsv} />
-            {#if ifaceNames.length}
-              <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:4px;">
-                {#each ifaceNames as ifn (ifn)}
-                  {@const picked = splitCsv(wanIfacesCsv).includes(ifn)}
-                  <button type="button" class="chip {picked ? 'active' : ''}" onclick={() => (wanIfacesCsv = toggleCsvIface(wanIfacesCsv, ifn))}>
-                    {ifn}
-                  </button>
-                {/each}
-              </div>
-            {/if}
-          </div>
-          <div class="field">
-            <label for="st-lan">{t.cfg.lblLanIfaces}</label>
-            <input id="st-lan" type="text" list="settings-iface-list" class="mono" placeholder="br-lan" bind:value={lanIfacesCsv} />
-            {#if ifaceNames.length}
-              <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:4px;">
-                {#each ifaceNames as ifn (ifn)}
-                  {@const picked = splitCsv(lanIfacesCsv).includes(ifn)}
-                  <button type="button" class="chip {picked ? 'active' : ''}" onclick={() => (lanIfacesCsv = toggleCsvIface(lanIfacesCsv, ifn))}>
-                    {ifn}
-                  </button>
-                {/each}
-              </div>
-            {/if}
-          </div>
-          <div class="field">
-            <label for="st-f2b">{t.cfg.lblMaxFailures}</label>
-            <input id="st-f2b" type="number" min="3" max="20" bind:value={generalDraft.security.max_login_failures} required />
-          </div>
-          <div class="field">
-            <label for="st-bds">{t.cfg.lblBanDuration}</label>
-            <input id="st-bds" type="number" min="60" max="86400" bind:value={generalDraft.security.ban_duration_secs} required />
-          </div>
-          <div class="field">
-            <label for="st-tlshs">{t.cfg.tlsHsTimeout} (2~30)</label>
-            <input id="st-tlshs" type="number" min="2" max="30" bind:value={generalDraft.security.tls_handshake_timeout_secs} required />
-          </div>
-          <div class="field">
-            <label for="st-hdrt">{t.cfg.hdrTimeout} (3~60)</label>
-            <input id="st-hdrt" type="number" min="3" max="60" bind:value={generalDraft.security.http_header_timeout_secs} required />
-          </div>
-        </div>
-        <div style="display:flex;gap:18px;flex-wrap:wrap;margin-bottom:8px;">
-          <label class="check-row"><input type="checkbox" bind:checked={generalDraft.firewall.auto_manage} /> {t.cfg.lblFwAuto}</label>
-          <label class="check-row"><input type="checkbox" bind:checked={generalDraft.security.kernel_ban_offload} /> {t.cfg.lblKernelBan}</label>
-        </div>
-
-        <!-- Monitor, Terminal & Docker -->
-        <div class="section-label">{t.cfg.groupMonitor}</div>
-        <div class="form-grid">
-          <div class="field">
-            <label for="st-mif">{t.cfg.lblMonIfaces}</label>
-            <input id="st-mif" type="text" list="settings-iface-list" class="mono" bind:value={monIfacesCsv} />
-            {#if ifaceNames.length}
-              <div style="display:flex;gap:5px;flex-wrap:wrap;margin-top:4px;">
-                {#each ifaceNames as ifn (ifn)}
-                  {@const picked = splitCsv(monIfacesCsv).includes(ifn)}
-                  <button type="button" class="chip {picked ? 'active' : ''}" onclick={() => (monIfacesCsv = toggleCsvIface(monIfacesCsv, ifn))}>
-                    {ifn}
-                  </button>
-                {/each}
-              </div>
-            {/if}
-          </div>
-          <div class="field">
-            <label for="st-msi">{t.cfg.monInterval}</label>
-            <input id="st-msi" type="number" min="1" max="60" bind:value={generalDraft.monitor.sample_interval_secs} required />
-          </div>
-          <div class="field">
-            <label for="st-tmp">{t.cfg.lblTempAlert} (40~125)</label>
-            <input id="st-tmp" type="number" min="40" max="125" bind:value={generalDraft.monitor.temp_alert_celsius} required />
-          </div>
-          <div class="field">
-            <label for="st-mem">{t.cfg.lblMemLow} (0 = off)</label>
-            <input id="st-mem" type="number" min="0" max="4096" bind:value={generalDraft.monitor.mem_low_mb} required />
-          </div>
-          <div class="field">
-            <label for="st-macd">{t.cfg.alertCooldown}</label>
-            <input id="st-macd" type="number" min="60" max="86400" bind:value={generalDraft.monitor.alert_cooldown_secs} required />
-          </div>
-          <div class="field">
-            <label for="st-thm">{t.cfg.thermalPath}</label>
-            <input id="st-thm" type="text" class="mono" placeholder="/sys/class/thermal/thermal_zone0/temp" bind:value={generalDraft.monitor.thermal_path} />
-          </div>
-          <div class="field">
-            <label for="st-topp">{t.cfg.topProcs}</label>
-            <input id="st-topp" type="number" min="1" max="50" bind:value={generalDraft.monitor.top_processes} required />
-          </div>
-          <div class="field">
-            <label for="st-psh">{t.cfg.ptyShell}</label>
-            <input id="st-psh" type="text" class="mono" bind:value={generalDraft.web_terminal.shell} />
-          </div>
-          <div class="field">
-            <label for="st-pcwd">{t.cfg.ptyCwd}</label>
-            <input id="st-pcwd" type="text" class="mono" bind:value={generalDraft.web_terminal.default_cwd} />
-          </div>
-          <div class="field">
-            <label for="st-pidle">{t.cfg.ptyIdle} (60~3600)</label>
-            <input id="st-pidle" type="number" min="60" max="3600" bind:value={generalDraft.web_terminal.idle_timeout_secs} required />
-          </div>
-          <div class="field">
-            <label for="st-pmax">{t.cfg.ptyMaxSess}</label>
-            <input id="st-pmax" type="number" min="1" max="4" bind:value={generalDraft.web_terminal.max_sessions} required />
-          </div>
-          <div class="field">
-            <label for="st-dkp">{t.cfg.lblProtectedContainers}</label>
-            <input id="st-dkp" type="text" class="mono" bind:value={protectedContainersCsv} />
-          </div>
-          <div class="field">
-            <label for="st-dktail">{t.cfg.dkTail}</label>
-            <input id="st-dktail" type="number" min="10" max="2000" bind:value={generalDraft.docker.log_tail_default} required />
-          </div>
-        </div>
-        <div style="display:flex;gap:18px;flex-wrap:wrap;">
-          <label class="check-row"><input type="checkbox" bind:checked={generalDraft.web_terminal.require_reauth} /> {t.cfg.lblPtyReauth}</label>
-          <label class="check-row"><input type="checkbox" bind:checked={generalDraft.docker.log_timestamps} /> {t.cfg.dkTs}</label>
-        </div>
+        {/if}
       </form>
     {/if}
   {/if}
 
-  <!-- 2. 认证安全中心：改密 + TOTP + Ed25519 + 本地根证书导出 -->
+  <!-- 2. 认证安全中心：改密 + TOTP + 通行密钥 -->
   {#if subTab === 'security'}
     <div class="bento-grid-2">
-      <!-- 修改管理员密码 + 导出本地 TLS 证书 -->
+      <!-- 修改管理员用户名与口令 -->
       <div class="card">
         <div class="card-header">
           <span class="card-title">{t.cfg.pwTitle}</span>
-          <button type="button" class="btn btn-xs" disabled={secBusy === 'cert'} onclick={downloadAdminCert}>
-            <Icons name="download" size={13} />
-            <span>{secBusy === 'cert' ? '...' : t.cfg.downloadCert}</span>
-          </button>
         </div>
         <form onsubmit={updateAdminCredentials}>
           <div class="field">
@@ -1210,7 +1694,7 @@
       <!-- TOTP 双因素认证 -->
       <div class="card">
         <div class="card-header">
-          <span class="card-title">RFC 6238 TOTP 2FA</span>
+          <span class="card-title">{lang === 'en' ? 'Authenticator App (TOTP)' : '动态口令验证 (TOTP)'}</span>
           <span class="badge {settingsJson.admin.totp_enabled ? 'badge-ok' : 'badge-muted'}">
             {settingsJson.admin.totp_enabled ? t.enabled : t.disabled}
           </span>
@@ -1219,8 +1703,8 @@
         {#if settingsJson.admin.totp_enabled}
           <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;">
             {lang === 'en'
-              ? `Monotonic replay-protected TOTP is active. Remaining recovery codes: ${settingsJson.admin.totp_recovery_hashes?.remaining ?? 0}`
-              : `防回退重放 TOTP 二步验证已开启。当前剩余一次性恢复码：${settingsJson.admin.totp_recovery_hashes?.remaining ?? 0} 个`}
+              ? `Two-factor authentication is active. Remaining recovery codes: ${settingsJson.admin.totp_recovery_hashes?.remaining ?? 0}`
+              : `两步验证已开启。当前剩余一次性恢复码：${settingsJson.admin.totp_recovery_hashes?.remaining ?? 0} 个`}
           </p>
           <div class="btn-group">
             <button
@@ -1228,13 +1712,15 @@
               class="btn btn-sm"
               disabled={Boolean(secBusy)}
               onclick={() =>
-                askConfirm({
-                  title: t.cfg.totpRegen,
-                  message: t.cfg.totpRegenConfirm,
-                  confirmLabel: t.confirmAction,
-                  danger: true,
-                  onConfirm: regenerateRecoveryCodes,
-                })
+                confirmThenRun(
+                  {
+                    title: t.cfg.totpRegen,
+                    message: t.cfg.totpRegenConfirm,
+                    confirmLabel: t.confirmAction,
+                    danger: true,
+                  },
+                  regenerateRecoveryCodes
+                )
               }
             >
               {secBusy === 'totp-regen' ? '...' : t.cfg.totpRegen}
@@ -1244,13 +1730,15 @@
               class="btn btn-sm btn-danger"
               disabled={Boolean(secBusy)}
               onclick={() =>
-                askConfirm({
-                  title: t.cfg.totpDisable,
-                  message: t.cfg.totpDisableConfirm,
-                  confirmLabel: t.cfg.totpDisable,
-                  danger: true,
-                  onConfirm: disableTotp,
-                })
+                confirmThenRun(
+                  {
+                    title: t.cfg.totpDisable,
+                    message: t.cfg.totpDisableConfirm,
+                    confirmLabel: t.cfg.totpDisable,
+                    danger: true,
+                  },
+                  disableTotpWithReauth
+                )
               }
             >
               {secBusy === 'totp-disable' ? '...' : t.cfg.totpDisable}
@@ -1276,19 +1764,29 @@
               {:else}
                 <div class="banner banner-warn" style="margin:0;">{t.cfg.qrTooLong}</div>
               {/if}
-              <div class="subcard mono" style="flex:1;min-width:210px;font-size:12px;word-break:break-all;display:grid;gap:8px;">
-                <div class="row-between">
-                  <div><strong>Secret:</strong> {totpSetupData.secret_base32}</div>
+              <div class="subcard" style="flex:1;min-width:220px;display:grid;gap:12px;">
+                <div class="row-between" style="gap:10px;">
+                  <div style="min-width:0;">
+                    <div style="font-size:11.5px;color:var(--text-muted);font-weight:600;">Base32 Secret</div>
+                    <div class="mono" style="font-size:13px;font-weight:600;margin-top:2px;">
+                      {maskTotpSecret(totpSetupData.secret_base32)}
+                    </div>
+                  </div>
                   <button type="button" class="btn btn-xs" onclick={() => handleCopy(totpSetupData.secret_base32)}>
                     <Icons name="copy" size={12} />
-                    <span>{t.copy}</span>
+                    <span>{lang === 'en' ? 'Copy Secret' : '复制密钥'}</span>
                   </button>
                 </div>
-                <div class="row-between">
-                  <div style="color:var(--text-secondary);font-size:11px;word-break:break-all;">{totpSetupData.otpauth_uri}</div>
+                <div class="row-between" style="gap:10px;padding-top:10px;border-top:1px solid var(--border-subtle);">
+                  <div style="min-width:0;">
+                    <div style="font-size:11.5px;color:var(--text-muted);font-weight:600;">otpauth URI</div>
+                    <div class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                      {maskOtpAuthUri(totpSetupData.otpauth_uri)}
+                    </div>
+                  </div>
                   <button type="button" class="btn btn-xs" onclick={() => handleCopy(totpSetupData.otpauth_uri)}>
                     <Icons name="copy" size={12} />
-                    <span>URI</span>
+                    <span>{lang === 'en' ? 'Copy URI' : '复制 URI'}</span>
                   </button>
                 </div>
               </div>
@@ -1349,80 +1847,157 @@
       </div>
     </div>
 
-    <!-- Ed25519 公钥管理 -->
+    <!-- 通行密钥 Passkey (WebAuthn / FIDO2)：遵循行业标准一键添加即启用，关闭时需二次验证并彻底清空 -->
+    {@const pkList = settingsJson.admin.passkeys || []}
+    {@const passkeyActive = Boolean(settingsJson.admin.passkey_enabled) && pkList.length > 0}
+    {@const pwLoginOn = Boolean(settingsJson.admin.password_login_enabled)}
     <div class="card">
       <div class="card-header">
-        <span class="card-title">OpenSSH Ed25519 Authorized Keys</span>
-        {#if settingsJson.admin.authorized_ed25519_keys?.length > 0}
-          <div style="display:flex;align-items:center;gap:10px;">
-            <span style="font-size:13px;color:var(--text-secondary);">{t.cfg.allowPwLogin}</span>
+        <div>
+          <div class="card-title">
+            <Icons name="passkey" size={16} />
+            <span>{t.cfg.passkeyTitle}</span>
+            <span class="badge {passkeyActive ? 'badge-ok' : 'badge-muted'}">
+              {passkeyActive ? `${t.enabled} · ${pkList.length}/16` : t.disabled}
+            </span>
+          </div>
+          <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">{t.cfg.passkeyDesc}</div>
+        </div>
+        {#if passkeyActive}
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span style="font-size:13px;color:var(--text-secondary);">{t.cfg.allowPwLogin}</span>
+              <button
+                type="button"
+                class="switch"
+                role="switch"
+                aria-checked={pwLoginOn}
+                aria-label={t.cfg.allowPwLogin}
+                disabled={Boolean(secBusy)}
+                onclick={requestTogglePasswordLogin}
+              >
+                <span class="switch-thumb"></span>
+              </button>
+            </div>
             <button
               type="button"
-              class="switch"
-              role="switch"
-              aria-checked={Boolean(settingsJson.admin.password_login_enabled)}
-              aria-label={t.cfg.allowPwLogin}
-              disabled={Boolean(secBusy)}
-              onclick={requestTogglePasswordLogin}
+              class="btn btn-sm btn-danger"
+              disabled={Boolean(secBusy) || !pwLoginOn}
+              title={!pwLoginOn ? t.cfg.passkeyLastAuthHint : ''}
+              onclick={() =>
+                confirmThenRun(
+                  {
+                    title: t.cfg.passkeyDisableConfirmTitle,
+                    message: t.cfg.passkeyDisableConfirmDesc,
+                    confirmLabel: t.cfg.passkeyDisableAllBtn,
+                    danger: true,
+                  },
+                  disableAllPasskeysWithReauth
+                )
+              }
             >
-              <span class="switch-thumb"></span>
+              {secBusy === 'pk-toggle' ? '...' : t.cfg.passkeyDisableAllBtn}
             </button>
           </div>
         {/if}
       </div>
 
-      {#if settingsJson.admin.authorized_ed25519_keys?.length}
-        <div style="display:grid;gap:8px;margin-bottom:14px;">
-          {#each settingsJson.admin.authorized_ed25519_keys as k (k.id)}
-            <div class="subcard row-between">
-              <div style="min-width:0;flex:1;">
-                <div style="font-weight:700;" class="mono">{k.id}</div>
-                <div class="mono" style="font-size:11px;color:var(--text-secondary);word-break:break-all;">{k.pubkey}</div>
+      {#if !passkeyBrowserOk}
+        <div class="banner banner-warn" style="margin-bottom:12px;">{t.cfg.passkeyUnsupported}</div>
+      {:else if passkeyOnRawIp}
+        <div class="banner banner-info" style="margin-bottom:12px;">
+          <div style="display:flex;align-items:flex-start;gap:8px;">
+            <Icons name="info" size={16} />
+            <span>{t.cfg.passkeyIpWarn}</span>
+          </div>
+        </div>
+      {/if}
+
+      {#if passkeyActive && !pwLoginOn}
+        <div class="banner banner-warn" style="margin-bottom:12px;">
+          <div style="display:flex;align-items:flex-start;gap:8px;">
+            <Icons name="alert" size={15} />
+            <span>{t.cfg.passkeyLastAuthHint}</span>
+          </div>
+        </div>
+      {/if}
+
+      {#if pkList.length}
+        <div class="settings-list" style="margin-bottom:14px;">
+          {#each pkList as pk (pk.id)}
+            {@const isLastProtectedKey = !pwLoginOn && pkList.length <= 1}
+            <div class="settings-row switch-row" style="padding:12px 16px;">
+              <div style="display:flex;align-items:center;gap:12px;min-width:0;">
+                <span class="icon-tile sm"><Icons name="passkey" size={15} /></span>
+                <div style="min-width:0;">
+                  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                    <span style="font-weight:600;font-size:13.5px;">{pk.name}</span>
+                    <span class="badge badge-info mono" style="font-size:11px;">{pk.rp_id}</span>
+                    <span class="badge badge-muted mono" style="font-size:11px;">{pk.alg === -8 ? 'Ed25519' : 'ES256'}</span>
+                  </div>
+                  <div class="mono" style="font-size:11.5px;color:var(--text-muted);margin-top:3px;">
+                    {lang === 'en' ? 'Added' : '绑定时间'}: {formatUnixTime(pk.created_at)}
+                    {#if pk.last_used_at}
+                      · {lang === 'en' ? 'Last used' : '最近使用'}: {formatUnixTime(pk.last_used_at)}
+                    {/if}
+                  </div>
+                </div>
               </div>
               <button
                 type="button"
                 class="btn btn-xs btn-danger"
-                disabled={Boolean(secBusy)}
+                disabled={Boolean(secBusy) || isLastProtectedKey}
+                title={isLastProtectedKey ? t.cfg.passkeyLastAuthHint : ''}
                 onclick={() =>
-                  askConfirm({
-                    title: t.common.confirmDeleteTitle,
-                    message: k.id,
-                    confirmLabel: t.delete,
-                    danger: true,
-                    onConfirm: () => deleteEd25519Key(k.id),
-                  })
+                  confirmThenRun(
+                    {
+                      title: t.common.confirmDeleteTitle,
+                      message: `${pk.name} (${pk.rp_id}) — ${t.cfg.passkeyDeleteConfirmDesc}`,
+                      confirmLabel: t.delete,
+                      danger: true,
+                    },
+                    () => deletePasskeyWithReauth(pk.id, pk.name)
+                  )
                 }
               >
-                {secBusy === `ed-del:${k.id}` ? '...' : t.delete}
+                {secBusy === `pk-del:${pk.id}` ? '...' : t.delete}
               </button>
             </div>
           {/each}
         </div>
+      {:else}
+        <div style="font-size:12.5px;color:var(--text-secondary);margin-bottom:12px;">{t.cfg.passkeyEmpty}</div>
       {/if}
 
-      <form onsubmit={addEd25519Key} class="ed-key-grid">
-        <div class="field" style="margin-bottom:0;">
-          <label for="ed-id">{t.cfg.lblKeyId}</label>
-          <input id="ed-id" type="text" class="mono" placeholder="macbook" bind:value={newKeyId} required />
-        </div>
-        <div class="field" style="margin-bottom:0;">
-          <label for="ed-pub">{t.cfg.lblKeyPub} (ssh-ed25519 AAAAC3...)</label>
-          <input id="ed-pub" type="text" class="mono" placeholder="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5..." bind:value={newKeyPub} required />
-        </div>
-        <button type="submit" class="btn btn-primary" disabled={Boolean(secBusy)}>
-          {secBusy === 'ed-add' ? '...' : t.cfg.addKey}
+      <form onsubmit={registerPasskey} style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+        <input
+          type="text"
+          style="flex:1;min-width:220px;"
+          maxlength="64"
+          placeholder={t.cfg.passkeyNamePh}
+          aria-label={t.cfg.passkeyNamePh}
+          disabled={Boolean(secBusy) || pkList.length >= 16}
+          bind:value={newPasskeyName}
+        />
+        <button
+          type="submit"
+          class="btn btn-primary"
+          disabled={Boolean(secBusy) || !passkeyBrowserOk || passkeyOnRawIp || pkList.length >= 16}
+        >
+          <Icons name="passkey" size={15} />
+          <span>{secBusy === 'pk-add' ? '...' : pkList.length ? t.cfg.passkeyAddBtn : t.cfg.passkeyAddFirstBtn}</span>
         </button>
       </form>
     </div>
   {/if}
 
-  <!-- 3. 通知渠道中心 -->
+  <!-- 3. 外部多渠道通知设置（Arcane 分组列表风格） -->
   {#if subTab === 'notifications'}
-    <div class="card">
-      <div class="card-header">
+    <section class="settings-section">
+      <div class="settings-section-head">
         <div>
-          <div class="card-title">{t.cfg.notifTitle}</div>
-          <div style="font-size:12px;color:var(--text-secondary);">{t.cfg.notifSub}</div>
+          <h3 class="settings-section-title">{t.cfg.notifTitle}</h3>
+          <p class="settings-section-desc">{t.cfg.notifSub}</p>
         </div>
         <button type="button" class="btn btn-primary btn-sm" onclick={() => openNotifDrawer(-1)}>
           <Icons name="plus" size={14} />
@@ -1433,25 +2008,29 @@
       {#if !settingsJson.notifications?.length}
         <div class="empty-state">{t.common.empty}</div>
       {:else}
-        <div style="display:grid;gap:10px;">
+        <div class="settings-list">
           {#each settingsJson.notifications as n, idx (n.name)}
-            <div class="subcard row-between">
-              <div style="min-width:0;flex:1;">
-                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                  <span class="status-dot {n.enabled ? 'ok' : 'muted'}"></span>
-                  <span style="font-weight:700;">{n.name}</span>
-                  <span class="badge badge-info">{n.provider}</span>
-                  <span class="badge badge-muted">&gt;= {n.min_severity}</span>
-                  {#if !n.enabled}<span class="badge badge-warn">{t.disabled}</span>{/if}
-                </div>
-                <div style="font-size:12px;color:var(--text-secondary);margin-top:4px;">
-                  {n.events?.length ? n.events.map((ev) => t.events?.[ev] || ev).join(' · ') : t.cfg.allEvents}
+            <div class="settings-row switch-row" style="padding:14px 18px;">
+              <div style="display:flex;align-items:center;gap:12px;min-width:0;">
+                <span class="icon-tile sm {n.enabled ? '' : 'muted'}">
+                  <Icons name="bell" size={15} />
+                </span>
+                <div style="min-width:0;">
+                  <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                    <span style="font-weight:600;font-size:14px;">{n.name}</span>
+                    <span class="badge badge-info">{n.provider}</span>
+                    <span class="badge badge-muted">&gt;= {n.min_severity}</span>
+                    {#if !n.enabled}<span class="badge badge-warn">{t.disabled}</span>{/if}
+                  </div>
+                  <div style="font-size:12px;color:var(--text-secondary);margin-top:3px;">
+                    {n.events?.length ? n.events.map((ev) => t.events?.[ev] || ev).join(' · ') : t.cfg.allEvents}
+                  </div>
                 </div>
               </div>
               <div class="btn-group">
                 <button
                   type="button"
-                  class="switch"
+                  class="switch switch-xs"
                   role="switch"
                   aria-checked={Boolean(n.enabled)}
                   aria-label={n.name}
@@ -1470,7 +2049,7 @@
           {/each}
         </div>
       {/if}
-    </div>
+    </section>
   {/if}
 
   <!-- 4. 跨机加密备份与脱敏导出 -->
@@ -1498,19 +2077,25 @@
               <Icons name={showBkPass ? 'eye_off' : 'eye'} size={13} />
             </button>
           </div>
-          <input id="bk-pw" type={showBkPass ? 'text' : 'password'} minlength="8" autocomplete="new-password" bind:value={backupPass} required />
+          <input id="bk-pw" type={showBkPass ? 'text' : 'password'} minlength="8" maxlength="128" autocomplete="new-password" bind:value={backupPass} required />
         </div>
         <div class="field">
           <label for="bk-pw2">{t.cfg.bkExportPwConfirm}</label>
-          <input id="bk-pw2" type={showBkPass ? 'text' : 'password'} minlength="8" autocomplete="new-password" bind:value={backupPassConfirm} required />
+          <input id="bk-pw2" type={showBkPass ? 'text' : 'password'} minlength="8" maxlength="128" autocomplete="new-password" bind:value={backupPassConfirm} required />
           {#if backupPassConfirm && backupPass !== backupPassConfirm}
             <div style="font-size:12px;color:var(--danger);margin-top:4px;">{t.cfg.bkPwMismatch}</div>
           {/if}
         </div>
+        <div class="subcard" style="margin-bottom:14px;font-size:12px;display:grid;gap:4px;">
+          <div style="color:{bkChecks.lenOk ? 'var(--accent)' : 'var(--text-secondary)'}">{bkChecks.lenOk ? '✓' : '○'} {t.ruleLen}</div>
+          <div style="color:{bkChecks.hasAlpha ? 'var(--accent)' : 'var(--text-secondary)'}">{bkChecks.hasAlpha ? '✓' : '○'} {t.ruleAlpha}</div>
+          <div style="color:{bkChecks.hasDigitOrPunct ? 'var(--accent)' : 'var(--text-secondary)'}">{bkChecks.hasDigitOrPunct ? '✓' : '○'} {t.ruleDigit}</div>
+          <div style="color:{bkChecks.matchConfirm ? 'var(--accent)' : 'var(--text-secondary)'}">{bkChecks.matchConfirm ? '✓' : '○'} {t.ruleMatch}</div>
+        </div>
         <button
           type="submit"
           class="btn btn-primary btn-sm"
-          disabled={Boolean(backupBusy) || !backupPass || backupPass !== backupPassConfirm}
+          disabled={Boolean(backupBusy) || !bkPassValid}
         >
           <Icons name="download" size={14} />
           <span>{backupBusy === 'export' ? '...' : t.cfg.bkExportBtn}</span>
@@ -1571,18 +2156,32 @@
       {/if}
     </div>
   {/if}
+
+  <!-- 5. 系统更新管理（GitHub Release 自动检查提醒 + 安全沙箱手动压缩包更新） -->
+  {#if subTab === 'update'}
+    <SystemUpdatePanel
+      {t}
+      {lang}
+      {settingsJson}
+      {onSaveSettings}
+      {requestReauth}
+      {apiFetch}
+      {showToast}
+    />
+  {/if}
 {/if}
 
-<!-- 通知渠道抽屉 -->
-{#if notifDrawerOpen && notifDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) notifDrawerOpen = false; }}>
-    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.cfg.tabNotifications}>
-    <form style="display:contents;" onsubmit={saveNotification}>
-      <div class="drawer-header">
-        <div class="card-title">{notifEditIdx >= 0 ? t.edit : t.add} · {t.cfg.tabNotifications}</div>
-        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => (notifDrawerOpen = false)}>{t.cancel}</button>
-      </div>
-      <div class="drawer-body">
+<!-- 通知渠道编辑弹窗 -->
+<EditorDialog
+  open={notifDrawerOpen && Boolean(notifDraft)}
+  title={`${notifEditIdx >= 0 ? t.edit : t.add} · ${t.cfg.tabNotifications}`}
+  size="md"
+  busy={saving}
+  {t}
+  {askConfirm}
+  onSubmit={saveNotification}
+  onClose={() => (notifDrawerOpen = false)}
+>
         <div class="form-grid">
           <div class="field">
             <label for="nf-name">{t.cfg.lblNotifName}</label>
@@ -1590,22 +2189,56 @@
           </div>
           <div class="field">
             <label for="nf-prov">{t.cfg.lblNotifProvider}</label>
-            <select id="nf-prov" bind:value={notifDraft.provider} onchange={onNotifProviderChange}>
-              {#each NOTIF_PROVIDERS as p (p)}
-                <option value={p}>{p}</option>
-              {/each}
-            </select>
+            <Select
+              id="nf-prov"
+              bind:value={notifDraft.provider}
+              options={
+                lang === 'en'
+                  ? [
+                      { value: 'webhook', label: 'Custom Webhook' },
+                      { value: 'bark', label: 'Bark (iOS Push)' },
+                      { value: 'telegram', label: 'Telegram Bot' },
+                      { value: 'wecom', label: 'WeCom Bot' },
+                      { value: 'feishu', label: 'Feishu / Lark Bot' },
+                      { value: 'dingtalk', label: 'DingTalk Bot' },
+                      { value: 'ntfy', label: 'Ntfy' },
+                      { value: 'gotify', label: 'Gotify' },
+                    ]
+                  : [
+                      { value: 'webhook', label: '自定义 Webhook' },
+                      { value: 'bark', label: 'Bark (iOS 推送)' },
+                      { value: 'telegram', label: 'Telegram 机器人' },
+                      { value: 'wecom', label: '企业微信机器人' },
+                      { value: 'feishu', label: '飞书机器人' },
+                      { value: 'dingtalk', label: '钉钉机器人' },
+                      { value: 'ntfy', label: 'Ntfy' },
+                      { value: 'gotify', label: 'Gotify' },
+                    ]
+              }
+              onchange={onNotifProviderChange}
+            />
           </div>
           <div class="field">
             <label for="nf-sev">{t.cfg.lblMinSeverity}</label>
-            <select id="nf-sev" bind:value={notifDraft.min_severity}>
-              <option value="debug">debug</option>
-              <option value="info">info</option>
-              <option value="warn">warn</option>
-              <option value="warning">warning</option>
-              <option value="error">error</option>
-              <option value="critical">critical</option>
-            </select>
+            <Select
+              id="nf-sev"
+              bind:value={notifDraft.min_severity}
+              options={
+                lang === 'en'
+                  ? [
+                      { value: 'info', label: 'Info & Above' },
+                      { value: 'warning', label: 'Warning & Above' },
+                      { value: 'error', label: 'Error & Above' },
+                      { value: 'critical', label: 'Critical Only' },
+                    ]
+                  : [
+                      { value: 'info', label: '普通通知及以上' },
+                      { value: 'warning', label: '警告及以上' },
+                      { value: 'error', label: '错误及以上' },
+                      { value: 'critical', label: '仅严重告警' },
+                    ]
+              }
+            />
           </div>
         </div>
 
@@ -1784,12 +2417,7 @@
           <div style="padding-top:10px;">
             <div class="field">
               <label for="nf-meth">{t.cfg.notifMethod}</label>
-              <select id="nf-meth" bind:value={notifDraft.method}>
-                <option value="POST">POST</option>
-                <option value="PUT">PUT</option>
-                <option value="PATCH">PATCH</option>
-                <option value="GET">GET</option>
-              </select>
+              <Select id="nf-meth" mono bind:value={notifDraft.method} options={['POST', 'PUT', 'PATCH', 'GET']} />
             </div>
             <HeaderRowsEditor label={t.cfg.notifHeaders} bind:rows={notifHeaderRows} secret={true} {t} />
             <SecretField
@@ -1803,12 +2431,4 @@
             />
           </div>
         </details>
-      </div>
-      <div class="drawer-footer">
-        <button type="button" class="btn" disabled={saving} onclick={() => (notifDrawerOpen = false)}>{t.cancel}</button>
-        <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
-      </div>
-    </form>
-    </div>
-  </div>
-{/if}
+</EditorDialog>

@@ -1,12 +1,15 @@
 <script>
   import Icons from './Icons.svelte';
   import HeaderRowsEditor from './HeaderRowsEditor.svelte';
+  import EditorDialog from './EditorDialog.svelte';
+  import Select from './Select.svelte';
+  import ComboInput from './ComboInput.svelte';
+  import FacetFilter from './FacetFilter.svelte';
   import {
     splitCsv,
     joinCsv,
     kvObjectToRows,
     rowsToKvObject,
-    copyText,
     deepClone,
     formatUnixTime,
     domainMatchesCert,
@@ -56,18 +59,23 @@
   let ruleRespRows = $state([]);
   let ruleRespRemCsv = $state('');
 
-  // 反代门禁 WebSocket 一次性票据弹窗状态
-  let wsTicketOpen = $state(false);
-  let wsTicketListener = $state('');
-  let wsTicketPort = $state(8443);
-  let wsTicketHost = $state('');
-  let wsTicketPath = $state('/');
-  let wsTicketBusy = $state(false);
-  let wsTicketErr = $state('');
-  let wsTicketToken = $state('');
-  let wsTicketUrl = $state('');
-  let wsTicketExpiresAt = $state(0);
-  let wsTicketRemain = $state(0);
+  // 反向代理独立门禁账号管理弹窗状态
+  let gateUsers = $state([]);
+  let gateUsersLoaded = $state(false);
+  let gateUsersOpen = $state(false);
+  let gateUsersLoading = $state(false);
+  let gateFormMode = $state(''); // '' | 'create' | 'edit'
+  let gateDraft = $state({
+    username: '',
+    password: '',
+    enabled: true,
+    session_ttl_secs: 43200,
+    note: '',
+  });
+  let gateSaving = $state(false);
+  let gateBusyUser = $state('');
+  let gateErr = $state('');
+  let gateShowPw = $state(false);
 
   // Port Forward Drawer 状态
   let pfDrawerOpen = $state(false);
@@ -76,13 +84,44 @@
   let pfTargetsCsv = $state('');
   let pfAllowedCsv = $state('');
 
-  let ifaceNames = $derived((networkInfo?.interfaces || []).map((i) => i.iface));
+  let ifaceOptions = $derived(
+    (networkInfo?.interfaces || []).map((i) => {
+      const ips = [...(i.ipv4 || []), ...(i.ipv6 || [])];
+      return { value: i.iface, label: i.iface, sub: ips.slice(0, 2).join(', ') };
+    })
+  );
   let stunRuleNames = $derived((settingsJson?.stun || []).map((s) => s.name).filter(Boolean));
   let adminPorts = $derived(
     (settingsJson?.admin?.listen_lan || [])
       .map((a) => Number(String(a).split(':').pop()))
       .filter((n) => n > 0)
   );
+
+  let effectiveGateUsers = $derived(
+    gateUsersLoaded
+      ? gateUsers
+      : (settingsJson?.proxy_auth_users || []).map((u) => ({
+          ...u,
+          active_sessions: 0,
+          bound_rules: (settingsJson?.reverse_proxy || [])
+            .flatMap((l) => l.rules || [])
+            .filter((r) => r.auth_gate && (r.auth_gate_users || []).includes(u.username)).length,
+        }))
+  );
+  let gateUsersCount = $derived(effectiveGateUsers.length);
+  let gateTtlOptions = $derived.by(() => {
+    const base = [
+      { value: 3600, label: lang === 'en' ? '1 hour' : '1 小时' },
+      { value: 43200, label: lang === 'en' ? '12 hours (Recommended)' : '12 小时（推荐）' },
+      { value: 86400, label: lang === 'en' ? '24 hours' : '24 小时' },
+      { value: 604800, label: lang === 'en' ? '7 days' : '7 天' },
+    ];
+    const cur = Number(gateDraft?.session_ttl_secs || 43200);
+    if (cur > 0 && !base.some((o) => o.value === cur)) {
+      base.unshift({ value: cur, label: lang === 'en' ? `Custom (${cur}s)` : `自定义 (${cur} 秒)` });
+    }
+    return base;
+  });
 
   // 切换 Tab 模式时重置搜索、筛选和抽屉状态，避免跨视图残留
   $effect(() => {
@@ -92,8 +131,16 @@
     rpDrawerOpen = false;
     ruleDrawerOpen = false;
     pfDrawerOpen = false;
-    wsTicketOpen = false;
+    gateUsersOpen = false;
+    gateFormMode = '';
     customLeaseName = '';
+  });
+
+  // 进入反向代理页面时加载独立门禁账号实时状态（活跃会话数等）
+  $effect(() => {
+    if (mode === 'reverse_proxy' && settingsJson) {
+      loadGateUsers(true);
+    }
   });
 
   // 定时刷新当前时间戳用于端口转发租约倒计时
@@ -101,20 +148,6 @@
     const timer = setInterval(() => {
       nowSec = Math.floor(Date.now() / 1000);
     }, 15_000);
-    return () => clearInterval(timer);
-  });
-
-  // WS 票据 30 秒倒计时
-  $effect(() => {
-    if (!wsTicketToken || !wsTicketExpiresAt) {
-      wsTicketRemain = 0;
-      return;
-    }
-    const tick = () => {
-      wsTicketRemain = Math.max(0, Math.ceil((wsTicketExpiresAt - Date.now()) / 1000));
-    };
-    tick();
-    const timer = setInterval(tick, 1000);
     return () => clearInterval(timer);
   });
 
@@ -157,11 +190,11 @@
   function defaultProxyRule(preset = 'nas') {
     const base = {
       enabled: true,
-      host: 'nas.example.com',
+      host: '',
       path_prefix: '/',
       strip_prefix: false,
       mode: 'proxy',
-      upstream: 'http://192.168.1.10:5000',
+      upstream: '',
       websocket: true,
       upstream_tls_mode: 'strict',
       upstream_cert_sha256: '',
@@ -173,6 +206,7 @@
       response_headers_set: {},
       response_headers_remove: [],
       auth_gate: false,
+      auth_gate_users: [],
       allowed_cidrs: [],
       denied_cidrs: [],
       max_body_mb: 0,
@@ -184,21 +218,16 @@
       static_body: '',
     };
     if (preset === 'pve_selfsigned') {
-      base.host = 'pve.example.com';
-      base.upstream = 'https://192.168.1.2:8006';
       base.upstream_tls_mode = 'insecure_skip_verify';
-      base.upstream_host_header = '192.168.1.2:8006';
     } else if (preset === 'stun_redirect') {
-      base.host = 'go.example.com';
       base.mode = 'redirect';
       base.redirect_url = 'https://{{stun.home_nat.public_addr}}{{path}}';
       base.redirect_code = 302;
     } else if (preset === 'static_page') {
-      base.host = 'status.example.com';
       base.mode = 'static';
       base.static_status = 200;
       base.static_content_type = 'text/plain; charset=utf-8';
-      base.static_body = 'Vane Gateway Online';
+      base.static_body = '';
     }
     return base;
   }
@@ -276,6 +305,7 @@
       // 克隆规则不复用旧规则的 Vault 密文占位符，避免新索引 AAD 不匹配
       r.request_headers_set = {};
     }
+    if (!Array.isArray(r.auth_gate_users)) r.auth_gate_users = [];
     ruleDraft = r;
     ruleAllowedCsv = joinCsv(r.allowed_cidrs);
     ruleDeniedCsv = joinCsv(r.denied_cidrs);
@@ -284,6 +314,16 @@
     ruleRespRows = kvObjectToRows(r.response_headers_set);
     ruleRespRemCsv = joinCsv(r.response_headers_remove);
     ruleDrawerOpen = true;
+    loadGateUsers(true);
+  }
+
+  function toggleRuleGateUser(username) {
+    if (!ruleDraft) return;
+    const list = Array.isArray(ruleDraft.auth_gate_users) ? [...ruleDraft.auth_gate_users] : [];
+    const idx = list.indexOf(username);
+    if (idx >= 0) list.splice(idx, 1);
+    else list.push(username);
+    ruleDraft.auth_gate_users = list;
   }
 
   async function saveRule(e) {
@@ -348,53 +388,185 @@
     });
   }
 
-  function openWsTicketModal(listener, rule) {
-    wsTicketListener = listener.name;
-    wsTicketPort = listener.listen_port;
-    wsTicketHost = rule.host.startsWith('*.') ? `app.${rule.host.slice(2)}` : rule.host;
-    wsTicketPath = rule.path_prefix && rule.path_prefix.startsWith('/') ? rule.path_prefix : '/';
-    wsTicketToken = '';
-    wsTicketUrl = '';
-    wsTicketErr = '';
-    wsTicketExpiresAt = 0;
-    wsTicketOpen = true;
-  }
-
-  async function issueWsTicket(e) {
-    e.preventDefault();
-    if (wsTicketBusy) return;
-    wsTicketErr = '';
-    const host = wsTicketHost.trim();
-    const path = wsTicketPath.trim() || '/';
-    if (!host || host.includes('*') || host.includes('/')) {
-      wsTicketErr = lang === 'en' ? 'Enter a concrete target hostname (no wildcard)' : '请输入具体目标主机名（不可包含通配符 *）';
-      return;
-    }
-    if (!path.startsWith('/') || path.startsWith('//') || path.includes('#') || path.includes('vane_ticket=')) {
-      wsTicketErr = lang === 'en' ? 'Path must start with / and exclude # or vane_ticket=' : '路径必须以 / 开头且不可包含 # 或 vane_ticket=';
-      return;
-    }
-    const authority = `${host.includes(':') && !host.startsWith('[') ? `[${host}]` : host}:${wsTicketPort}`;
-    wsTicketBusy = true;
+  async function loadGateUsers(silent = false) {
+    if (!silent) gateUsersLoading = true;
     try {
-      const r = await apiFetch('/api/proxy/ticket', {
-        method: 'POST',
-        body: JSON.stringify({ listener: wsTicketListener, authority, path }),
-      });
-      wsTicketToken = r.ticket;
-      const sep = path.includes('?') ? '&' : '?';
-      wsTicketUrl = `wss://${authority}${path}${sep}vane_ticket=${encodeURIComponent(r.ticket)}`;
-      wsTicketExpiresAt = Date.now() + Number(r.expires_in || 30) * 1000;
+      const r = await apiFetch('/api/proxy/auth-users');
+      gateUsers = Array.isArray(r?.users) ? r.users : [];
+      gateUsersLoaded = true;
     } catch (err) {
-      wsTicketErr = err.message;
+      if (!silent) showToast(err.message, 'error');
     } finally {
-      wsTicketBusy = false;
+      gateUsersLoading = false;
     }
   }
 
-  async function copyOrToast(text) {
-    if (await copyText(text)) showToast(t.copied, 'success');
-    else showToast(t.copyFailed, 'error');
+  function openGateUsersModal() {
+    gateFormMode = '';
+    gateErr = '';
+    gateUsersOpen = true;
+    loadGateUsers(false);
+  }
+
+  function startCreateGateUser() {
+    gateFormMode = 'create';
+    gateErr = '';
+    gateShowPw = false;
+    gateDraft = {
+      username: '',
+      password: '',
+      enabled: true,
+      session_ttl_secs: 43200,
+      note: '',
+    };
+  }
+
+  function startEditGateUser(user) {
+    gateFormMode = 'edit';
+    gateErr = '';
+    gateShowPw = false;
+    gateDraft = {
+      username: user.username,
+      password: '',
+      enabled: Boolean(user.enabled),
+      session_ttl_secs: Number(user.session_ttl_secs || 43200),
+      note: user.note || '',
+    };
+  }
+
+  function formatGateTtl(secs) {
+    const s = Number(secs || 0);
+    if (s >= 86400 && s % 86400 === 0) return lang === 'en' ? `${s / 86400}d` : `${s / 86400} 天`;
+    if (s >= 3600 && s % 3600 === 0) return lang === 'en' ? `${s / 3600}h` : `${s / 3600} 小时`;
+    if (s >= 60 && s % 60 === 0) return lang === 'en' ? `${s / 60}m` : `${s / 60} 分钟`;
+    return `${s}s`;
+  }
+
+  async function submitGateUser(e) {
+    e.preventDefault();
+    if (gateSaving) return;
+    gateErr = '';
+    const username = String(gateDraft.username || '').trim();
+    if (!username) {
+      gateErr = lang === 'en' ? 'Username is required' : '请输入访问账号名称';
+      return;
+    }
+    if (gateFormMode === 'create' && !gateDraft.password) {
+      gateErr = lang === 'en' ? 'Password is required' : '请设置访问密码';
+      return;
+    }
+    gateSaving = true;
+    try {
+      let r;
+      if (gateFormMode === 'create') {
+        r = await apiFetch('/api/proxy/auth-users', {
+          method: 'POST',
+          body: JSON.stringify({
+            username,
+            password: gateDraft.password,
+            enabled: Boolean(gateDraft.enabled),
+            session_ttl_secs: Number(gateDraft.session_ttl_secs || 43200),
+            note: String(gateDraft.note || '').trim(),
+          }),
+        });
+        showToast(t.rp.gateCreatedToast, 'success');
+      } else {
+        const payload = {
+          enabled: Boolean(gateDraft.enabled),
+          session_ttl_secs: Number(gateDraft.session_ttl_secs || 43200),
+          note: String(gateDraft.note || '').trim(),
+        };
+        if (gateDraft.password) payload.password = gateDraft.password;
+        r = await apiFetch(`/api/proxy/auth-users/${encodeURIComponent(username)}`, {
+          method: 'PUT',
+          body: JSON.stringify(payload),
+        });
+        showToast(t.rp.gateUpdatedToast, 'success');
+      }
+      if (Array.isArray(r?.users)) {
+        gateUsers = r.users;
+        gateUsersLoaded = true;
+      }
+      gateFormMode = '';
+      await onRefresh();
+    } catch (err) {
+      gateErr = err.message;
+    } finally {
+      gateSaving = false;
+    }
+  }
+
+  async function toggleGateUserEnabled(user) {
+    if (gateBusyUser) return;
+    gateBusyUser = user.username;
+    try {
+      const r = await apiFetch(`/api/proxy/auth-users/${encodeURIComponent(user.username)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ enabled: !user.enabled }),
+      });
+      if (Array.isArray(r?.users)) {
+        gateUsers = r.users;
+        gateUsersLoaded = true;
+      }
+      showToast(t.rp.gateUpdatedToast, 'success');
+      await onRefresh();
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      gateBusyUser = '';
+    }
+  }
+
+  async function revokeGateUserSessions(user) {
+    if (gateBusyUser) return;
+    gateBusyUser = user.username;
+    try {
+      const r = await apiFetch(`/api/proxy/auth-users/${encodeURIComponent(user.username)}/revoke`, {
+        method: 'POST',
+      });
+      if (Array.isArray(r?.users)) {
+        gateUsers = r.users;
+        gateUsersLoaded = true;
+      }
+      showToast(t.rp.gateRevokedToast, 'success');
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      gateBusyUser = '';
+    }
+  }
+
+  function deleteGateUser(user) {
+    askConfirm({
+      title: t.common.confirmDeleteTitle,
+      message: `${user.username} — ${t.rp.gateDeleteWarn}`,
+      confirmLabel: t.delete,
+      danger: true,
+      onConfirm: async () => {
+        gateBusyUser = user.username;
+        try {
+          const r = await apiFetch(`/api/proxy/auth-users/${encodeURIComponent(user.username)}`, {
+            method: 'DELETE',
+          });
+          if (Array.isArray(r?.users)) {
+            gateUsers = r.users;
+            gateUsersLoaded = true;
+          }
+          if (ruleDraft && Array.isArray(ruleDraft.auth_gate_users)) {
+            ruleDraft.auth_gate_users = ruleDraft.auth_gate_users.filter((u) => u !== user.username);
+          }
+          if (gateFormMode === 'edit' && gateDraft.username === user.username) {
+            gateFormMode = '';
+          }
+          showToast(t.rp.gateDeletedToast, 'success');
+          await onRefresh();
+        } catch (err) {
+          showToast(err.message, 'error');
+        } finally {
+          gateBusyUser = '';
+        }
+      },
+    });
   }
 
   // ---------------- Port Forward ----------------
@@ -408,8 +580,8 @@
       listen_port: 18080,
       bind_interface: '',
       source_ip: '',
-      target: '192.168.1.10:8080',
-      targets: ['192.168.1.10:8080'],
+      target: '',
+      targets: [],
       load_balance: 'failover',
       send_proxy_protocol: 'none',
       open_wan_firewall: true,
@@ -426,11 +598,9 @@
       base.engine = 'kernel_dnat';
       base.listen_port = 51413;
       base.proto = 'tcp_udp';
-      base.targets = ['192.168.1.10:51413'];
     } else if (preset === 'temp_ssh') {
       base.name = 'temp_nas_ssh';
       base.listen_port = 22222;
-      base.targets = ['192.168.1.10:22'];
       base.allowed_time_window = '08:00-23:30';
     }
     return base;
@@ -571,73 +741,84 @@
   );
 </script>
 
-<svelte:window
-  onkeydown={(e) => {
-    if (e.key === 'Escape' && !e.defaultPrevented && !saving) {
-      if (wsTicketOpen) wsTicketOpen = false;
-      else if (ruleDrawerOpen) ruleDrawerOpen = false;
-      else if (rpDrawerOpen) rpDrawerOpen = false;
-      else if (pfDrawerOpen) pfDrawerOpen = false;
-    }
-  }}
-/>
-
-<datalist id="net-iface-list">
-  {#each ifaceNames as name}
-    <option value={name}></option>
-  {/each}
-</datalist>
-
 {#if settingsJson && mode === 'reverse_proxy'}
-  <div class="card" style="margin-bottom:16px;">
-    <div class="card-header">
-      <div>
-        <div class="card-title">{t.nav.reverse_proxy}</div>
-        <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">{t.rp.subtitle}</div>
-      </div>
+  {@const rpTotal = settingsJson.reverse_proxy?.length || 0}
+  {@const rpOn = (settingsJson.reverse_proxy || []).filter((x) => x.enabled).length}
+  <div class="page-section-bar">
+    <div>
+      <div class="page-section-desc">{t.rp.subtitle}</div>
+      {#if rpTotal > 0}
+        <div class="stat-inline-strip num">
+          <span class="stat-inline-item"><span class="status-dot" style="background:var(--info);"></span><span class="stat-inline-num">{rpTotal}</span><span>{t.all}</span></span>
+          <span class="stat-inline-item"><span class="status-dot ok"></span><span class="stat-inline-num">{rpOn}</span><span>{t.enabled}</span></span>
+          <span class="stat-inline-item"><span class="status-dot muted"></span><span class="stat-inline-num">{rpTotal - rpOn}</span><span>{t.disabled}</span></span>
+        </div>
+      {/if}
+    </div>
+    <div class="btn-group">
+      <button type="button" class="btn btn-sm" onclick={openGateUsersModal}>
+        <Icons name="user" size={14} />
+        <span>{t.rp.gateUsersBtn}</span>
+        {#if gateUsersCount > 0}
+          <span class="badge badge-muted num">{gateUsersCount}</span>
+        {/if}
+      </button>
       <button type="button" class="btn btn-primary btn-sm" onclick={() => openListenerDrawer(-1)}>
         <Icons name="plus" size={14} />
         <span>{t.rp.newListener}</span>
       </button>
     </div>
+  </div>
 
-    {#if settingsJson.reverse_proxy?.length}
-      <div class="toolbar">
+  {#if rpTotal > 0}
+    <div class="toolbar">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:1;min-width:0;">
         <div class="search-wrap">
           <span class="search-icon"><Icons name="search" size={15} /></span>
           <input type="text" placeholder={t.search} bind:value={searchQuery} />
         </div>
-        <div class="btn-group">
-          <button type="button" class="chip {filterStatus === 'all' ? 'active' : ''}" onclick={() => filterStatus = 'all'}>{t.all}</button>
-          <button type="button" class="chip {filterStatus === 'enabled' ? 'active' : ''}" onclick={() => filterStatus = 'enabled'}>{t.enabled}</button>
-          <button type="button" class="chip {filterStatus === 'disabled' ? 'active' : ''}" onclick={() => filterStatus = 'disabled'}>{t.disabled}</button>
-        </div>
+        <FacetFilter
+          label={lang === 'en' ? 'State' : '状态'}
+          bind:value={filterStatus}
+          options={[
+            { value: 'all', label: t.all, count: rpTotal },
+            { value: 'enabled', label: t.enabled, count: rpOn, tone: 'ok' },
+            { value: 'disabled', label: t.disabled, count: rpTotal - rpOn, tone: 'muted' },
+          ]}
+        />
       </div>
-    {/if}
+      <span class="mono" style="font-size:12px;color:var(--text-muted);">{filteredListeners.length} / {rpTotal}</span>
+    </div>
+  {/if}
 
-    {#if !settingsJson.reverse_proxy?.length}
-      <div class="empty-state">{t.common.empty}</div>
-    {:else if !filteredListeners.length}
-      <div class="empty-state">{t.common.noMatches}</div>
-    {:else}
-      <div style="display:grid;gap:14px;">
-        {#each filteredListeners as { l: listener, idx: lIdx }}
-          {@const rt = listenerRuntime(listener.name)}
-          {@const sm = statusMeta(rt, listener.enabled)}
-          <div class="subcard">
-            <div class="row-between" style="margin-bottom:10px;">
-              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                <span class="status-dot {sm.dot}"></span>
-                <span style="font-weight:700;font-size:15px;">{listener.name}</span>
-                <span class="badge badge-info mono">:{listener.listen_port} ({listener.stack})</span>
-                <span class="badge {sm.cls}">{sm.text}{#if rt && rt.active_conns > 0} · {rt.active_conns}c{/if}</span>
-                <span class="badge {listener.strict_sni ? 'badge-ok' : 'badge-warn'}">
-                  {listener.strict_sni ? 'Strict SNI' : 'Fallback Cert'}
-                </span>
-                {#if listener.open_wan_firewall}
-                  <span class="badge badge-warn">WAN Open</span>
-                {/if}
-              </div>
+  {#if !rpTotal}
+    <div class="empty-state">{t.common.empty}</div>
+  {:else if !filteredListeners.length}
+    <div class="empty-state">{t.common.noMatches}</div>
+  {:else}
+    <div style="display:grid;gap:14px;">
+      {#each filteredListeners as { l: listener, idx: lIdx }}
+        {@const rt = listenerRuntime(listener.name)}
+        {@const sm = statusMeta(rt, listener.enabled)}
+        <div class="card">
+          <div class="row-between" style="margin-bottom:12px;">
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+              <span class="icon-tile sm {sm.dot === 'ok' ? '' : sm.dot === 'danger' ? 'danger' : 'muted'}">
+                <Icons name="reverse_proxy" size={15} />
+              </span>
+              <span style="font-weight:700;font-size:15px;">{listener.name}</span>
+              <span class="port-pill mono">
+                <span class="port-pill-lead accent">:{listener.listen_port}</span>
+                <span>{listener.stack}</span>
+              </span>
+              <span class="badge {sm.cls}">{sm.text}{#if rt && rt.active_conns > 0} · {rt.active_conns}c{/if}</span>
+              <span class="badge {listener.strict_sni ? 'badge-ok' : 'badge-warn'}">
+                {listener.strict_sni ? 'Strict SNI' : 'Fallback Cert'}
+              </span>
+              {#if listener.open_wan_firewall}
+                <span class="badge badge-warn">WAN Open</span>
+              {/if}
+            </div>
               <div class="btn-group">
                 <button
                   type="button"
@@ -710,7 +891,14 @@
                               <span class="badge badge-warn">{t.rp.certMissing}</span>
                             {/if}
                             {#if rule.websocket && rule.mode === 'proxy'}<span class="badge badge-info">WS</span>{/if}
-                            {#if rule.auth_gate}<span class="badge badge-warn">Auth Gate</span>{/if}
+                            {#if rule.auth_gate}
+                              {@const gCount = (rule.auth_gate_users || []).length}
+                              {#if gCount > 0}
+                                <span class="badge badge-ok">{t.rp.gateBadge} · {gCount}</span>
+                              {:else}
+                                <span class="badge badge-warn">{t.rp.gateUnboundBadge}</span>
+                              {/if}
+                            {/if}
                             {#if rule.strip_prefix}<span class="badge badge-muted">Strip Prefix</span>{/if}
                             {#if rule.mode === 'proxy' && rule.upstream?.startsWith('https://')}
                               <span class="badge {rule.upstream_tls_mode === 'insecure_skip_verify' ? 'badge-warn' : 'badge-info'}">
@@ -729,12 +917,6 @@
                           </div>
                         </div>
                         <div class="btn-group">
-                          {#if listener.enabled && rule.enabled && rule.mode === 'proxy' && rule.auth_gate && rule.websocket}
-                            <button type="button" class="btn btn-xs" onclick={() => openWsTicketModal(listener, rule)}>
-                              <Icons name="key" size={12} />
-                              <span>{t.rp.wsTicketBtn}</span>
-                            </button>
-                          {/if}
                           <button
                             type="button"
                             role="switch"
@@ -764,59 +946,77 @@
         {/each}
       </div>
     {/if}
-  </div>
 {/if}
 
 {#if settingsJson && mode === 'port_forward'}
-  <div class="card">
-    <div class="card-header">
-      <div>
-        <div class="card-title">{t.nav.port_forward}</div>
-        <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">{t.pf.subtitle}</div>
-      </div>
-      <div class="btn-group">
-        <button type="button" class="btn btn-xs" onclick={() => openPfDrawer(-1, 'kernel_dnat')}>+ {t.pf.presetDnat}</button>
-        <button type="button" class="btn btn-xs" onclick={() => openPfDrawer(-1, 'temp_ssh')}>+ {t.pf.presetSsh}</button>
-        <button type="button" class="btn btn-primary btn-sm" onclick={() => openPfDrawer(-1, 'v6_to_v4')}>
-          <Icons name="plus" size={14} />
-          <span>{t.add}</span>
-        </button>
-      </div>
+  {@const pfTotal = settingsJson.port_forwards?.length || 0}
+  {@const pfOn = (settingsJson.port_forwards || []).filter((x) => x.enabled).length}
+  <div class="page-section-bar">
+    <div>
+      <div class="page-section-desc">{t.pf.subtitle}</div>
+      {#if pfTotal > 0}
+        <div class="stat-inline-strip num">
+          <span class="stat-inline-item"><span class="status-dot" style="background:var(--info);"></span><span class="stat-inline-num">{pfTotal}</span><span>{t.all}</span></span>
+          <span class="stat-inline-item"><span class="status-dot ok"></span><span class="stat-inline-num">{pfOn}</span><span>{t.enabled}</span></span>
+          <span class="stat-inline-item"><span class="status-dot muted"></span><span class="stat-inline-num">{pfTotal - pfOn}</span><span>{t.disabled}</span></span>
+        </div>
+      {/if}
     </div>
+    <div class="btn-group">
+      <button type="button" class="btn btn-xs" onclick={() => openPfDrawer(-1, 'kernel_dnat')}>+ {t.pf.presetDnat}</button>
+      <button type="button" class="btn btn-xs" onclick={() => openPfDrawer(-1, 'temp_ssh')}>+ {t.pf.presetSsh}</button>
+      <button type="button" class="btn btn-primary btn-sm" onclick={() => openPfDrawer(-1, 'v6_to_v4')}>
+        <Icons name="plus" size={14} />
+        <span>{t.add}</span>
+      </button>
+    </div>
+  </div>
 
-    {#if settingsJson.port_forwards?.length}
-      <div class="toolbar">
+  {#if pfTotal > 0}
+    <div class="toolbar">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:1;min-width:0;">
         <div class="search-wrap">
           <span class="search-icon"><Icons name="search" size={15} /></span>
           <input type="text" placeholder={t.search} bind:value={searchQuery} />
         </div>
-        <div class="btn-group">
-          <button type="button" class="chip {filterStatus === 'all' ? 'active' : ''}" onclick={() => filterStatus = 'all'}>{t.all}</button>
-          <button type="button" class="chip {filterStatus === 'enabled' ? 'active' : ''}" onclick={() => filterStatus = 'enabled'}>{t.enabled}</button>
-          <button type="button" class="chip {filterStatus === 'disabled' ? 'active' : ''}" onclick={() => filterStatus = 'disabled'}>{t.disabled}</button>
-        </div>
+        <FacetFilter
+          label={lang === 'en' ? 'State' : '状态'}
+          bind:value={filterStatus}
+          options={[
+            { value: 'all', label: t.all, count: pfTotal },
+            { value: 'enabled', label: t.enabled, count: pfOn, tone: 'ok' },
+            { value: 'disabled', label: t.disabled, count: pfTotal - pfOn, tone: 'muted' },
+          ]}
+        />
       </div>
-    {/if}
+      <span class="mono" style="font-size:12px;color:var(--text-muted);">{filteredPortForwards.length} / {pfTotal}</span>
+    </div>
+  {/if}
 
-    {#if !settingsJson.port_forwards?.length}
-      <div class="empty-state">{t.common.empty}</div>
-    {:else if !filteredPortForwards.length}
-      <div class="empty-state">{t.common.noMatches}</div>
-    {:else}
-      <div style="display:grid;gap:12px;">
-        {#each filteredPortForwards as { pf, idx } (pf.name)}
-          {@const rt = pfRuntime(pf.name)}
-          {@const sm = statusMeta(rt, pf.enabled)}
-          {@const famLabel = rt ? [rt.bound_v4 ? 'v4' : '', rt.bound_v6 ? 'v6' : ''].filter(Boolean).join('+') : ''}
-          <div class="subcard">
-            <div class="row-between">
-              <div style="min-width:0;flex:1;">
-                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                  <span class="status-dot {sm.dot}"></span>
-                  <span style="font-weight:700;font-size:15px;">{pf.name}</span>
-                  <span class="badge badge-info mono">:{pf.listen_port}/{pf.proto} ({pf.stack})</span>
-                  <span class="badge {sm.cls}">{sm.text}{#if famLabel} · {famLabel}{/if}{#if rt && rt.active_conns > 0} · {rt.active_conns}c{/if}</span>
-                  <span class="badge badge-muted">{pf.engine}</span>
+  {#if !pfTotal}
+    <div class="empty-state">{t.common.empty}</div>
+  {:else if !filteredPortForwards.length}
+    <div class="empty-state">{t.common.noMatches}</div>
+  {:else}
+    <div style="display:grid;gap:12px;">
+      {#each filteredPortForwards as { pf, idx } (pf.name)}
+        {@const rt = pfRuntime(pf.name)}
+        {@const sm = statusMeta(rt, pf.enabled)}
+        {@const famLabel = rt ? [rt.bound_v4 ? 'v4' : '', rt.bound_v6 ? 'v6' : ''].filter(Boolean).join('+') : ''}
+        <div class="card" style="padding:15px 18px;">
+          <div class="row-between">
+            <div style="min-width:0;flex:1;">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                <span class="icon-tile sm {sm.dot === 'ok' ? '' : sm.dot === 'danger' ? 'danger' : 'muted'}">
+                  <Icons name="port_forward" size={14} />
+                </span>
+                <span style="font-weight:700;font-size:15px;">{pf.name}</span>
+                <span class="port-pill mono">
+                  <span class="port-pill-lead">:{pf.listen_port}/{pf.proto}</span>
+                  <span>→ {(pf.targets?.length ? pf.targets : [pf.target])[0]}</span>
+                </span>
+                <span class="badge {sm.cls}">{sm.text}{#if famLabel} · {famLabel}{/if}{#if rt && rt.active_conns > 0} · {rt.active_conns}c{/if}</span>
+                <span class="badge badge-muted">{pf.engine}</span>
                   {#if pf.open_wan_firewall || pf.engine === 'kernel_dnat'}
                     <span class="badge badge-warn">WAN Open</span>
                   {/if}
@@ -899,19 +1099,19 @@
         {/each}
       </div>
     {/if}
-  </div>
 {/if}
 
-<!-- 反代监听器抽屉 -->
-{#if rpDrawerOpen && rpDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) rpDrawerOpen = false; }}>
-    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.nav.reverse_proxy}>
-    <form style="display:contents;" onsubmit={saveListener}>
-      <div class="drawer-header">
-        <div class="card-title">{rpEditIndex >= 0 ? t.edit : t.add} · {t.nav.reverse_proxy}</div>
-        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => rpDrawerOpen = false}>{t.cancel}</button>
-      </div>
-      <div class="drawer-body">
+<!-- 反代监听器编辑弹窗 -->
+<EditorDialog
+  open={rpDrawerOpen && Boolean(rpDraft)}
+  title={`${rpEditIndex >= 0 ? t.edit : t.add} · ${t.nav.reverse_proxy}`}
+  size="sm"
+  busy={saving}
+  {t}
+  {askConfirm}
+  onSubmit={saveListener}
+  onClose={() => (rpDrawerOpen = false)}
+>
         <div class="form-grid">
           <div class="field">
             <label for="rp-name">{t.rp.listenerName}</label>
@@ -923,11 +1123,15 @@
           </div>
           <div class="field">
             <label for="rp-stack">{t.rp.stack}</label>
-            <select id="rp-stack" bind:value={rpDraft.stack}>
-              <option value="dual">dual (IPv4 + IPv6)</option>
-              <option value="ipv4_only">ipv4_only</option>
-              <option value="ipv6_only">ipv6_only</option>
-            </select>
+            <Select
+              id="rp-stack"
+              bind:value={rpDraft.stack}
+              options={[
+                { value: 'dual', label: lang === 'en' ? 'Dual Stack (IPv4 + IPv6)' : '双栈 (IPv4 + IPv6)' },
+                { value: 'ipv4_only', label: lang === 'en' ? 'IPv4 Only' : '仅 IPv4' },
+                { value: 'ipv6_only', label: lang === 'en' ? 'IPv6 Only' : '仅 IPv6' },
+              ]}
+            />
           </div>
           <div class="field">
             <label for="rp-maxc">{t.rp.maxConns}</label>
@@ -942,26 +1146,19 @@
           <label class="check-row"><input type="checkbox" bind:checked={rpDraft.strict_sni} /> {t.rp.strictSni}</label>
           <label class="check-row"><input type="checkbox" bind:checked={rpDraft.open_wan_firewall} /> {t.rp.openWan}</label>
         </div>
-      </div>
-      <div class="drawer-footer">
-        <button type="button" class="btn" disabled={saving} onclick={() => rpDrawerOpen = false}>{t.cancel}</button>
-        <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
-      </div>
-    </form>
-    </div>
-  </div>
-{/if}
+</EditorDialog>
 
-<!-- 反代子规则抽屉 -->
-{#if ruleDrawerOpen && ruleDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) ruleDrawerOpen = false; }}>
-    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.rp.addRule}>
-    <form style="display:contents;" onsubmit={saveRule}>
-      <div class="drawer-header">
-        <div class="card-title">{ruleEditIndex >= 0 ? t.edit : t.add} · {t.rp.addRule}</div>
-        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => ruleDrawerOpen = false}>{t.cancel}</button>
-      </div>
-      <div class="drawer-body">
+<!-- 反代子规则编辑弹窗 -->
+<EditorDialog
+  open={ruleDrawerOpen && Boolean(ruleDraft)}
+  title={`${ruleEditIndex >= 0 ? t.edit : t.add} · ${t.rp.addRule}`}
+  size="md"
+  busy={saving}
+  {t}
+  {askConfirm}
+  onSubmit={saveRule}
+  onClose={() => (ruleDrawerOpen = false)}
+>
         <div class="form-grid">
           <div class="field">
             <label for="rr-host">{t.rp.host}</label>
@@ -973,11 +1170,15 @@
           </div>
           <div class="field">
             <label for="rr-mode">{t.rp.mode}</label>
-            <select id="rr-mode" bind:value={ruleDraft.mode}>
-              <option value="proxy">proxy</option>
-              <option value="redirect">redirect (301/302/307/308)</option>
-              <option value="static">static</option>
-            </select>
+            <Select
+              id="rr-mode"
+              bind:value={ruleDraft.mode}
+              options={[
+                { value: 'proxy', label: lang === 'en' ? 'Reverse Proxy' : '反向代理转发' },
+                { value: 'redirect', label: lang === 'en' ? 'HTTP Redirect (301/302/307/308)' : '网址跳转重定向' },
+                { value: 'static', label: lang === 'en' ? 'Static Response' : '直接返回静态内容' },
+              ]}
+            />
           </div>
         </div>
 
@@ -985,6 +1186,47 @@
           <label class="check-row"><input type="checkbox" bind:checked={ruleDraft.enabled} /> {t.enabled}</label>
           <label class="check-row"><input type="checkbox" bind:checked={ruleDraft.auth_gate} /> {t.rp.authGate}</label>
         </div>
+
+        {#if ruleDraft.auth_gate}
+          <div class="subcard" style="margin-bottom:12px;display:grid;gap:8px;">
+            <div class="row-between">
+              <span style="font-size:12.5px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:6px;">
+                <Icons name="lock" size={13} />
+                <span>{t.rp.gateRuleUsersLabel}</span>
+              </span>
+              <button type="button" class="btn btn-xs" onclick={openGateUsersModal}>
+                <Icons name="user" size={12} />
+                <span>{t.rp.gateRuleManageBtn}</span>
+              </button>
+            </div>
+            {#if effectiveGateUsers.length === 0}
+              <div class="banner banner-warn" style="margin:0;">{t.rp.gateRuleNoUsersWarn}</div>
+            {:else}
+              <div class="btn-group" style="gap:6px;">
+                {#each effectiveGateUsers as gu (gu.username)}
+                  {@const picked = (ruleDraft.auth_gate_users || []).includes(gu.username)}
+                  <button
+                    type="button"
+                    data-dirty="1"
+                    class="chip mono"
+                    style={picked ? 'background:var(--accent-soft);border-color:var(--accent);color:var(--accent);font-weight:600;' : ''}
+                    onclick={() => toggleRuleGateUser(gu.username)}
+                  >
+                    {#if picked}<Icons name="check" size={12} />{/if}
+                    <span>{gu.username}</span>
+                    {#if !gu.enabled}
+                      <span style="opacity:.7;font-size:11px;">({t.disabled})</span>
+                    {/if}
+                  </button>
+                {/each}
+              </div>
+              {#if !(ruleDraft.auth_gate_users || []).length}
+                <div class="banner banner-warn" style="margin:0;">{t.rp.gateRuleNoneSelectedWarn}</div>
+              {/if}
+            {/if}
+            <div class="field-hint" style="margin:0;">{t.rp.gateRulePortalHint}</div>
+          </div>
+        {/if}
 
         {#if ruleDraft.mode === 'proxy'}
           <div class="field">
@@ -994,11 +1236,15 @@
           <div class="form-grid">
             <div class="field">
               <label for="rr-tls">{t.rp.tlsVerify}</label>
-              <select id="rr-tls" bind:value={ruleDraft.upstream_tls_mode}>
-                <option value="strict">strict</option>
-                <option value="pinned_sha256">pinned_sha256</option>
-                <option value="insecure_skip_verify">insecure_skip_verify</option>
-              </select>
+              <Select
+                id="rr-tls"
+                bind:value={ruleDraft.upstream_tls_mode}
+                options={[
+                  { value: 'strict', label: lang === 'en' ? 'Verify System CA (Recommended)' : '校验有效证书（推荐）' },
+                  { value: 'pinned_sha256', label: lang === 'en' ? 'Pin Certificate SHA-256' : '锁定指定证书指纹' },
+                  { value: 'insecure_skip_verify', label: lang === 'en' ? 'Skip Verification (Self-Signed LAN)' : '忽略证书校验（内网自签）' },
+                ]}
+              />
             </div>
             <div class="field">
               <label for="rr-sni">{t.rp.upstreamSni}</label>
@@ -1027,12 +1273,12 @@
           <div class="form-grid">
             <div class="field">
               <label for="rr-rcode">{t.rp.redirectCode}</label>
-              <select id="rr-rcode" bind:value={ruleDraft.redirect_code}>
-                <option value={301}>301</option>
-                <option value={302}>302</option>
-                <option value={307}>307</option>
-                <option value={308}>308</option>
-              </select>
+              <Select
+                id="rr-rcode"
+                mono
+                bind:value={ruleDraft.redirect_code}
+                options={[301, 302, 307, 308]}
+              />
             </div>
             <div class="field">
               <label for="rr-rurl">{t.rp.redirectUrl}</label>
@@ -1125,77 +1371,181 @@
             </div>
           </div>
         </details>
-      </div>
-      <div class="drawer-footer">
-        <button type="button" class="btn" disabled={saving} onclick={() => ruleDrawerOpen = false}>{t.cancel}</button>
-        <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
-      </div>
-    </form>
-    </div>
-  </div>
-{/if}
+</EditorDialog>
 
-<!-- 反代门禁 WebSocket 一次性票据弹窗 -->
-{#if wsTicketOpen}
-  <div class="modal-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !wsTicketBusy) wsTicketOpen = false; }}>
-    <div class="modal-card" style="max-width:520px;" role="dialog" aria-modal="true" aria-label={t.rp.wsTicketTitle}>
-    <form onsubmit={issueWsTicket}>
-      <div class="row-between" style="margin-bottom:10px;">
-        <div class="card-title"><Icons name="key" size={16} />{t.rp.wsTicketTitle}</div>
-        <button type="button" class="btn btn-xs" onclick={() => wsTicketOpen = false}>{t.close}</button>
+<!-- 反向代理独立门禁账号管理弹窗 -->
+<EditorDialog
+  open={gateUsersOpen}
+  title={t.rp.gateUsersTitle}
+  size="md"
+  form={false}
+  confirmDiscard={false}
+  {t}
+  onClose={() => {
+    gateUsersOpen = false;
+    gateFormMode = '';
+  }}
+>
+  <div class="banner banner-info" style="margin-bottom:12px;">{t.rp.gateUsersDesc}</div>
+
+  <div class="row-between" style="margin-bottom:12px;">
+    <span style="font-size:12.5px;color:var(--text-secondary);">
+      {t.all}: <strong class="num">{effectiveGateUsers.length}</strong>
+    </span>
+    {#if gateFormMode === ''}
+      <button type="button" class="btn btn-primary btn-xs" onclick={startCreateGateUser}>
+        <Icons name="plus" size={13} />
+        <span>{t.rp.gateAddUser}</span>
+      </button>
+    {/if}
+  </div>
+
+  {#if gateFormMode !== ''}
+    <form class="subcard" style="margin-bottom:12px;display:grid;gap:10px;" onsubmit={submitGateUser}>
+      <div class="row-between">
+        <span style="font-weight:700;font-size:13.5px;">
+          {gateFormMode === 'create' ? t.rp.gateAddUser : `${t.rp.gateEditUser} · ${gateDraft.username}`}
+        </span>
+        <button type="button" class="btn btn-ghost btn-xs" onclick={() => { gateFormMode = ''; gateErr = ''; }}>
+          {t.cancel}
+        </button>
       </div>
-      <p style="font-size:12.5px;color:var(--text-secondary);margin-bottom:12px;line-height:1.5;">{t.rp.wsTicketDesc}</p>
-      {#if wsTicketErr}
-        <div role="alert" class="badge badge-danger" style="width:100%;padding:8px 10px;border-radius:8px;margin-bottom:10px;white-space:normal;">
-          {wsTicketErr}
-        </div>
+      {#if gateErr}
+        <div role="alert" class="banner banner-danger" style="margin:0;">{gateErr}</div>
       {/if}
       <div class="form-grid">
         <div class="field">
-          <label for="wst-host">{t.rp.wsTicketHost}</label>
-          <input id="wst-host" type="text" class="mono" bind:value={wsTicketHost} required />
+          <label for="gu-name">{t.rp.gateUsername}</label>
+          <input
+            id="gu-name"
+            type="text"
+            class="mono"
+            placeholder={t.rp.gateUsernamePh}
+            bind:value={gateDraft.username}
+            disabled={gateFormMode === 'edit'}
+            required
+          />
         </div>
         <div class="field">
-          <label for="wst-path">{t.rp.wsTicketPath}</label>
-          <input id="wst-path" type="text" class="mono" bind:value={wsTicketPath} required />
+          <label for="gu-ttl">{t.rp.gateTtl}</label>
+          <Select id="gu-ttl" bind:value={gateDraft.session_ttl_secs} options={gateTtlOptions} />
         </div>
       </div>
-      {#if wsTicketToken}
-        <div class="subcard mono" style="font-size:12px;margin-bottom:12px;word-break:break-all;display:grid;gap:8px;">
-          <div class="row-between">
-            <span style="font-weight:700;">{t.rp.wsTicketReady}</span>
-            <span class="badge {wsTicketRemain > 0 ? 'badge-ok' : 'badge-danger'} num">
-              {wsTicketRemain > 0 ? `${wsTicketRemain}s` : t.rp.wsTicketExpired}
-            </span>
-          </div>
-          <div style="color:var(--accent);">{wsTicketUrl}</div>
-          <div class="btn-group">
-            <button type="button" class="btn btn-xs" onclick={() => copyOrToast(wsTicketUrl)}>{t.copy} WSS URL</button>
-            <button type="button" class="btn btn-xs" onclick={() => copyOrToast(wsTicketToken)}>{t.copy} Ticket</button>
-          </div>
+      <div class="field">
+        <label for="gu-pw">{t.rp.gatePassword}</label>
+        <div style="position:relative;display:flex;align-items:center;">
+          <input
+            id="gu-pw"
+            type={gateShowPw ? 'text' : 'password'}
+            autocomplete="new-password"
+            placeholder={gateFormMode === 'create' ? t.rp.gatePasswordPh : t.rp.gatePasswordKeepPh}
+            bind:value={gateDraft.password}
+            required={gateFormMode === 'create'}
+            style="padding-right:38px;"
+          />
+          <button
+            type="button"
+            class="btn btn-ghost btn-xs"
+            aria-label={t.common.toggleSecret}
+            style="position:absolute;right:4px;"
+            onclick={() => (gateShowPw = !gateShowPw)}
+          >
+            <Icons name={gateShowPw ? 'eye_off' : 'eye'} size={14} />
+          </button>
         </div>
-      {/if}
-      <div style="display:flex;justify-content:flex-end;gap:8px;">
-        <button type="button" class="btn btn-sm" onclick={() => wsTicketOpen = false}>{t.close}</button>
-        <button type="submit" class="btn btn-sm btn-primary" disabled={wsTicketBusy}>
-          {wsTicketBusy ? '...' : t.rp.wsTicketIssue}
-        </button>
+      </div>
+      <div class="field">
+        <label for="gu-note">{t.rp.gateNote}</label>
+        <input id="gu-note" type="text" placeholder={t.rp.gateNotePh} bind:value={gateDraft.note} />
+      </div>
+      <div class="row-between">
+        <label class="check-row"><input type="checkbox" bind:checked={gateDraft.enabled} /> {t.enabled}</label>
+        <div class="btn-group">
+          <button type="button" class="btn btn-xs" disabled={gateSaving} onclick={() => { gateFormMode = ''; gateErr = ''; }}>
+            {t.cancel}
+          </button>
+          <button type="submit" class="btn btn-primary btn-xs" disabled={gateSaving}>
+            {gateSaving ? '...' : t.confirm}
+          </button>
+        </div>
       </div>
     </form>
-    </div>
-  </div>
-{/if}
+  {/if}
 
-<!-- 端口转发抽屉 -->
-{#if pfDrawerOpen && pfDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) pfDrawerOpen = false; }}>
-    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.nav.port_forward}>
-    <form style="display:contents;" onsubmit={savePortForward}>
-      <div class="drawer-header">
-        <div class="card-title">{pfEditIndex >= 0 ? t.edit : t.add} · {t.nav.port_forward}</div>
-        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => pfDrawerOpen = false}>{t.cancel}</button>
-      </div>
-      <div class="drawer-body">
+  {#if gateUsersLoading && !gateUsersLoaded}
+    <div style="font-size:12.5px;color:var(--text-muted);padding:12px 0;text-align:center;">{t.common.loading}</div>
+  {:else if !effectiveGateUsers.length}
+    <div class="empty-state" style="padding:24px 16px;">{t.rp.gateNoUsers}</div>
+  {:else}
+    <div style="display:grid;gap:8px;">
+      {#each effectiveGateUsers as u (u.username)}
+        <div class="rule-card">
+          <div class="row-between">
+            <div style="min-width:0;flex:1;">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                <span class="mono" style="font-weight:700;font-size:13.5px;">{u.username}</span>
+                <span class="badge {u.enabled ? 'badge-ok' : 'badge-muted'}">{u.enabled ? t.enabled : t.disabled}</span>
+                <span class="badge badge-muted">{formatGateTtl(u.session_ttl_secs)}</span>
+                <span class="badge badge-info">{t.rp.gateBoundRules}: {u.bound_rules || 0}</span>
+                {#if (u.active_sessions || 0) > 0}
+                  <span class="badge badge-ok">{t.rp.gateActiveSess}: {u.active_sessions}</span>
+                {/if}
+              </div>
+              {#if u.note}
+                <div style="font-size:12px;color:var(--text-secondary);margin-top:4px;">{u.note}</div>
+              {/if}
+            </div>
+            <div class="btn-group">
+              {#if (u.active_sessions || 0) > 0}
+                <button
+                  type="button"
+                  class="btn btn-xs"
+                  disabled={gateBusyUser === u.username}
+                  onclick={() => revokeGateUserSessions(u)}
+                >
+                  <Icons name="logout" size={12} />
+                  <span>{t.rp.gateRevokeBtn}</span>
+                </button>
+              {/if}
+              <button
+                type="button"
+                role="switch"
+                aria-checked={u.enabled}
+                aria-label={u.username}
+                class="switch"
+                disabled={gateBusyUser === u.username}
+                onclick={() => toggleGateUserEnabled(u)}
+              >
+                <span class="switch-thumb"></span>
+              </button>
+              <button type="button" class="btn btn-xs" onclick={() => startEditGateUser(u)}>{t.edit}</button>
+              <button
+                type="button"
+                class="btn btn-xs btn-danger"
+                disabled={gateBusyUser === u.username}
+                onclick={() => deleteGateUser(u)}
+              >
+                {t.delete}
+              </button>
+            </div>
+          </div>
+        </div>
+      {/each}
+    </div>
+  {/if}
+</EditorDialog>
+
+<!-- 端口转发编辑弹窗 -->
+<EditorDialog
+  open={pfDrawerOpen && Boolean(pfDraft)}
+  title={`${pfEditIndex >= 0 ? t.edit : t.add} · ${t.nav.port_forward}`}
+  size="md"
+  busy={saving}
+  {t}
+  {askConfirm}
+  onSubmit={savePortForward}
+  onClose={() => (pfDrawerOpen = false)}
+>
         <div class="form-grid">
           <div class="field">
             <label for="pf-name">{t.pf.ruleName}</label>
@@ -1207,36 +1557,53 @@
           </div>
           <div class="field">
             <label for="pf-proto">{t.pf.proto}</label>
-            <select id="pf-proto" bind:value={pfDraft.proto}>
-              <option value="tcp">tcp</option>
-              <option value="udp">udp</option>
-              <option value="tcp_udp">tcp_udp</option>
-            </select>
+            <Select
+              id="pf-proto"
+              bind:value={pfDraft.proto}
+              options={[
+                { value: 'tcp', label: 'TCP' },
+                { value: 'udp', label: 'UDP' },
+                { value: 'tcp_udp', label: 'TCP + UDP' },
+              ]}
+            />
           </div>
           <div class="field">
             <label for="pf-eng">{t.pf.engine}</label>
-            <select id="pf-eng" bind:value={pfDraft.engine} onchange={onPfEngineChange}>
-              <option value="userspace_splice">userspace_splice</option>
-              <option value="kernel_dnat">kernel_dnat</option>
-            </select>
+            <Select
+              id="pf-eng"
+              bind:value={pfDraft.engine}
+              options={[
+                { value: 'userspace_splice', label: lang === 'en' ? 'Smart Proxy (Cross-Stack & LB)' : '智能转发（支持跨栈与多目标）' },
+                { value: 'kernel_dnat', label: lang === 'en' ? 'Kernel DNAT (Same-Stack Direct)' : '系统内核直转（仅限单目标同协议栈）' },
+              ]}
+              onchange={onPfEngineChange}
+            />
           </div>
           <div class="field">
             <label for="pf-stack">{t.pf.stack}</label>
-            <select id="pf-stack" bind:value={pfDraft.stack}>
-              {#if pfDraft.engine !== 'kernel_dnat'}
-                <option value="dual">dual (IPv4 + IPv6)</option>
-              {/if}
-              <option value="ipv4_only">ipv4_only</option>
-              <option value="ipv6_only">ipv6_only</option>
-            </select>
+            <Select
+              id="pf-stack"
+              bind:value={pfDraft.stack}
+              options={[
+                ...(pfDraft.engine !== 'kernel_dnat'
+                  ? [{ value: 'dual', label: lang === 'en' ? 'Dual Stack (IPv4 + IPv6)' : '双栈 (IPv4 + IPv6)' }]
+                  : []),
+                { value: 'ipv4_only', label: lang === 'en' ? 'IPv4 Only' : '仅 IPv4' },
+                { value: 'ipv6_only', label: lang === 'en' ? 'IPv6 Only' : '仅 IPv6' },
+              ]}
+            />
           </div>
           {#if pfDraft.engine !== 'kernel_dnat'}
             <div class="field">
               <label for="pf-lb">{t.pf.loadBalance}</label>
-              <select id="pf-lb" bind:value={pfDraft.load_balance}>
-                <option value="failover">failover</option>
-                <option value="round_robin">round_robin</option>
-              </select>
+              <Select
+                id="pf-lb"
+                bind:value={pfDraft.load_balance}
+                options={[
+                  { value: 'failover', label: lang === 'en' ? 'Primary / Backup Failover' : '主备容灾（优先首个目标）' },
+                  { value: 'round_robin', label: lang === 'en' ? 'Round Robin' : '轮询分流' },
+                ]}
+              />
             </div>
           {/if}
         </div>
@@ -1265,11 +1632,15 @@
             {#if pfDraft.proto !== 'udp'}
               <div class="field">
                 <label for="pf-pp">{t.pf.proxyProto}</label>
-                <select id="pf-pp" bind:value={pfDraft.send_proxy_protocol}>
-                  <option value="none">none</option>
-                  <option value="v1">v1 (Text)</option>
-                  <option value="v2">v2 (Binary)</option>
-                </select>
+                <Select
+                  id="pf-pp"
+                  bind:value={pfDraft.send_proxy_protocol}
+                  options={[
+                    { value: 'none', label: 'none' },
+                    { value: 'v1', label: 'v1 (Text)' },
+                    { value: 'v2', label: 'v2 (Binary)' },
+                  ]}
+                />
               </div>
             {/if}
             <div class="field">
@@ -1278,7 +1649,7 @@
             </div>
             <div class="field">
               <label for="pf-iface">{t.pf.bindIface}</label>
-              <input id="pf-iface" type="text" class="mono" list="net-iface-list" bind:value={pfDraft.bind_interface} />
+              <ComboInput id="pf-iface" options={ifaceOptions} bind:value={pfDraft.bind_interface} />
             </div>
           </div>
 
@@ -1327,12 +1698,4 @@
             {t.pf.openWan}
           </label>
         </div>
-      </div>
-      <div class="drawer-footer">
-        <button type="button" class="btn" disabled={saving} onclick={() => pfDrawerOpen = false}>{t.cancel}</button>
-        <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
-      </div>
-    </form>
-    </div>
-  </div>
-{/if}
+</EditorDialog>

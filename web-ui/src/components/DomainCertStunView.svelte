@@ -2,6 +2,10 @@
   import Icons from './Icons.svelte';
   import SecretField from './SecretField.svelte';
   import HeaderRowsEditor from './HeaderRowsEditor.svelte';
+  import EditorDialog from './EditorDialog.svelte';
+  import Select from './Select.svelte';
+  import ComboInput from './ComboInput.svelte';
+  import FacetFilter from './FacetFilter.svelte';
   import {
     splitCsv,
     joinCsv,
@@ -36,7 +40,12 @@
   let searchQuery = $state('');
   let filterStatus = $state('all');
 
-  let ifaceNames = $derived((networkInfo?.interfaces || []).map((i) => i.iface));
+  let ifaceOptions = $derived(
+    (networkInfo?.interfaces || []).map((i) => {
+      const ips = [...(i.ipv4 || []), ...(i.ipv6 || [])];
+      return { value: i.iface, label: i.iface, sub: ips.slice(0, 2).join(', ') };
+    })
+  );
   let neighborEntries = $derived(networkInfo?.neighbors || []);
 
   // 切换 Tab 模式时重置筛选和抽屉，避免跨视图状态泄漏
@@ -191,13 +200,15 @@
 
   function defaultDdns(preset = 'wan') {
     const firstProv = Object.keys(settingsJson?.dns_providers || {})[0] || 'custom_http';
+    const defaultWan = settingsJson?.firewall?.wan_interfaces?.[0] || '';
+    const defaultLan = settingsJson?.firewall?.lan_interfaces?.[0] || '';
     const d = {
       name: `ddns_${(settingsJson?.ddns?.length || 0) + 1}`,
       enabled: true,
       provider: firstProv,
-      domain: 'home.example.com',
+      domain: '',
       records: ['A', 'AAAA'],
-      source: { kind: 'interface', name: 'pppoe-wan', preferred_subnet: '', index: 0 },
+      source: { kind: 'interface', name: defaultWan, preferred_subnet: '', index: 0 },
       on_missing_public_ip: 'keep_existing',
       ttl: 300,
       proxied: false,
@@ -212,9 +223,8 @@
     };
     if (preset === 'subdevice_v6') {
       d.name = 'nas_ipv6';
-      d.domain = 'nas6.example.com';
       d.records = ['AAAA'];
-      d.source = { kind: 'prefix_and_iid', prefix_iface: 'br-lan', iid: '::10' };
+      d.source = { kind: 'prefix_and_iid', prefix_iface: defaultLan, iid: '' };
       d.firewall_allow_tcp_ports = [5001];
     }
     return d;
@@ -268,9 +278,11 @@
   }
 
   function onDdnsSourceKindChange() {
-    if (ddnsSourceKind === 'interface') ddnsDraft.source = { kind: 'interface', name: 'pppoe-wan', preferred_subnet: '', index: 0 };
-    else if (ddnsSourceKind === 'prefix_and_iid') ddnsDraft.source = { kind: 'prefix_and_iid', prefix_iface: 'br-lan', iid: '::10' };
-    else if (ddnsSourceKind === 'neighbor_mac') ddnsDraft.source = { kind: 'neighbor_mac', prefix_iface: 'br-lan', mac: '00:11:32:aa:bb:cc' };
+    const defaultWan = settingsJson?.firewall?.wan_interfaces?.[0] || '';
+    const defaultLan = settingsJson?.firewall?.lan_interfaces?.[0] || '';
+    if (ddnsSourceKind === 'interface') ddnsDraft.source = { kind: 'interface', name: defaultWan, preferred_subnet: '', index: 0 };
+    else if (ddnsSourceKind === 'prefix_and_iid') ddnsDraft.source = { kind: 'prefix_and_iid', prefix_iface: defaultLan, iid: '' };
+    else if (ddnsSourceKind === 'neighbor_mac') ddnsDraft.source = { kind: 'neighbor_mac', prefix_iface: defaultLan, mac: '' };
     else if (ddnsSourceKind === 'external_url') ddnsDraft.source = { kind: 'external_url', url_v4: '', url_v6: '' };
     else ddnsDraft.source = { kind: 'custom_http_extract', url: '' };
   }
@@ -418,9 +430,9 @@
         ? deepClone(settingsJson.acme[idx])
         : {
             enabled: true,
-            domain: '*.home.example.com',
-            extra_domains: ['home.example.com'],
-            email: 'admin@example.com',
+            domain: '',
+            extra_domains: [],
+            email: '',
             dns_provider: firstProv,
             cert_dir: '/data/vane/certs',
             renew_before_days: 30,
@@ -649,7 +661,7 @@
       ruleset_id: '',
       rule_id: '',
       api_token: '',
-      source_host: 'go.example.com',
+      source_host: '',
       target_template: 'https://{{public_addr}}',
       status_code: 302,
     };
@@ -801,28 +813,6 @@
   );
 </script>
 
-<svelte:window
-  onkeydown={(e) => {
-    if (e.key === 'Escape' && !e.defaultPrevented && !saving) {
-      if (provDrawerOpen) provDrawerOpen = false;
-      else if (ddnsDrawerOpen) ddnsDrawerOpen = false;
-      else if (acmeDrawerOpen) acmeDrawerOpen = false;
-      else if (stunDrawerOpen) stunDrawerOpen = false;
-    }
-  }}
-/>
-
-<datalist id="ddns-iface-list">
-  {#each ifaceNames as name}
-    <option value={name}></option>
-  {/each}
-</datalist>
-<datalist id="ddns-mac-list">
-  {#each neighborEntries as nb}
-    <option value={nb.mac}>{nb.iface} · {nb.ip}</option>
-  {/each}
-</datalist>
-
 <!-- ===================== DNS 云服务商凭据池（DDNS 与 ACME 页面共享展示） ===================== -->
 {#if settingsJson && (mode === 'ddns' || mode === 'acme')}
   <div class="card" style="margin-bottom:16px;">
@@ -862,50 +852,66 @@
 
 <!-- ===================== DDNS ===================== -->
 {#if settingsJson && mode === 'ddns'}
-  <div class="card">
-    <div class="card-header">
-      <div>
-        <div class="card-title">{t.nav.ddns}</div>
-        <div style="font-size:12px;color:var(--text-secondary);">{t.ddns.subtitle}</div>
-      </div>
-      <div class="btn-group">
-        <button type="button" class="btn btn-xs" onclick={() => openDdnsDrawer(-1, 'subdevice_v6')}>+ {t.ddns.presetSubdevice}</button>
-        <button type="button" class="btn btn-primary btn-sm" onclick={() => openDdnsDrawer(-1, 'wan')}>
-          <Icons name="plus" size={14} />
-          <span>{t.add}</span>
-        </button>
-      </div>
+  {@const ddTotal = settingsJson.ddns?.length || 0}
+  {@const ddOn = (settingsJson.ddns || []).filter((x) => x.enabled).length}
+  <div class="page-section-bar">
+    <div>
+      <div class="page-section-desc">{t.ddns.subtitle}</div>
+      {#if ddTotal > 0}
+        <div class="stat-inline-strip num">
+          <span class="stat-inline-item"><span class="status-dot" style="background:var(--info);"></span><span class="stat-inline-num">{ddTotal}</span><span>{t.all}</span></span>
+          <span class="stat-inline-item"><span class="status-dot ok"></span><span class="stat-inline-num">{ddOn}</span><span>{t.enabled}</span></span>
+          <span class="stat-inline-item"><span class="status-dot muted"></span><span class="stat-inline-num">{ddTotal - ddOn}</span><span>{t.disabled}</span></span>
+        </div>
+      {/if}
     </div>
+    <div class="btn-group">
+      <button type="button" class="btn btn-xs" onclick={() => openDdnsDrawer(-1, 'subdevice_v6')}>+ {t.ddns.presetSubdevice}</button>
+      <button type="button" class="btn btn-primary btn-sm" onclick={() => openDdnsDrawer(-1, 'wan')}>
+        <Icons name="plus" size={14} />
+        <span>{t.add}</span>
+      </button>
+    </div>
+  </div>
 
-    {#if settingsJson.ddns?.length}
-      <div class="toolbar">
+  {#if ddTotal > 0}
+    <div class="toolbar">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:1;min-width:0;">
         <div class="search-wrap">
           <span class="search-icon"><Icons name="search" size={15} /></span>
           <input type="text" placeholder={t.search} bind:value={searchQuery} />
         </div>
-        <div class="btn-group">
-          <button type="button" class="chip {filterStatus === 'all' ? 'active' : ''}" onclick={() => filterStatus = 'all'}>{t.all}</button>
-          <button type="button" class="chip {filterStatus === 'enabled' ? 'active' : ''}" onclick={() => filterStatus = 'enabled'}>{t.enabled}</button>
-          <button type="button" class="chip {filterStatus === 'disabled' ? 'active' : ''}" onclick={() => filterStatus = 'disabled'}>{t.disabled}</button>
-        </div>
+        <FacetFilter
+          label={lang === 'en' ? 'State' : '状态'}
+          bind:value={filterStatus}
+          options={[
+            { value: 'all', label: t.all, count: ddTotal },
+            { value: 'enabled', label: t.enabled, count: ddOn, tone: 'ok' },
+            { value: 'disabled', label: t.disabled, count: ddTotal - ddOn, tone: 'muted' },
+          ]}
+        />
       </div>
-    {/if}
+      <span class="mono" style="font-size:12px;color:var(--text-muted);">{filteredDdns.length} / {ddTotal}</span>
+    </div>
+  {/if}
 
-    {#if !settingsJson.ddns?.length}
-      <div class="empty-state">{t.common.empty}</div>
-    {:else if !filteredDdns.length}
-      <div class="empty-state">{t.common.noMatches}</div>
-    {:else}
-      <div style="display:grid;gap:12px;">
-        {#each filteredDdns as { d, idx } (d.name)}
-          {@const rt = (dashboard?.ddns || []).find((x) => x.name === d.name)}
-          {@const ddnsErrors = [rt?.ipv4?.error ? `IPv4: ${rt.ipv4.error}` : '', rt?.ipv6?.error ? `IPv6: ${rt.ipv6.error}` : '', rt?.firewall_error ? `FW: ${rt.firewall_error}` : ''].filter(Boolean)}
-          <div class="subcard">
-            <div class="row-between">
-              <div style="min-width:0;flex:1;">
-                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                  <span class="status-dot {d.enabled ? (rt?.status === 'failed' ? 'danger' : rt?.status === 'synced' ? 'ok' : 'warn') : 'muted'}"></span>
-                  <span style="font-weight:700;font-size:15px;word-break:break-all;" class="mono">{d.domain}</span>
+  {#if !ddTotal}
+    <div class="empty-state">{t.common.empty}</div>
+  {:else if !filteredDdns.length}
+    <div class="empty-state">{t.common.noMatches}</div>
+  {:else}
+    <div style="display:grid;gap:12px;">
+      {#each filteredDdns as { d, idx } (d.name)}
+        {@const rt = (dashboard?.ddns || []).find((x) => x.name === d.name)}
+        {@const ddnsErrors = [rt?.ipv4?.error ? `IPv4: ${rt.ipv4.error}` : '', rt?.ipv6?.error ? `IPv6: ${rt.ipv6.error}` : '', rt?.firewall_error ? `FW: ${rt.firewall_error}` : ''].filter(Boolean)}
+        <div class="card" style="padding:15px 18px;">
+          <div class="row-between">
+            <div style="min-width:0;flex:1;">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                <span class="icon-tile sm {d.enabled ? (rt?.status === 'failed' ? 'danger' : rt?.status === 'synced' ? '' : 'warn') : 'muted'}">
+                  <Icons name="ddns" size={14} />
+                </span>
+                <span style="font-weight:700;font-size:15px;word-break:break-all;" class="mono">{d.domain}</span>
                   <span class="badge badge-muted">{d.name}</span>
                   <span class="badge badge-info">{d.provider} ({d.records.join('+')})</span>
                   {#if rt}
@@ -962,52 +968,67 @@
         {/each}
       </div>
     {/if}
-  </div>
 {/if}
 
 <!-- ===================== ACME 自动化证书 ===================== -->
 {#if settingsJson && mode === 'acme'}
-  <div class="card">
-    <div class="card-header">
-      <div>
-        <div class="card-title">{t.nav.acme}</div>
-        <div style="font-size:12px;color:var(--text-secondary);">{t.acme.subtitle}</div>
-      </div>
-      <button type="button" class="btn btn-primary btn-sm" onclick={() => openAcmeDrawer(-1)}>
-        <Icons name="plus" size={14} />
-        <span>{t.add}</span>
-      </button>
+  {@const acTotal = settingsJson.acme?.length || 0}
+  {@const acOn = (settingsJson.acme || []).filter((x) => x.enabled).length}
+  <div class="page-section-bar">
+    <div>
+      <div class="page-section-desc">{t.acme.subtitle}</div>
+      {#if acTotal > 0}
+        <div class="stat-inline-strip num">
+          <span class="stat-inline-item"><span class="status-dot" style="background:var(--info);"></span><span class="stat-inline-num">{acTotal}</span><span>{t.all}</span></span>
+          <span class="stat-inline-item"><span class="status-dot ok"></span><span class="stat-inline-num">{acOn}</span><span>{t.enabled}</span></span>
+          <span class="stat-inline-item"><span class="status-dot muted"></span><span class="stat-inline-num">{acTotal - acOn}</span><span>{t.disabled}</span></span>
+        </div>
+      {/if}
     </div>
+    <button type="button" class="btn btn-primary btn-sm" onclick={() => openAcmeDrawer(-1)}>
+      <Icons name="plus" size={14} />
+      <span>{t.add}</span>
+    </button>
+  </div>
 
-    {#if settingsJson.acme?.length}
-      <div class="toolbar">
+  {#if acTotal > 0}
+    <div class="toolbar">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:1;min-width:0;">
         <div class="search-wrap">
           <span class="search-icon"><Icons name="search" size={15} /></span>
           <input type="text" placeholder={t.search} bind:value={searchQuery} />
         </div>
-        <div class="btn-group">
-          <button type="button" class="chip {filterStatus === 'all' ? 'active' : ''}" onclick={() => filterStatus = 'all'}>{t.all}</button>
-          <button type="button" class="chip {filterStatus === 'enabled' ? 'active' : ''}" onclick={() => filterStatus = 'enabled'}>{t.enabled}</button>
-          <button type="button" class="chip {filterStatus === 'disabled' ? 'active' : ''}" onclick={() => filterStatus = 'disabled'}>{t.disabled}</button>
-        </div>
+        <FacetFilter
+          label={lang === 'en' ? 'State' : '状态'}
+          bind:value={filterStatus}
+          options={[
+            { value: 'all', label: t.all, count: acTotal },
+            { value: 'enabled', label: t.enabled, count: acOn, tone: 'ok' },
+            { value: 'disabled', label: t.disabled, count: acTotal - acOn, tone: 'muted' },
+          ]}
+        />
       </div>
-    {/if}
+      <span class="mono" style="font-size:12px;color:var(--text-muted);">{filteredAcme.length} / {acTotal}</span>
+    </div>
+  {/if}
 
-    {#if !settingsJson.acme?.length}
-      <div class="empty-state">{t.common.empty}</div>
-    {:else if !filteredAcme.length}
-      <div class="empty-state">{t.common.noMatches}</div>
-    {:else}
-      <div style="display:grid;gap:12px;">
-        {#each filteredAcme as { a, idx } (a.domain)}
-          {@const st = (dashboard?.certs || []).find((c) => c.domain === a.domain)}
-          {@const days = certDaysRemaining(st?.expires_at_unix)}
-          <div class="subcard">
-            <div class="row-between">
-              <div style="min-width:0;flex:1;">
-                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                  <span class="status-dot {a.enabled ? (st?.status === 'active' ? 'ok' : st?.status === 'failed' ? 'danger' : 'warn') : 'muted'}"></span>
-                  <span style="font-weight:700;font-size:15px;word-break:break-all;" class="mono">{a.domain}</span>
+  {#if !acTotal}
+    <div class="empty-state">{t.common.empty}</div>
+  {:else if !filteredAcme.length}
+    <div class="empty-state">{t.common.noMatches}</div>
+  {:else}
+    <div style="display:grid;gap:12px;">
+      {#each filteredAcme as { a, idx } (a.domain)}
+        {@const st = (dashboard?.certs || []).find((c) => c.domain === a.domain)}
+        {@const days = certDaysRemaining(st?.expires_at_unix)}
+        <div class="card" style="padding:15px 18px;">
+          <div class="row-between">
+            <div style="min-width:0;flex:1;">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                <span class="icon-tile sm {a.enabled ? (st?.status === 'active' ? '' : st?.status === 'failed' ? 'danger' : 'warn') : 'muted'}">
+                  <Icons name="acme" size={14} />
+                </span>
+                <span style="font-weight:700;font-size:15px;word-break:break-all;" class="mono">{a.domain}</span>
                   {#if a.extra_domains?.length}
                     <span class="badge badge-muted mono">+{a.extra_domains.length} SAN</span>
                   {/if}
@@ -1066,53 +1087,68 @@
         {/each}
       </div>
     {/if}
-  </div>
 {/if}
 
 <!-- ===================== STUN 穿透与动态重定向 ===================== -->
 {#if settingsJson && mode === 'stun'}
-  <div class="card">
-    <div class="card-header">
-      <div>
-        <div class="card-title">{t.nav.stun}</div>
-        <div style="font-size:12px;color:var(--text-secondary);">{t.stun.subtitle}</div>
-      </div>
-      <button type="button" class="btn btn-primary btn-sm" onclick={() => openStunDrawer(-1)}>
-        <Icons name="plus" size={14} />
-        <span>{t.add}</span>
-      </button>
+  {@const stTotal = settingsJson.stun?.length || 0}
+  {@const stOn = (settingsJson.stun || []).filter((x) => x.enabled).length}
+  <div class="page-section-bar">
+    <div>
+      <div class="page-section-desc">{t.stun.subtitle}</div>
+      {#if stTotal > 0}
+        <div class="stat-inline-strip num">
+          <span class="stat-inline-item"><span class="status-dot" style="background:var(--info);"></span><span class="stat-inline-num">{stTotal}</span><span>{t.all}</span></span>
+          <span class="stat-inline-item"><span class="status-dot ok"></span><span class="stat-inline-num">{stOn}</span><span>{t.enabled}</span></span>
+          <span class="stat-inline-item"><span class="status-dot muted"></span><span class="stat-inline-num">{stTotal - stOn}</span><span>{t.disabled}</span></span>
+        </div>
+      {/if}
     </div>
+    <button type="button" class="btn btn-primary btn-sm" onclick={() => openStunDrawer(-1)}>
+      <Icons name="plus" size={14} />
+      <span>{t.add}</span>
+    </button>
+  </div>
 
-    {#if settingsJson.stun?.length}
-      <div class="toolbar">
+  {#if stTotal > 0}
+    <div class="toolbar">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:1;min-width:0;">
         <div class="search-wrap">
           <span class="search-icon"><Icons name="search" size={15} /></span>
           <input type="text" placeholder={t.search} bind:value={searchQuery} />
         </div>
-        <div class="btn-group">
-          <button type="button" class="chip {filterStatus === 'all' ? 'active' : ''}" onclick={() => filterStatus = 'all'}>{t.all}</button>
-          <button type="button" class="chip {filterStatus === 'enabled' ? 'active' : ''}" onclick={() => filterStatus = 'enabled'}>{t.enabled}</button>
-          <button type="button" class="chip {filterStatus === 'disabled' ? 'active' : ''}" onclick={() => filterStatus = 'disabled'}>{t.disabled}</button>
-        </div>
+        <FacetFilter
+          label={lang === 'en' ? 'State' : '状态'}
+          bind:value={filterStatus}
+          options={[
+            { value: 'all', label: t.all, count: stTotal },
+            { value: 'enabled', label: t.enabled, count: stOn, tone: 'ok' },
+            { value: 'disabled', label: t.disabled, count: stTotal - stOn, tone: 'muted' },
+          ]}
+        />
       </div>
-    {/if}
+      <span class="mono" style="font-size:12px;color:var(--text-muted);">{filteredStun.length} / {stTotal}</span>
+    </div>
+  {/if}
 
-    {#if !settingsJson.stun?.length}
-      <div class="empty-state">{t.common.empty}</div>
-    {:else if !filteredStun.length}
-      <div class="empty-state">{t.common.noMatches}</div>
-    {:else}
-      <div style="display:grid;gap:12px;">
-        {#each filteredStun as { s, idx } (s.name)}
-          {@const st = (dashboard?.stun || []).find((x) => x.name === s.name)}
-          {@const pubAddr = st?.public_addr || dashboard?.stun_public_addrs?.[s.name] || ''}
-          {@const boundPort = resolveBoundRulePort(s.bind_rule)}
-          <div class="subcard">
-            <div class="row-between">
-              <div style="min-width:0;flex:1;">
-                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                  <span class="status-dot {s.enabled ? (st?.status === 'active' ? 'ok' : st?.status === 'error' ? 'danger' : 'warn') : 'muted'}"></span>
-                  <span style="font-weight:700;font-size:15px;">{s.name}</span>
+  {#if !stTotal}
+    <div class="empty-state">{t.common.empty}</div>
+  {:else if !filteredStun.length}
+    <div class="empty-state">{t.common.noMatches}</div>
+  {:else}
+    <div style="display:grid;gap:12px;">
+      {#each filteredStun as { s, idx } (s.name)}
+        {@const st = (dashboard?.stun || []).find((x) => x.name === s.name)}
+        {@const pubAddr = st?.public_addr || dashboard?.stun_public_addrs?.[s.name] || ''}
+        {@const boundPort = resolveBoundRulePort(s.bind_rule)}
+        <div class="card" style="padding:15px 18px;">
+          <div class="row-between">
+            <div style="min-width:0;flex:1;">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                <span class="icon-tile sm {s.enabled ? (st?.status === 'active' ? '' : st?.status === 'error' ? 'danger' : 'warn') : 'muted'}">
+                  <Icons name="stun" size={14} />
+                </span>
+                <span style="font-weight:700;font-size:15px;">{s.name}</span>
                   <span class="badge badge-info mono">
                     {s.proto.toUpperCase()} :{s.local_port || boundPort || 'auto'}
                   </span>
@@ -1174,19 +1210,19 @@
         {/each}
       </div>
     {/if}
-  </div>
 {/if}
 
-<!-- DNS 服务商账号抽屉 -->
-{#if provDrawerOpen && provDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) provDrawerOpen = false; }}>
-    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.dns.addAccount}>
-    <form style="display:contents;" onsubmit={saveProvider}>
-      <div class="drawer-header">
-        <div class="card-title">{provEditId ? t.edit : t.add} · {t.dns.provider}</div>
-        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => provDrawerOpen = false}>{t.cancel}</button>
-      </div>
-      <div class="drawer-body">
+<!-- DNS 服务商账号编辑弹窗 -->
+<EditorDialog
+  open={provDrawerOpen && Boolean(provDraft)}
+  title={`${provEditId ? t.edit : t.add} · ${t.dns.provider}`}
+  size="sm"
+  busy={saving}
+  {t}
+  {askConfirm}
+  onSubmit={saveProvider}
+  onClose={() => (provDrawerOpen = false)}
+>
         <div class="form-grid">
           <div class="field">
             <label for="dp-id">{t.dns.accountId}</label>
@@ -1194,11 +1230,15 @@
           </div>
           <div class="field">
             <label for="dp-kind">{t.dns.provider}</label>
-            <select id="dp-kind" bind:value={provDraft.provider}>
-              <option value="cloudflare">cloudflare</option>
-              <option value="aliyun">aliyun</option>
-              <option value="dnspod">dnspod</option>
-            </select>
+            <Select
+              id="dp-kind"
+              bind:value={provDraft.provider}
+              options={[
+                { value: 'cloudflare', label: 'Cloudflare' },
+                { value: 'aliyun', label: lang === 'en' ? 'Alibaba Cloud DNS' : '阿里云解析 DNS' },
+                { value: 'dnspod', label: lang === 'en' ? 'Tencent DNSPod' : '腾讯云 DNSPod' },
+              ]}
+            />
           </div>
         </div>
         <SecretField
@@ -1245,26 +1285,19 @@
             <input id="dp-he" type="number" min="100" max="2000" bind:value={provDraft.happy_eyeballs_delay_ms} />
           </div>
         </div>
-      </div>
-      <div class="drawer-footer">
-        <button type="button" class="btn" disabled={saving} onclick={() => provDrawerOpen = false}>{t.cancel}</button>
-        <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
-      </div>
-    </form>
-    </div>
-  </div>
-{/if}
+</EditorDialog>
 
-<!-- DDNS 规则抽屉 -->
-{#if ddnsDrawerOpen && ddnsDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) ddnsDrawerOpen = false; }}>
-    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.nav.ddns}>
-    <form style="display:contents;" onsubmit={saveDdns}>
-      <div class="drawer-header">
-        <div class="card-title">{ddnsEditIdx >= 0 ? t.edit : t.add} · {t.nav.ddns}</div>
-        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => ddnsDrawerOpen = false}>{t.cancel}</button>
-      </div>
-      <div class="drawer-body">
+<!-- DDNS 规则编辑弹窗 -->
+<EditorDialog
+  open={ddnsDrawerOpen && Boolean(ddnsDraft)}
+  title={`${ddnsEditIdx >= 0 ? t.edit : t.add} · ${t.nav.ddns}`}
+  size="md"
+  busy={saving}
+  {t}
+  {askConfirm}
+  onSubmit={saveDdns}
+  onClose={() => (ddnsDrawerOpen = false)}
+>
         <div class="form-grid">
           <div class="field">
             <label for="dd-name">{t.ddns.ruleName}</label>
@@ -1276,22 +1309,39 @@
           </div>
           <div class="field">
             <label for="dd-prov">{t.ddns.providerAccount}</label>
-            <select id="dd-prov" bind:value={ddnsDraft.provider}>
-              {#each Object.keys(settingsJson.dns_providers || {}) as pid}
-                <option value={pid}>{pid}</option>
-              {/each}
-              <option value="custom_http">custom_http</option>
-            </select>
+            <Select
+              id="dd-prov"
+              bind:value={ddnsDraft.provider}
+              options={[
+                ...Object.keys(settingsJson.dns_providers || {}).map((k) => ({ value: k, label: k })),
+                { value: 'custom_http', label: lang === 'en' ? 'Custom HTTP Request' : '自定义 HTTP 接口' },
+              ]}
+            />
           </div>
           <div class="field">
             <label for="dd-src">{t.ddns.sourceMode}</label>
-            <select id="dd-src" bind:value={ddnsSourceKind} onchange={onDdnsSourceKindChange}>
-              <option value="interface">interface (WAN)</option>
-              <option value="prefix_and_iid">prefix_and_iid (PD + IID)</option>
-              <option value="neighbor_mac">neighbor_mac (LAN NDP)</option>
-              <option value="external_url">external_url</option>
-              <option value="custom_http_extract">custom_http_extract</option>
-            </select>
+            <Select
+              id="dd-src"
+              bind:value={ddnsSourceKind}
+              options={
+                lang === 'en'
+                  ? [
+                      { value: 'interface', label: 'Router WAN Interface' },
+                      { value: 'prefix_and_iid', label: 'LAN Prefix + Fixed Suffix (IPv6)' },
+                      { value: 'neighbor_mac', label: 'LAN Device by MAC Address (IPv6)' },
+                      { value: 'external_url', label: 'Public IP Check URL' },
+                      { value: 'custom_http_extract', label: 'Extract from Custom HTTP Response' },
+                    ]
+                  : [
+                      { value: 'interface', label: '读取路由器 WAN 网卡地址' },
+                      { value: 'prefix_and_iid', label: '内网前缀 + 固定后缀拼装 (IPv6)' },
+                      { value: 'neighbor_mac', label: '按内网设备 MAC 识别地址 (IPv6)' },
+                      { value: 'external_url', label: '通过外部接口查询公网 IP' },
+                      { value: 'custom_http_extract', label: '从自定义接口响应提取 IP' },
+                    ]
+              }
+              onchange={onDdnsSourceKindChange}
+            />
           </div>
         </div>
 
@@ -1299,7 +1349,7 @@
           <div class="form-grid">
             <div class="field">
               <label for="dd-if">{t.ddns.wanIface}</label>
-              <input id="dd-if" type="text" class="mono" list="ddns-iface-list" bind:value={ddnsDraft.source.name} required />
+              <ComboInput id="dd-if" placeholder="pppoe-wan" options={ifaceOptions} bind:value={ddnsDraft.source.name} required />
             </div>
             <div class="field">
               <label for="dd-sub">{t.ddns.prefSubnet}</label>
@@ -1314,22 +1364,28 @@
           <div class="form-grid">
             <div class="field">
               <label for="dd-pif">{t.ddns.prefixIface}</label>
-              <input id="dd-pif" type="text" class="mono" list="ddns-iface-list" bind:value={ddnsDraft.source.prefix_iface} required />
+              <ComboInput id="dd-pif" placeholder="br-lan" options={ifaceOptions} bind:value={ddnsDraft.source.prefix_iface} required />
             </div>
             <div class="field">
               <label for="dd-iid">{t.ddns.fixedIid}</label>
-              <input id="dd-iid" type="text" class="mono" bind:value={ddnsDraft.source.iid} required />
+              <input id="dd-iid" type="text" class="mono" placeholder="::10" bind:value={ddnsDraft.source.iid} required />
             </div>
           </div>
         {:else if ddnsDraft.source.kind === 'neighbor_mac'}
           <div class="form-grid">
             <div class="field">
               <label for="dd-nif">{t.ddns.prefixIface}</label>
-              <input id="dd-nif" type="text" class="mono" list="ddns-iface-list" bind:value={ddnsDraft.source.prefix_iface} required />
+              <ComboInput id="dd-nif" placeholder="br-lan" options={ifaceOptions} bind:value={ddnsDraft.source.prefix_iface} required />
             </div>
             <div class="field">
               <label for="dd-mac">{t.ddns.targetMac}</label>
-              <input id="dd-mac" type="text" class="mono" list="ddns-mac-list" placeholder="00:11:32:aa:bb:cc" bind:value={ddnsDraft.source.mac} required />
+              <ComboInput
+                id="dd-mac"
+                options={neighborEntries.map((nb) => ({ value: nb.mac, label: nb.mac, sub: `${nb.iface} · ${nb.ip}` }))}
+                placeholder="00:11:32:aa:bb:cc"
+                bind:value={ddnsDraft.source.mac}
+                required
+              />
             </div>
           </div>
         {:else if ddnsDraft.source.kind === 'external_url'}
@@ -1370,11 +1426,7 @@
             <div class="form-grid">
               <div class="field">
                 <label for="dd-chm">{t.ddns.httpMethod}</label>
-                <select id="dd-chm" bind:value={ddnsDraft.custom_http.method}>
-                  <option value="GET">GET</option>
-                  <option value="POST">POST</option>
-                  <option value="PUT">PUT</option>
-                </select>
+                <Select id="dd-chm" mono bind:value={ddnsDraft.custom_http.method} options={['GET', 'POST', 'PUT']} />
               </div>
               <SecretField
                 id="dd-tok"
@@ -1465,12 +1517,16 @@
           <div class="form-grid" style="padding-top:10px;">
             <div class="field">
               <label for="dd-miss">{t.ddns.missingPolicy}</label>
-              <select id="dd-miss" bind:value={ddnsDraft.on_missing_public_ip}>
-                <option value="keep_existing">keep_existing</option>
-                {#if ddnsDraft.provider !== 'custom_http'}
-                  <option value="delete_record">delete_record</option>
-                {/if}
-              </select>
+              <Select
+                id="dd-miss"
+                bind:value={ddnsDraft.on_missing_public_ip}
+                options={[
+                  { value: 'keep_existing', label: lang === 'en' ? 'Keep Existing DNS Record' : '保留原解析记录' },
+                  ...(ddnsDraft.provider !== 'custom_http'
+                    ? [{ value: 'delete_record', label: lang === 'en' ? 'Delete DNS Record' : '删除对应解析记录' }]
+                    : []),
+                ]}
+              />
             </div>
             <div class="field">
               <label for="dd-ttl">{t.ddns.ttl}</label>
@@ -1483,13 +1539,27 @@
             {#if selectedDdnsProviderKind === 'aliyun' || selectedDdnsProviderKind === 'dnspod'}
               <div class="field">
                 <label for="dd-line">{t.ddns.line}</label>
-                <select id="dd-line" bind:value={ddnsDraft.line}>
-                  <option value="default">default</option>
-                  <option value="telecom">telecom</option>
-                  <option value="unicom">unicom</option>
-                  <option value="mobile">mobile</option>
-                  <option value="oversea">oversea</option>
-                </select>
+                <Select
+                  id="dd-line"
+                  bind:value={ddnsDraft.line}
+                  options={
+                    lang === 'en'
+                      ? [
+                          { value: 'default', label: 'Default' },
+                          { value: 'telecom', label: 'China Telecom' },
+                          { value: 'unicom', label: 'China Unicom' },
+                          { value: 'mobile', label: 'China Mobile' },
+                          { value: 'oversea', label: 'Overseas' },
+                        ]
+                      : [
+                          { value: 'default', label: '默认线路' },
+                          { value: 'telecom', label: '中国电信' },
+                          { value: 'unicom', label: '中国联通' },
+                          { value: 'mobile', label: '中国移动' },
+                          { value: 'oversea', label: '境外线路' },
+                        ]
+                  }
+                />
               </div>
             {/if}
             <div class="field">
@@ -1498,26 +1568,19 @@
             </div>
           </div>
         </details>
-      </div>
-      <div class="drawer-footer">
-        <button type="button" class="btn" disabled={saving} onclick={() => ddnsDrawerOpen = false}>{t.cancel}</button>
-        <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
-      </div>
-    </form>
-    </div>
-  </div>
-{/if}
+</EditorDialog>
 
-<!-- ACME 证书抽屉 -->
-{#if acmeDrawerOpen && acmeDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) acmeDrawerOpen = false; }}>
-    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.nav.acme}>
-    <form style="display:contents;" onsubmit={saveAcme}>
-      <div class="drawer-header">
-        <div class="card-title">{acmeEditIdx >= 0 ? t.edit : t.add} · {t.nav.acme}</div>
-        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => acmeDrawerOpen = false}>{t.cancel}</button>
-      </div>
-      <div class="drawer-body">
+<!-- ACME 证书编辑弹窗 -->
+<EditorDialog
+  open={acmeDrawerOpen && Boolean(acmeDraft)}
+  title={`${acmeEditIdx >= 0 ? t.edit : t.add} · ${t.nav.acme}`}
+  size="md"
+  busy={saving}
+  {t}
+  {askConfirm}
+  onSubmit={saveAcme}
+  onClose={() => (acmeDrawerOpen = false)}
+>
         <div class="form-grid">
           <div class="field">
             <label for="ac-dom">{t.acme.primaryDomain}</label>
@@ -1529,33 +1592,34 @@
           </div>
           <div class="field">
             <label for="ac-prov">{t.acme.dnsProvider}</label>
-            <select id="ac-prov" bind:value={acmeDraft.dns_provider} required>
-              {#if !Object.keys(settingsJson.dns_providers || {}).length}
-                <option value="">{lang === 'en' ? '— Add DNS Provider first —' : '— 请先添加 DNS 账号 —'}</option>
-              {/if}
-              {#each Object.keys(settingsJson.dns_providers || {}) as pid (pid)}
-                <option value={pid}>{pid}</option>
-              {/each}
-            </select>
+            <Select
+              id="ac-prov"
+              mono
+              bind:value={acmeDraft.dns_provider}
+              required
+              placeholder={lang === 'en' ? '— Add DNS Provider first —' : '— 请先添加 DNS 账号 —'}
+              options={Object.keys(settingsJson.dns_providers || {})}
+            />
           </div>
           <div class="field">
             <label for="ac-ca">{t.acme.caDir}</label>
-            <select
+            <Select
               id="ac-ca"
               value={acmeCaChoice}
-              onchange={(e) => {
-                acmeCaChoice = e.currentTarget.value;
+              options={[
+                { value: 'letsencrypt', label: "Let's Encrypt (Production)" },
+                { value: 'letsencrypt_staging', label: "Let's Encrypt (Staging)" },
+                { value: 'zerossl', label: 'ZeroSSL' },
+                { value: 'buypass', label: 'Buypass' },
+                { value: 'google', label: 'Google Trust Services' },
+                { value: 'custom', label: 'Custom HTTPS Directory' },
+              ]}
+              onchange={(val) => {
+                acmeCaChoice = val;
                 if (acmeCaChoice !== 'custom') acmeDraft.directory_url = acmeCaChoice;
                 else if (PRESET_CA.has(acmeDraft.directory_url)) acmeDraft.directory_url = 'https://';
               }}
-            >
-              <option value="letsencrypt">Let's Encrypt (Production)</option>
-              <option value="letsencrypt_staging">Let's Encrypt (Staging)</option>
-              <option value="zerossl">ZeroSSL</option>
-              <option value="buypass">Buypass</option>
-              <option value="google">Google Trust Services</option>
-              <option value="custom">Custom HTTPS Directory</option>
-            </select>
+            />
           </div>
         </div>
 
@@ -1569,7 +1633,7 @@
         <div class="form-grid">
           <div class="field">
             <label for="ac-email">{t.acme.email}</label>
-            <input id="ac-email" type="email" bind:value={acmeDraft.email} />
+            <input id="ac-email" type="email" placeholder="admin@example.com" bind:value={acmeDraft.email} />
           </div>
           <div class="field">
             <label for="ac-alias">{t.acme.aliasDomain}</label>
@@ -1593,7 +1657,7 @@
         <div style="margin-bottom:12px;">
           <div class="row-between" style="margin-bottom:6px;">
             <span style="font-size:12.5px;font-weight:600;color:var(--text-secondary);">{t.acme.copyDir}</span>
-            <button type="button" class="btn btn-xs" onclick={addAcmeCopyDir}>+ {t.add}</button>
+            <button type="button" class="btn btn-xs" data-dirty="1" onclick={addAcmeCopyDir}>+ {t.add}</button>
           </div>
           {#each acmeCopyDirs as _dir, cIdx (cIdx)}
             <div style="display:flex;gap:8px;margin-bottom:6px;">
@@ -1603,7 +1667,7 @@
                 placeholder="/mnt/usb/shared-certs"
                 bind:value={acmeCopyDirs[cIdx]}
               />
-              <button type="button" class="btn btn-xs btn-danger" onclick={() => removeAcmeCopyDir(cIdx)}>
+              <button type="button" class="btn btn-xs btn-danger" data-dirty="1" onclick={() => removeAcmeCopyDir(cIdx)}>
                 <Icons name="trash" size={12} />
               </button>
             </div>
@@ -1629,7 +1693,7 @@
         <div style="margin-bottom:12px;">
           <div class="row-between" style="margin-bottom:8px;">
             <span style="font-size:13px;font-weight:600;color:var(--text-secondary);">{t.acme.webhooks}</span>
-            <button type="button" class="btn btn-xs" onclick={addAcmeWebhook}>+ {t.acme.addWebhook}</button>
+            <button type="button" class="btn btn-xs" data-dirty="1" onclick={addAcmeWebhook}>+ {t.acme.addWebhook}</button>
           </div>
           {#each acmeHookEdits as wh, wIdx (wIdx)}
             <div class="subcard" style="margin-bottom:8px;">
@@ -1647,7 +1711,7 @@
                 <label class="check-row" style="min-height:30px;">
                   <input type="checkbox" bind:checked={wh.include_private_key} /> {t.acme.includePrivKey}
                 </label>
-                <button type="button" class="btn btn-xs btn-danger" onclick={() => removeAcmeWebhook(wIdx)}>{t.delete}</button>
+                <button type="button" class="btn btn-xs btn-danger" data-dirty="1" onclick={() => removeAcmeWebhook(wIdx)}>{t.delete}</button>
               </div>
             </div>
           {/each}
@@ -1657,26 +1721,19 @@
           <label class="check-row"><input type="checkbox" bind:checked={acmeDraft.enabled} /> {t.enabled}</label>
           <label class="check-row"><input type="checkbox" bind:checked={acmeDraft.use_for_admin} /> {t.acme.useForAdmin}</label>
         </div>
-      </div>
-      <div class="drawer-footer">
-        <button type="button" class="btn" disabled={saving} onclick={() => acmeDrawerOpen = false}>{t.cancel}</button>
-        <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
-      </div>
-    </form>
-    </div>
-  </div>
-{/if}
+</EditorDialog>
 
-<!-- STUN 规则抽屉 -->
-{#if stunDrawerOpen && stunDraft}
-  <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget && !saving) stunDrawerOpen = false; }}>
-    <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.nav.stun}>
-    <form style="display:contents;" onsubmit={saveStun}>
-      <div class="drawer-header">
-        <div class="card-title">{stunEditIdx >= 0 ? t.edit : t.add} · {t.nav.stun}</div>
-        <button type="button" class="btn btn-sm" disabled={saving} onclick={() => stunDrawerOpen = false}>{t.cancel}</button>
-      </div>
-      <div class="drawer-body">
+<!-- STUN 规则编辑弹窗 -->
+<EditorDialog
+  open={stunDrawerOpen && Boolean(stunDraft)}
+  title={`${stunEditIdx >= 0 ? t.edit : t.add} · ${t.nav.stun}`}
+  size="md"
+  busy={saving}
+  {t}
+  {askConfirm}
+  onSubmit={saveStun}
+  onClose={() => (stunDrawerOpen = false)}
+>
         <div class="form-grid">
           <div class="field">
             <label for="st-name">{t.stun.ruleName}</label>
@@ -1684,10 +1741,7 @@
           </div>
           <div class="field">
             <label for="st-proto">{t.stun.proto}</label>
-            <select id="st-proto" bind:value={stunDraft.proto}>
-              <option value="udp">udp</option>
-              <option value="tcp">tcp</option>
-            </select>
+            <Select id="st-proto" mono bind:value={stunDraft.proto} options={['udp', 'tcp']} />
           </div>
           <div class="field">
             <label for="st-port">{t.stun.localPort}</label>
@@ -1703,24 +1757,27 @@
           </div>
           <div class="field">
             <label for="st-bind">{t.stun.bindRule}</label>
-            <select
+            <Select
               id="st-bind"
               bind:value={stunDraft.bind_rule}
-              onchange={() => {
-                if (stunDraft.bind_rule) stunDraft.local_port = 0;
+              options={[
+                { value: '', label: '— None —' },
+                ...(stunBindRuleDangling
+                  ? [{ value: stunDraft.bind_rule, label: `⚠ ${stunDraft.bind_rule} (${lang === 'en' ? 'missing' : '规则不存在'})` }]
+                  : []),
+                ...(settingsJson.reverse_proxy || []).map((rp) => ({
+                  value: rp.name,
+                  label: `[Proxy] ${rp.name} (:${rp.listen_port})`,
+                })),
+                ...(settingsJson.port_forwards || []).map((pf) => ({
+                  value: pf.name,
+                  label: `[Forward] ${pf.name} (:${pf.listen_port})`,
+                })),
+              ]}
+              onchange={(val) => {
+                if (val) stunDraft.local_port = 0;
               }}
-            >
-              <option value="">— None —</option>
-              {#if stunBindRuleDangling}
-                <option value={stunDraft.bind_rule}>⚠ {stunDraft.bind_rule} ({lang === 'en' ? 'missing' : '规则不存在'})</option>
-              {/if}
-              {#each settingsJson.reverse_proxy || [] as rp (rp.name)}
-                <option value={rp.name}>[Proxy] {rp.name} (:{rp.listen_port})</option>
-              {/each}
-              {#each settingsJson.port_forwards || [] as pf (pf.name)}
-                <option value={pf.name}>[Forward] {pf.name} (:{pf.listen_port})</option>
-              {/each}
-            </select>
+            />
           </div>
         </div>
 
@@ -1755,7 +1812,7 @@
             <div class="form-grid">
               <div class="field">
                 <label for="cf-host">{t.stun.cfHost}</label>
-                <input id="cf-host" type="text" class="mono" bind:value={stunCfDraft.source_host} required />
+                <input id="cf-host" type="text" class="mono" placeholder="go.example.com" bind:value={stunCfDraft.source_host} required />
               </div>
               <div class="field">
                 <label for="cf-tpl">{t.stun.cfTpl}</label>
@@ -1763,12 +1820,7 @@
               </div>
               <div class="field">
                 <label for="cf-code">{t.stun.cfCode}</label>
-                <select id="cf-code" bind:value={stunCfDraft.status_code}>
-                  <option value={301}>301</option>
-                  <option value={302}>302</option>
-                  <option value={307}>307</option>
-                  <option value={308}>308</option>
-                </select>
+                <Select id="cf-code" mono bind:value={stunCfDraft.status_code} options={[301, 302, 307, 308]} />
               </div>
               <div class="field">
                 <label for="cf-zid">{t.stun.cfZone}</label>
@@ -1795,12 +1847,4 @@
             />
           </div>
         {/if}
-      </div>
-      <div class="drawer-footer">
-        <button type="button" class="btn" disabled={saving} onclick={() => stunDrawerOpen = false}>{t.cancel}</button>
-        <button type="submit" class="btn btn-primary" disabled={saving}>{saving ? '...' : t.confirm}</button>
-      </div>
-    </form>
-    </div>
-  </div>
-{/if}
+</EditorDialog>

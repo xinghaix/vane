@@ -1,6 +1,9 @@
 <script>
   import { untrack } from 'svelte';
   import Icons from './Icons.svelte';
+  import MetricRing from './MetricRing.svelte';
+  import EditorDialog from './EditorDialog.svelte';
+  import ComboInput from './ComboInput.svelte';
   import {
     formatKB,
     formatBytes,
@@ -9,9 +12,80 @@
     formatDurationSecs,
     translateRuntimeStatus,
     copyText,
+    splitCsv,
+    joinCsv,
+    deepClone,
   } from '../lib/helpers.js';
 
-  let { t, lang, dashboard, settingsJson, onRefresh, onNavigate, apiFetch, showToast } = $props();
+  let {
+    t,
+    lang,
+    dashboard,
+    settingsJson,
+    networkInfo = null,
+    onEnsureNetworkInfo = null,
+    onSaveSettings = null,
+    askConfirm = null,
+    onRefresh,
+    onNavigate,
+    apiFetch,
+    showToast,
+  } = $props();
+
+  let monSettingsOpen = $state(false);
+  let monSettingsSaving = $state(false);
+  let monIfacesCsv = $state('');
+  let monIntervalDraft = $state(2);
+  let monTopProcsDraft = $state(10);
+  let monTempDraft = $state(85);
+  let monMemDraft = $state(32);
+  let monCooldownDraft = $state(1800);
+  let monThermalDraft = $state('');
+
+  let ifaceOptions = $derived(
+    (networkInfo?.interfaces || []).map((i) => {
+      const ips = [...(i.ipv4 || []), ...(i.ipv6 || [])];
+      return { value: i.iface, label: i.iface, sub: ips.slice(0, 2).join(', ') };
+    })
+  );
+
+  function openMonitorSettings() {
+    if (!settingsJson) return;
+    const m = settingsJson.monitor || {};
+    monIfacesCsv = joinCsv(m.interfaces);
+    monIntervalDraft = Number(m.sample_interval_secs || 2);
+    monTopProcsDraft = Number(m.top_processes || 10);
+    monTempDraft = Number(m.temp_alert_celsius || 85);
+    monMemDraft = Number(m.mem_low_mb ?? 32);
+    monCooldownDraft = Number(m.alert_cooldown_secs || 1800);
+    monThermalDraft = String(m.thermal_path || '');
+    monSettingsOpen = true;
+    onEnsureNetworkInfo?.(false);
+  }
+
+  async function saveMonitorSettings(e) {
+    e.preventDefault();
+    if (monSettingsSaving || !settingsJson || !onSaveSettings) return;
+    monSettingsSaving = true;
+    try {
+      const next = deepClone(settingsJson);
+      next.monitor = {
+        ...next.monitor,
+        interfaces: splitCsv(monIfacesCsv),
+        sample_interval_secs: Math.max(1, Math.min(60, Number(monIntervalDraft) || 2)),
+        top_processes: Math.max(1, Math.min(50, Number(monTopProcsDraft) || 10)),
+        temp_alert_celsius: Math.max(40, Math.min(125, Number(monTempDraft) || 85)),
+        mem_low_mb: Math.max(0, Math.min(4096, Number(monMemDraft) || 0)),
+        alert_cooldown_secs: Math.max(60, Math.min(86400, Number(monCooldownDraft) || 1800)),
+        thermal_path: String(monThermalDraft || '').trim(),
+      };
+      if (await onSaveSettings(next)) {
+        monSettingsOpen = false;
+      }
+    } finally {
+      monSettingsSaving = false;
+    }
+  }
 
   let cpuHistory = $state([]);
   let netHistory = $state([]);
@@ -90,15 +164,21 @@
     return '';
   }
 
-  async function unbanCidr(cidr) {
+  async function unbanCidr(cidr, scope = 'admin') {
     if (unbanBusy) return;
-    unbanBusy = cidr;
+    const effectiveScope = scope || 'admin';
+    const busyKey = `${effectiveScope}:${cidr}`;
+    unbanBusy = busyKey;
     try {
-      const r = await apiFetch(`/api/security/bans/${encodeURIComponent(cidr)}`, { method: 'DELETE' });
+      const r = await apiFetch(
+        `/api/security/bans/${encodeURIComponent(cidr)}?scope=${encodeURIComponent(effectiveScope)}`,
+        { method: 'DELETE' }
+      );
       if (r?.unbanned === false) {
         showToast(t.dash.unbanNotFound, 'info');
       } else {
-        showToast(`${t.dash.unban}: ${cidr}`, 'success');
+        const scopeSuffix = effectiveScope !== 'admin' ? ` (${effectiveScope})` : '';
+        showToast(`${t.dash.unban}: ${cidr}${scopeSuffix}`, 'success');
       }
       await onRefresh(true);
     } catch (err) {
@@ -174,6 +254,31 @@
   let cpuSpark = $derived(buildSpark(cpuHistory, 100));
   let netSpark = $derived(buildSpark(netHistory.map((p) => p.total), 102400));
   let latestNet = $derived(netHistory[netHistory.length - 1] || { total: 0, rx: 0, tx: 0 });
+
+  // StatStrip 概览统计（对齐 Arcane stat-strip-item）
+  let stripStats = $derived.by(() => {
+    const mods = Object.values(dashboard?.module_health || {});
+    const modRun = mods.filter((h) => h?.state === 'running').length;
+    const modWarn = mods.filter((h) => h?.state === 'degraded').length;
+    const modErr = mods.filter((h) => h?.state === 'circuit_open').length;
+
+    const rpList = dashboard?.reverse_proxy_status || [];
+    const pfList = dashboard?.port_forward_status || [];
+    const trafficTotal = rpList.length + pfList.length;
+    const trafficRun = [...rpList, ...pfList].filter((x) => x.status === 'running').length;
+    const trafficErr = [...rpList, ...pfList].filter((x) => x.status === 'failed').length;
+
+    const ddnsList = dashboard?.ddns || [];
+    const certList = dashboard?.certs || [];
+    const domTotal = ddnsList.length + certList.length;
+    const domOk = ddnsList.filter((d) => d.status === 'synced').length + certList.filter((c) => c.status === 'active').length;
+    const domErr = ddnsList.filter((d) => d.status === 'failed').length + certList.filter((c) => c.status === 'failed').length;
+
+    const fwRules = dashboard?.firewall?.rules?.length || 0;
+    const bans = dashboard?.bans?.length || 0;
+
+    return { modTotal: mods.length, modRun, modWarn, modErr, trafficTotal, trafficRun, trafficErr, domTotal, domOk, domErr, fwRules, bans };
+  });
 </script>
 
 {#if !dashboard}
@@ -187,6 +292,55 @@
     {/each}
   </div>
 {:else}
+  <!-- Arcane StatStrip 顶部聚合指标带 -->
+  <div class="stat-strip-card">
+    <div class="stat-strip-grid">
+      <button type="button" class="stat-strip-cell" onclick={() => onNavigate?.('settings')}>
+        <span class="stat-strip-label"><Icons name="grid" size={13} />{lang === 'en' ? 'Active Modules' : '子模块健康'}</span>
+        <span class="stat-strip-val num">{stripStats.modRun}<span style="font-size:15px;color:var(--text-muted);font-weight:500;">/{stripStats.modTotal}</span></span>
+        <span class="stat-strip-bar" aria-hidden="true">
+          {#if stripStats.modRun > 0}<span class="stat-strip-seg" style={`flex:${stripStats.modRun};background:var(--accent);`}></span>{/if}
+          {#if stripStats.modWarn > 0}<span class="stat-strip-seg" style={`flex:${stripStats.modWarn};background:var(--warn);`}></span>{/if}
+          {#if stripStats.modErr > 0}<span class="stat-strip-seg" style={`flex:${stripStats.modErr};background:var(--danger);`}></span>{/if}
+        </span>
+        <span class="stat-strip-sub num">{stripStats.modErr > 0 ? `${stripStats.modErr} ${t.dash.circuitOpen}` : `${stripStats.modRun} ${t.common.statusRunning}`}</span>
+      </button>
+
+      <button type="button" class="stat-strip-cell" onclick={() => onNavigate?.('reverse_proxy')}>
+        <span class="stat-strip-label"><Icons name="reverse_proxy" size={13} />{t.navGroups.traffic}</span>
+        <span class="stat-strip-val num">{stripStats.trafficTotal}</span>
+        <span class="stat-strip-bar" aria-hidden="true">
+          {#if stripStats.trafficRun > 0}<span class="stat-strip-seg" style={`flex:${stripStats.trafficRun};background:var(--accent);`}></span>{/if}
+          {#if stripStats.trafficErr > 0}<span class="stat-strip-seg" style={`flex:${stripStats.trafficErr};background:var(--danger);`}></span>{/if}
+          {#if stripStats.trafficTotal - stripStats.trafficRun - stripStats.trafficErr > 0}<span class="stat-strip-seg" style={`flex:${stripStats.trafficTotal - stripStats.trafficRun - stripStats.trafficErr};background:var(--text-muted);opacity:0.4;`}></span>{/if}
+        </span>
+        <span class="stat-strip-sub num">{stripStats.trafficRun} {t.common.statusRunning}</span>
+      </button>
+
+      <button type="button" class="stat-strip-cell" onclick={() => onNavigate?.('ddns')}>
+        <span class="stat-strip-label"><Icons name="ddns" size={13} />{t.navGroups.domain}</span>
+        <span class="stat-strip-val num">{stripStats.domTotal}</span>
+        <span class="stat-strip-bar" aria-hidden="true">
+          {#if stripStats.domOk > 0}<span class="stat-strip-seg" style={`flex:${stripStats.domOk};background:var(--info);`}></span>{/if}
+          {#if stripStats.domErr > 0}<span class="stat-strip-seg" style={`flex:${stripStats.domErr};background:var(--danger);`}></span>{/if}
+          {#if stripStats.domTotal - stripStats.domOk - stripStats.domErr > 0}<span class="stat-strip-seg" style={`flex:${stripStats.domTotal - stripStats.domOk - stripStats.domErr};background:var(--warn);`}></span>{/if}
+        </span>
+        <span class="stat-strip-sub num">{stripStats.domOk} {lang === 'en' ? 'healthy' : '正常同步'}</span>
+      </button>
+
+      <button type="button" class="stat-strip-cell" onclick={() => (showFwRules = !showFwRules)}>
+        <span class="stat-strip-label"><Icons name="shield" size={13} />{t.dash.wanRules} / {t.dash.activeBans}</span>
+        <span class="stat-strip-val num">{stripStats.fwRules}</span>
+        <span class="stat-strip-bar" aria-hidden="true">
+          {#if stripStats.fwRules > 0}<span class="stat-strip-seg" style={`flex:${stripStats.fwRules};background:var(--accent);`}></span>{/if}
+          {#if stripStats.bans > 0}<span class="stat-strip-seg" style={`flex:${stripStats.bans};background:var(--danger);`}></span>{/if}
+        </span>
+        <span class="stat-strip-sub num" style={stripStats.bans > 0 ? 'color:var(--danger);font-weight:600;' : ''}>
+          {stripStats.bans > 0 ? `${stripStats.bans} ${t.dash.activeBans}` : dashboard.firewall.backend}
+        </span>
+      </button>
+    </div>
+  </div>
   <div class="bento-grid">
     <!-- SoC CPU & 温度 -->
     <div class="card">
@@ -206,17 +360,29 @@
           <span class="badge badge-muted">{t.dash.tempNa}</span>
         {/if}
       </div>
-      <div class="num" style="font-size:28px;font-weight:700;margin-bottom:4px;">
-        {dashboard.system.cpu_usage_percent.toFixed(1)}%
-      </div>
-      <div class="progress-bar">
-        <div
-          class="progress-fill {barTone(dashboard.system.cpu_usage_percent)}"
-          style="width:{Math.min(100, dashboard.system.cpu_usage_percent)}%"
-        ></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:6px;">
+        <div style="min-width:0;">
+          <div class="num" style="font-size:28px;font-weight:700;letter-spacing:-0.02em;line-height:1.1;">
+            {dashboard.system.cpu_usage_percent.toFixed(1)}%
+          </div>
+          <div class="mono" style="font-size:11.5px;color:var(--text-secondary);margin-top:6px;">
+            {t.dash.load}: {dashboard.system.load_avg.map((v) => v.toFixed(2)).join(' / ')}
+          </div>
+          <div class="mono" style="font-size:11.5px;color:var(--text-muted);margin-top:2px;">
+            {t.dash.uptime}: {formatUptime(dashboard.system.uptime_secs)}
+          </div>
+        </div>
+        <MetricRing
+          percent={dashboard.system.cpu_usage_percent}
+          size={58}
+          stroke={5}
+          tone={barTone(dashboard.system.cpu_usage_percent) || 'info'}
+          label={`${Math.round(dashboard.system.cpu_usage_percent)}%`}
+          sub="CPU"
+        />
       </div>
       {#if dashboard.system.cpu_cores_percent?.length > 1}
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(68px,1fr));gap:6px;margin-top:10px;">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(64px,1fr));gap:6px;margin-top:10px;">
           {#each dashboard.system.cpu_cores_percent as pct, idx}
             <div>
               <div class="row-between mono" style="font-size:10.5px;color:var(--text-secondary);">
@@ -230,9 +396,6 @@
           {/each}
         </div>
       {/if}
-      <div class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:10px;">
-        {t.dash.load}: {dashboard.system.load_avg.map((v) => v.toFixed(2)).join(' / ')} · {t.dash.uptime}: {formatUptime(dashboard.system.uptime_secs)}
-      </div>
     </div>
 
     <!-- 物理内存与 Swap / Slab SUnreclaim -->
@@ -241,54 +404,89 @@
         <span class="card-title">{t.dash.memTitle}</span>
         <span class="badge {availBadgeClass} num">{t.dash.avail} {formatKB(dashboard.system.memory.available_kb)}</span>
       </div>
-      <div class="num" style="font-size:25px;font-weight:700;margin-bottom:4px;">
-        {formatKB(dashboard.system.memory.used_kb)}
-        <span style="font-size:15px;color:var(--text-secondary);">/ {formatKB(dashboard.system.memory.total_kb)}</span>
-      </div>
-      <div class="progress-bar">
-        <div class="progress-fill {barTone(memUsedPct)}" style="width:{memUsedPct}%"></div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:6px;">
+        <div style="min-width:0;">
+          <div class="num" style="font-size:24px;font-weight:700;letter-spacing:-0.02em;line-height:1.15;">
+            {formatKB(dashboard.system.memory.used_kb)}
+            <span style="font-size:14px;color:var(--text-secondary);font-weight:500;">/ {formatKB(dashboard.system.memory.total_kb)}</span>
+          </div>
+          <div class="mono" style="font-size:11.5px;color:var(--text-secondary);margin-top:6px;">
+            {t.dash.cached}: {formatKB(dashboard.system.memory.cached_kb)}
+          </div>
+          <div class="mono" style="font-size:11.5px;color:var(--text-muted);margin-top:2px;">
+            {t.dash.slabUnreclaim}: {formatKB(dashboard.system.memory.slab_unreclaim_kb)}
+          </div>
+        </div>
+        <MetricRing
+          percent={memUsedPct}
+          size={58}
+          stroke={5}
+          tone={barTone(memUsedPct) || 'accent'}
+          label={`${Math.round(memUsedPct)}%`}
+          sub="RAM"
+        />
       </div>
       {#if dashboard.system.memory.swap_total_kb > 0}
-        <div style="margin-top:8px;">
+        <div style="margin-top:10px;">
           <div class="row-between mono" style="font-size:11px;color:var(--text-secondary);">
             <span>{t.dash.swap}</span>
             <span>{formatKB(swapUsedKb)} / {formatKB(dashboard.system.memory.swap_total_kb)}</span>
           </div>
-          <div class="progress-bar" style="height:5px;margin:4px 0;">
+          <div class="progress-bar" style="height:5px;margin:4px 0 0;">
             <div class="progress-fill {barTone(swapPct)}" style="width:{swapPct}%"></div>
           </div>
         </div>
       {/if}
-      <div class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:8px;">
-        {t.dash.cached}: {formatKB(dashboard.system.memory.cached_kb)} · {t.dash.slabUnreclaim}: {formatKB(dashboard.system.memory.slab_unreclaim_kb)}
-      </div>
     </div>
 
     <!-- 防火墙与全局连接配额 -->
     <div class="card">
       <div class="card-header">
         <span class="card-title"><Icons name="shield" size={16} />{t.dash.fwTitle}</span>
-        <span class="badge {dashboard.firewall.lockdown ? 'badge-danger' : 'badge-ok'}">
-          {dashboard.firewall.lockdown ? t.dash.lockdownTag : dashboard.firewall.backend}
-        </span>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+          {#if dashboard.firewall.degraded}
+            <span class="badge badge-warn" title={t.dash.fwDegradedBanner}>
+              <Icons name="alert" size={11} />
+              <span>{t.dash.fwDegradedTag}</span>
+            </span>
+          {/if}
+          <span class="badge {dashboard.firewall.lockdown ? 'badge-danger' : dashboard.firewall.degraded ? 'badge-warn' : 'badge-ok'}">
+            {dashboard.firewall.lockdown ? t.dash.lockdownTag : dashboard.firewall.backend}
+          </span>
+        </div>
       </div>
-      <div class="num" style="font-size:28px;font-weight:700;margin-bottom:4px;">
-        {dashboard.active_connections}
-        <span style="font-size:16px;color:var(--text-secondary);">/ {dashboard.max_connections}</span>
+      {#if dashboard.firewall.degraded}
+        <div class="banner banner-warn" role="alert" style="margin-bottom:10px;padding:8px 10px;font-size:12px;">
+          <Icons name="alert" size={14} />
+          <span>{t.dash.fwDegradedBanner}</span>
+        </div>
+      {/if}
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:6px;">
+        <div style="min-width:0;">
+          <div class="num" style="font-size:28px;font-weight:700;letter-spacing:-0.02em;line-height:1.1;">
+            {dashboard.active_connections}
+            <span style="font-size:15px;color:var(--text-secondary);font-weight:500;">/ {dashboard.max_connections}</span>
+          </div>
+          <div class="mono" style="font-size:11.5px;color:var(--text-secondary);margin-top:6px;">
+            {t.dash.wanRules}: {dashboard.firewall.rules.length} · {t.dash.activeBans}: {dashboard.bans.length}
+          </div>
+        </div>
+        <MetricRing
+          percent={quotaPct}
+          size={58}
+          stroke={5}
+          tone={barTone(quotaPct) || 'accent'}
+          label={`${Math.round(quotaPct)}%`}
+          sub="CONN"
+        />
       </div>
-      <div class="progress-bar">
-        <div class="progress-fill {barTone(quotaPct)}" style="width:{quotaPct}%"></div>
-      </div>
-      <div class="row-between" style="margin-top:8px;">
-        <span class="mono" style="font-size:12px;color:var(--text-secondary);">
-          {t.dash.wanRules}: {dashboard.firewall.rules.length} · {t.dash.activeBans}: {dashboard.bans.length}
-        </span>
-        <button type="button" class="btn btn-xs btn-ghost" onclick={() => showFwRules = !showFwRules}>
+      <div style="margin-top:8px;">
+        <button type="button" class="btn btn-xs btn-ghost" style="margin-left:-8px;" onclick={() => showFwRules = !showFwRules}>
           {t.dash.fwRulesToggle}
         </button>
       </div>
       {#if showFwRules}
-        <div class="subcard mono" style="margin-top:10px;padding:10px 12px;font-size:11px;max-height:160px;overflow-y:auto;">
+        <div class="subcard mono" style="margin-top:8px;padding:10px 12px;font-size:11px;max-height:160px;overflow-y:auto;">
           {#if !dashboard.firewall.rules.length}
             <div style="color:var(--text-muted);">{t.dash.noFwRules}</div>
           {:else}
@@ -311,9 +509,17 @@
             {t.dash.trendHint} ({Math.round(pollIntervalMs / 1000)}s)
           </div>
         </div>
-        <span class="mono" style="font-size:12px;color:var(--info);font-weight:600;">
-          ↓ {formatRate(latestNet.rx)} · ↑ {formatRate(latestNet.tx)}
-        </span>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          <span class="mono" style="font-size:12px;color:var(--info);font-weight:600;">
+            ↓ {formatRate(latestNet.rx)} · ↑ {formatRate(latestNet.tx)}
+          </span>
+          {#if settingsJson && onSaveSettings}
+            <button type="button" class="btn btn-xs" onclick={openMonitorSettings}>
+              <Icons name="settings" size={12} />
+              <span>{lang === 'en' ? 'Monitor Settings' : '监控设置'}</span>
+            </button>
+          {/if}
+        </div>
       </div>
       <div style="display:grid;gap:10px;">
         <!-- CPU Sparkline -->
@@ -433,7 +639,7 @@
       <div class="card-header">
         <span class="card-title">{t.dash.healthTitle}</span>
       </div>
-      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:8px;">
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(186px,1fr));gap:8px;">
         {#each Object.entries(dashboard.module_health || {}) as [modName, h] (modName)}
           {@const b = healthBadge(h)}
           {@const canJump = h?.state !== 'disabled' && t.nav[modName]}
@@ -444,15 +650,17 @@
             disabled={!canJump}
             onclick={() => canJump && onNavigate?.(modName)}
           >
-            <div class="row-between">
-              <span style="display:inline-flex;align-items:center;gap:7px;font-size:13px;font-weight:600;">
-                <span class="status-dot {b.dot}"></span>
-                {t.nav[modName] || modName}
+            <div class="row-between" style="gap:8px;">
+              <span style="display:inline-flex;align-items:center;gap:8px;font-size:13px;font-weight:600;min-width:0;">
+                <span class="icon-tile sm {b.dot === 'ok' ? '' : b.dot === 'warn' ? 'warn' : b.dot === 'danger' ? 'danger' : 'muted'}">
+                  <Icons name={modName} size={14} />
+                </span>
+                <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{t.nav[modName] || modName}</span>
               </span>
-              <span class="badge {b.cls}" style="font-size:10.5px;padding:2px 7px;">{b.text}</span>
+              <span class="badge {b.cls}" style="font-size:10.5px;padding:1.5px 7px;">{b.text}</span>
             </div>
             {#if h?.last_error || h?.reason}
-              <div class="mono" style="font-size:11px;color:var(--warn);margin-top:5px;word-break:break-all;">
+              <div class="mono" style="font-size:11px;color:var(--warn);margin-top:6px;word-break:break-all;">
                 {h.last_error || h.reason}
               </div>
             {/if}
@@ -467,7 +675,15 @@
     <div class="card">
       <div class="card-header">
         <span class="card-title">{t.dash.ifaceTitle}</span>
-        <span class="badge badge-info">{dashboard.system.interfaces.length}</span>
+        <div class="btn-group">
+          <span class="badge badge-info">{dashboard.system.interfaces.length}</span>
+          {#if settingsJson && onSaveSettings}
+            <button type="button" class="btn btn-xs" onclick={openMonitorSettings}>
+              <Icons name="settings" size={12} />
+              <span>{lang === 'en' ? 'Select NICs' : '选择网卡'}</span>
+            </button>
+          {/if}
+        </div>
       </div>
       {#if !dashboard.system.interfaces.length}
         <div class="empty-state" style="padding:20px;">{t.dash.noIfaces}</div>
@@ -605,16 +821,23 @@
         <div class="empty-state" style="padding:20px;">{t.dash.noBans}</div>
       {:else}
         <div style="display:grid;gap:8px;">
-          {#each dashboard.bans as ban (ban.cidr)}
+          {#each dashboard.bans as ban (`${ban.scope || 'admin'}:${ban.cidr}`)}
+            {@const banScope = ban.scope || 'admin'}
+            {@const banKey = `${banScope}:${ban.cidr}`}
             <div class="subcard row-between">
               <div style="min-width:0;flex:1;">
-                <div class="mono" style="font-weight:700;color:var(--danger);word-break:break-all;">{ban.cidr}</div>
+                <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+                  <span class="mono" style="font-weight:700;color:var(--danger);word-break:break-all;">{ban.cidr}</span>
+                  {#if ban.scope && ban.scope !== 'admin'}
+                    <span class="badge badge-muted mono" style="font-size:10px;padding:1px 6px;">{ban.scope}</span>
+                  {/if}
+                </div>
                 <div class="mono" style="font-size:11px;color:var(--text-secondary);">
                   {ban.reason} · fails={ban.failures} · {formatDurationSecs(ban.remaining_secs)}
                 </div>
               </div>
-              <button type="button" class="btn btn-sm" disabled={unbanBusy === ban.cidr} onclick={() => unbanCidr(ban.cidr)}>
-                {unbanBusy === ban.cidr ? '...' : t.dash.unban}
+              <button type="button" class="btn btn-sm" disabled={unbanBusy === banKey} onclick={() => unbanCidr(ban.cidr, banScope)}>
+                {unbanBusy === banKey ? '...' : t.dash.unban}
               </button>
             </div>
           {/each}
@@ -624,14 +847,81 @@
 
     <div class="card">
       <div class="card-header"><span class="card-title">{t.dash.procTitle}</span></div>
-      <div style="display:grid;gap:8px;">
-        {#each dashboard.system.top_processes as proc}
-          <div class="subcard row-between" style="padding:8px 12px;font-size:13px;">
-            <span><code class="mono" style="color:var(--text-muted);">#{proc.pid}</code> {proc.name}</span>
-            <span class="mono" style="font-weight:600;">{formatKB(proc.vm_rss_kb)}</span>
-          </div>
-        {/each}
-      </div>
+      {#if !dashboard.system.top_processes?.length}
+        <div class="empty-state" style="padding:20px;">—</div>
+      {:else}
+        {@const maxProcKb = Math.max(1, ...dashboard.system.top_processes.map((p) => Number(p.vm_rss_kb || 0)))}
+        <div class="arcane-table-wrap">
+          <table class="arcane-table">
+            <thead>
+              <tr>
+                <th>PID</th>
+                <th>{lang === 'en' ? 'Process' : '进程'}</th>
+                <th>{lang === 'en' ? 'Memory' : '内存'}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each dashboard.system.top_processes as proc}
+                {@const pct = Math.min(100, (Number(proc.vm_rss_kb || 0) / maxProcKb) * 100)}
+                <tr>
+                  <td class="mono" style="color:var(--text-muted);width:68px;">#{proc.pid}</td>
+                  <td>
+                    <div style="font-weight:500;font-size:13px;">{proc.name}</div>
+                    <div class="progress-bar" style="height:3px;margin:4px 0 0;max-width:160px;">
+                      <div class="progress-fill" style="width:{pct}%;"></div>
+                    </div>
+                  </td>
+                  <td class="mono" style="font-weight:600;white-space:nowrap;">{formatKB(proc.vm_rss_kb)}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
     </div>
   </div>
 {/if}
+
+<!-- 仪表盘监控与告警设置弹窗 -->
+<EditorDialog
+  open={monSettingsOpen}
+  title={t.cfg.groupMonitor}
+  size="md"
+  busy={monSettingsSaving}
+  {t}
+  {askConfirm}
+  onSubmit={saveMonitorSettings}
+  onClose={() => (monSettingsOpen = false)}
+>
+  <div class="field">
+    <label for="dash-mon-if">{t.cfg.lblMonIfaces}</label>
+    <ComboInput id="dash-mon-if" multiple placeholder="pppoe-wan, br-lan" options={ifaceOptions} bind:value={monIfacesCsv} />
+    <div class="field-hint">{t.cfg.descMonIfaces}</div>
+  </div>
+  <div class="form-grid">
+    <div class="field">
+      <label for="dash-mon-iv">{t.cfg.monInterval}</label>
+      <input id="dash-mon-iv" type="number" min="1" max="60" bind:value={monIntervalDraft} required />
+    </div>
+    <div class="field">
+      <label for="dash-mon-tp">{t.cfg.topProcs}</label>
+      <input id="dash-mon-tp" type="number" min="1" max="50" bind:value={monTopProcsDraft} required />
+    </div>
+    <div class="field">
+      <label for="dash-mon-tmp">{t.cfg.lblTempAlert}</label>
+      <input id="dash-mon-tmp" type="number" min="40" max="125" bind:value={monTempDraft} required />
+    </div>
+    <div class="field">
+      <label for="dash-mon-mem">{t.cfg.lblMemLow}</label>
+      <input id="dash-mon-mem" type="number" min="0" max="4096" bind:value={monMemDraft} required />
+    </div>
+    <div class="field">
+      <label for="dash-mon-cd">{t.cfg.alertCooldown}</label>
+      <input id="dash-mon-cd" type="number" min="60" max="86400" bind:value={monCooldownDraft} required />
+    </div>
+    <div class="field">
+      <label for="dash-mon-th">{t.cfg.thermalPath}</label>
+      <input id="dash-mon-th" type="text" class="mono" placeholder="/sys/class/thermal/thermal_zone0/temp" bind:value={monThermalDraft} />
+    </div>
+  </div>
+</EditorDialog>

@@ -1,9 +1,12 @@
 <script>
   import { I18N } from './lib/i18n.js';
   import { localizeError } from './lib/helpers.js';
+  import { getPwaState, initPwaListeners, promptPwaInstall, subscribePwaState } from './lib/pwa.js';
   import Icons from './components/Icons.svelte';
   import ToastStack from './components/ToastStack.svelte';
   import ConfirmModal from './components/ConfirmModal.svelte';
+  import ReauthModal from './components/ReauthModal.svelte';
+  import NotificationInboxPanel from './components/NotificationInboxPanel.svelte';
   import AuthGate from './components/AuthGate.svelte';
   import DashboardView from './components/DashboardView.svelte';
   import NetworkRulesView from './components/NetworkRulesView.svelte';
@@ -27,12 +30,14 @@
 
   function parseHash() {
     const raw = (location.hash || '').replace(/^#\/?/, '');
-    if (!raw) return { tab: 'dashboard', sub: 'general' };
+    if (!raw) return { tab: 'dashboard', sub: 'general', hadHash: false };
     const [tabPart, subPart] = raw.split('/');
-    return {
-      tab: VALID_TABS.has(tabPart) ? tabPart : 'dashboard',
-      sub: ['general', 'security', 'notifications', 'backup'].includes(subPart) ? subPart : 'general',
-    };
+    const tab = VALID_TABS.has(tabPart) ? tabPart : 'dashboard';
+    const sub =
+      tab === 'settings' && ['general', 'appearance', 'security', 'notifications', 'backup', 'update'].includes(subPart)
+        ? subPart
+        : 'general';
+    return { tab, sub, hadHash: true };
   }
 
   const storedLang = localStorage.getItem('vane_lang');
@@ -43,19 +48,69 @@
   let loading = $state(true);
   let authenticated = $state(false);
   let mustChangePassword = $state(false);
+  let initialSetup = $state(false);
   let authConnError = $state('');
   let username = $state('admin');
   let passwordLoginEnabled = $state(true);
   let totpEnabled = $state(false);
-  let hasEd25519Keys = $state(false);
-  let ed25519KeyIds = $state([]);
+  let passkeyEnabled = $state(false);
+  let hasPasskeys = $state(false);
   let sessionTtlSecs = $state(3600);
+  let unreadNotifications = $state(0);
+  let inboxModalOpen = $state(false);
+
+  const MODULE_REAUTH_IDS = new Set([
+    'reverse_proxy',
+    'port_forward',
+    'ddns',
+    'acme',
+    'stun',
+    'web_terminal',
+    'cron',
+    'docker',
+  ]);
+  let moduleReauth = $state({
+    reverse_proxy: false,
+    port_forward: false,
+    ddns: false,
+    acme: false,
+    stun: false,
+    web_terminal: false,
+    cron: false,
+    docker: false,
+  });
+  let unlockedModules = $state({});
+  let nowTick = $state(Date.now());
+
+  const ACCENT_PRESETS = [
+    { id: 'emerald', color: '#10b981' },
+    { id: 'ocean', color: '#0284c7' },
+    { id: 'indigo', color: '#4f46e5' },
+    { id: 'violet', color: '#7c3aed' },
+    { id: 'amber', color: '#d97706' },
+    { id: 'rose', color: '#e11d48' },
+  ];
 
   const initHash = parseHash();
-  let themeMode = $state(localStorage.getItem('vane_theme_mode') || 'dark');
+  let themeMode = $state(localStorage.getItem('vane_theme_mode') || 'auto');
+  let oledMode = $state(localStorage.getItem('vane_oled_mode') === '1');
+  let accentColor = $state(localStorage.getItem('vane_theme_accent') || 'emerald');
+  let sidebarCollapsed = $state(localStorage.getItem('vane_sidebar_collapsed') === '1');
+  let settingsMenuOpen = $state(initHash.tab === 'settings');
+  let userMenuOpen = $state(false);
+  let userBtnEl = $state(null);
+  let mobileUserBtnEl = $state(null);
+  let userMenuStyle = $state('');
+  let sidebarFlyout = $state(null);
   let activeTab = $state(initHash.tab);
   let settingsSubTab = $state(initHash.sub);
-  let mobileMoreOpen = $state(false);
+  let pendingPostLoginRoute = $state(
+    initHash.hadHash ? { tab: initHash.tab, sub: initHash.sub } : null
+  );
+  let mobileDockScrollEl = $state(null);
+  let dockCanScrollLeft = $state(false);
+  let dockCanScrollRight = $state(false);
+  let pwaState = $state(getPwaState());
   let toasts = $state([]);
   let nextToastId = 1;
 
@@ -69,6 +124,20 @@
     busy: false,
     onConfirm: null,
   });
+
+  // 全局敏感操作二次验证弹框（支持密码 / TOTP / 通行密钥）
+  let reauthState = $state({
+    open: false,
+    title: '',
+    description: '',
+    actionLabel: '',
+    unlockModule: '',
+    requireMfa: false,
+    resolve: null,
+  });
+
+  let lockdownWarnings = $state([]);
+  let lockdownKernelEnforced = $state(true);
 
   let modules = $state({
     reverse_proxy: true,
@@ -160,30 +229,133 @@
 
   let navItems = $derived(navGroups.flatMap((g) => g.items));
 
-  let mobilePrimaryItems = $derived.by(() => {
-    const picked = [navItems[0]];
-    for (const candidate of ['reverse_proxy', 'port_forward', 'ddns', 'docker', 'logs']) {
-      if (picked.length >= 3) break;
-      const found = navItems.find((n) => n.id === candidate && !picked.some((p) => p.id === n.id));
-      if (found) picked.push(found);
+  let settingsSubItems = $derived([
+    { id: 'general', icon: 'sliders', label: t.cfg.tabGeneral },
+    { id: 'appearance', icon: 'palette', label: t.cfg.tabAppearance },
+    { id: 'security', icon: 'shield', label: t.cfg.tabSecurity },
+    { id: 'notifications', icon: 'bell', label: t.cfg.tabNotifications },
+    { id: 'backup', icon: 'database', label: t.cfg.tabBackup },
+    { id: 'update', icon: 'refresh', label: t.cfg.tabUpdate },
+  ]);
+
+  let mobileScrollItems = $derived(navItems.filter((n) => n.id !== 'settings'));
+
+  function updateDockScrollState() {
+    const el = mobileDockScrollEl;
+    if (!el) {
+      dockCanScrollLeft = false;
+      dockCanScrollRight = false;
+      return;
     }
-    const settingsItem = navItems.find((n) => n.id === 'settings');
-    if (settingsItem && !picked.some((p) => p.id === 'settings')) picked.push(settingsItem);
-    return picked;
+    dockCanScrollLeft = el.scrollLeft > 4;
+    dockCanScrollRight = el.scrollLeft + el.clientWidth < el.scrollWidth - 4;
+  }
+
+  function handleDockWheel(e) {
+    const el = mobileDockScrollEl;
+    if (!el || el.scrollWidth <= el.clientWidth) return;
+    if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+      e.preventDefault();
+      el.scrollBy({ left: e.deltaY, behavior: 'smooth' });
+    }
+  }
+
+  $effect(() => {
+    const _tab = activeTab;
+    const _len = mobileScrollItems.length;
+    const el = mobileDockScrollEl;
+    if (!el) return;
+    queueMicrotask(() => {
+      if (_tab !== 'settings') {
+        const activeBtn = el.querySelector(`[data-dock-id="${_tab}"]`);
+        activeBtn?.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
+      }
+      updateDockScrollState();
+    });
+    const onResize = () => updateDockScrollState();
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  });
+
+  function toggleUserMenu(anchorEl = null, fromTop = false) {
+    if (userMenuOpen) {
+      userMenuOpen = false;
+      return;
+    }
+    const target = anchorEl || userBtnEl;
+    if (target) {
+      const r = target.getBoundingClientRect();
+      if (fromTop) {
+        const top = Math.round(r.bottom + 8);
+        const right = Math.max(12, Math.round(window.innerWidth - r.right));
+        userMenuStyle = `top:${top}px;right:${right}px;`;
+      } else {
+        const left = Math.min(window.innerWidth - 244, Math.round(r.right + 12));
+        const bottom = Math.max(12, Math.round(window.innerHeight - r.bottom));
+        userMenuStyle = `left:${left}px;bottom:${bottom}px;`;
+      }
+    } else {
+      userMenuStyle = 'left:264px;bottom:14px;';
+    }
+    userMenuOpen = true;
+  }
+
+  $effect(() => {
+    if (!userMenuOpen) return;
+    const onDown = (e) => {
+      if (userBtnEl?.contains(e.target) || mobileUserBtnEl?.contains(e.target)) return;
+      const pop = document.getElementById('vane-user-popover');
+      if (pop?.contains(e.target)) return;
+      userMenuOpen = false;
+    };
+    const onKey = (e) => {
+      if (e.key === 'Escape') userMenuOpen = false;
+    };
+    window.addEventListener('pointerdown', onDown, true);
+    window.addEventListener('keydown', onKey, true);
+    return () => {
+      window.removeEventListener('pointerdown', onDown, true);
+      window.removeEventListener('keydown', onKey, true);
+    };
   });
 
   $effect(() => {
     localStorage.setItem('vane_theme_mode', themeMode);
+    localStorage.setItem('vane_oled_mode', oledMode ? '1' : '0');
+    document.documentElement.setAttribute('data-oled', oledMode ? '1' : '0');
     const mq = window.matchMedia('(prefers-color-scheme: light)');
     const apply = () => {
       const resolved = themeMode === 'auto' ? (mq.matches ? 'light' : 'dark') : themeMode;
       document.documentElement.setAttribute('data-theme', resolved);
       const meta = document.querySelector('meta[name="theme-color"]');
-      if (meta) meta.setAttribute('content', resolved === 'light' ? '#f1f5f9' : '#080a0f');
+      if (meta) meta.setAttribute('content', resolved === 'light' ? '#f6f6f7' : oledMode ? '#000000' : '#09090b');
     };
     apply();
     mq.addEventListener('change', apply);
     return () => mq.removeEventListener('change', apply);
+  });
+
+  $effect(() => {
+    const offWin = initPwaListeners();
+    const offSub = subscribePwaState((snap) => {
+      pwaState = snap;
+    });
+    return () => {
+      offSub();
+      offWin();
+    };
+  });
+
+  async function handleInstallPwa() {
+    const outcome = await promptPwaInstall();
+    if (outcome === 'accepted') {
+      showToast(t.cfg.pwaInstalledToast, 'success');
+    }
+  }
+
+  $effect(() => {
+    localStorage.setItem('vane_theme_accent', accentColor);
+    document.documentElement.setAttribute('data-accent', accentColor);
   });
 
   $effect(() => {
@@ -202,13 +374,41 @@
   }
 
   $effect(() => {
-    if (activeTab === 'web_terminal' && modules.web_terminal) {
+    if (!Object.keys(unlockedModules).length) return;
+    const timer = setInterval(() => {
+      nowTick = Date.now();
+    }, 15_000);
+    return () => clearInterval(timer);
+  });
+
+  function syncUnlockedModules(remMap) {
+    if (!remMap || typeof remMap !== 'object') return;
+    const now = Date.now();
+    const next = {};
+    for (const [k, secs] of Object.entries(remMap)) {
+      const n = Number(secs || 0);
+      if (n > 0) next[k] = now + n * 1000;
+    }
+    unlockedModules = next;
+    nowTick = now;
+  }
+
+  function isModuleProtected(id) {
+    return MODULE_REAUTH_IDS.has(id) && Boolean(moduleReauth?.[id]);
+  }
+
+  function isModuleLocked(id) {
+    return isModuleProtected(id) && !(Number(unlockedModules?.[id] || 0) > nowTick);
+  }
+
+  $effect(() => {
+    if (activeTab === 'web_terminal' && modules.web_terminal && !isModuleLocked('web_terminal')) {
       ptyEverOpened = true;
       if (!TerminalComp && !ptyLoadError) {
         loadTerminalChunk();
       }
     }
-    if (!modules.web_terminal) {
+    if (!modules.web_terminal || isModuleLocked('web_terminal')) {
       ptyEverOpened = false;
     }
   });
@@ -216,6 +416,12 @@
   function isTabAvailable(tab) {
     if (['dashboard', 'logs', 'settings'].includes(tab)) return true;
     return Boolean(modules[tab]);
+  }
+
+  function clearUrlHash() {
+    if (location.hash) {
+      history.replaceState(null, '', `${location.pathname}${location.search}`);
+    }
   }
 
   function syncUrlHash(tab, sub = settingsSubTab, push = false) {
@@ -227,36 +433,134 @@
   }
 
   function handleHashChange() {
-    const { tab, sub } = parseHash();
+    const { tab, sub, hadHash } = parseHash();
+    if (!authenticated || mustChangePassword) {
+      if (hadHash) {
+        pendingPostLoginRoute = { tab, sub };
+        clearUrlHash();
+      }
+      return;
+    }
     const safeTab = isTabAvailable(tab) ? tab : 'dashboard';
-    if (safeTab !== tab) syncUrlHash(safeTab, 'general', false);
-    if (safeTab !== activeTab || sub !== settingsSubTab) {
+    const safeSub = safeTab === 'settings' ? sub : 'general';
+    if (safeTab !== tab || safeSub !== sub) {
+      syncUrlHash(safeTab, safeSub, false);
+    }
+    if (safeTab !== activeTab || safeSub !== settingsSubTab) {
       activeTab = safeTab;
-      settingsSubTab = safeTab === 'settings' ? sub : 'general';
+      settingsSubTab = safeSub;
       refreshActiveView(true);
     }
   }
 
-  function toggleLang() {
-    lang = lang === 'zh' ? 'en' : 'zh';
+  function toggleSidebar() {
+    sidebarCollapsed = !sidebarCollapsed;
+    sidebarFlyout = null;
+    localStorage.setItem('vane_sidebar_collapsed', sidebarCollapsed ? '1' : '0');
+  }
+
+  function showSidebarFlyout(el, info) {
+    if (!sidebarCollapsed || !el) return;
+    const rect = el.getBoundingClientRect();
+    const centerY = rect.top + rect.height / 2;
+    const top = Math.max(28, Math.min(centerY, window.innerHeight - 40));
+    sidebarFlyout = {
+      top: Math.round(top),
+      left: Math.round(rect.right + 12),
+      ...info,
+    };
+  }
+
+  function hideSidebarFlyout() {
+    sidebarFlyout = null;
+  }
+
+  function buildNavFlyout(item, groupLabel) {
+    const dot = moduleStatusDot(item.id);
+    const en = lang === 'en';
+    let badge = typeof item.count === 'number' ? String(item.count) : '';
+    let desc = groupLabel;
+    let statusLabel = '';
+    let statusKind = '';
+
+    if (dot === 'danger') {
+      statusLabel = t.dash.circuitOpen;
+      statusKind = 'danger';
+    } else if (dot === 'warn') {
+      statusLabel = item.id === 'dashboard' ? (en ? 'Active bans' : '活跃封禁') : t.statuses.degraded;
+      statusKind = 'warn';
+    }
+
+    if (item.id === 'dashboard') {
+      const bans = dashboard?.bans?.length || 0;
+      if (bans > 0) badge = `${bans}`;
+      if (dashboard?.system) {
+        const cpu = Math.round(dashboard.system.cpu_usage_pct || 0);
+        const load = Number(dashboard.system.load_1m || 0).toFixed(2);
+        desc = `CPU ${cpu}% · ${t.dash.load} ${load}`;
+      }
+    } else if (item.id === 'reverse_proxy') {
+      const listeners = settingsJson?.reverse_proxy || [];
+      const rules = listeners.reduce((n, l) => n + (l.rules?.length || 0), 0);
+      desc = en
+        ? `${groupLabel} · ${listeners.length} listeners / ${rules} rules`
+        : `${groupLabel} · ${listeners.length} 监听器 / ${rules} 条规则`;
+    } else if (item.id === 'port_forward') {
+      const list = settingsJson?.port_forwards || [];
+      const on = list.filter((p) => p.enabled).length;
+      desc = en ? `${groupLabel} · ${on}/${list.length} enabled` : `${groupLabel} · ${on}/${list.length} 已启用`;
+    } else if (item.id === 'ddns') {
+      const list = settingsJson?.ddns || [];
+      const on = list.filter((d) => d.enabled).length;
+      desc = en ? `${groupLabel} · ${on}/${list.length} enabled` : `${groupLabel} · ${on}/${list.length} 已启用`;
+    } else if (item.id === 'acme') {
+      const list = settingsJson?.acme || [];
+      const active = (dashboard?.certs || []).filter((c) => c.status === 'active').length;
+      desc = en ? `${groupLabel} · ${active}/${list.length} active certs` : `${groupLabel} · ${active}/${list.length} 有效证书`;
+    } else if (item.id === 'stun') {
+      const list = settingsJson?.stun || [];
+      const on = list.filter((s) => s.enabled).length;
+      desc = en ? `${groupLabel} · ${on}/${list.length} enabled` : `${groupLabel} · ${on}/${list.length} 已启用`;
+    } else if (item.id === 'docker') {
+      const running = (containers || []).filter((c) => c.state === 'running').length;
+      desc = containers.length
+        ? en
+          ? `${groupLabel} · ${running}/${containers.length} running`
+          : `${groupLabel} · ${running}/${containers.length} 运行中`
+        : `${groupLabel} · Docker Socket`;
+    } else if (item.id === 'web_terminal') {
+      desc = en ? `${groupLabel} · Interactive PTY Shell` : `${groupLabel} · 交互式 PTY 伪终端`;
+    } else if (item.id === 'cron') {
+      const list = settingsJson?.cron || [];
+      const on = list.filter((c) => c.enabled).length;
+      desc = en ? `${groupLabel} · ${on}/${list.length} enabled` : `${groupLabel} · ${on}/${list.length} 已启用`;
+    } else if (item.id === 'logs') {
+      desc = logs.length
+        ? `${groupLabel} · ${logs.length} / ${logCapacity}`
+        : en
+          ? `${groupLabel} · In-memory ring log`
+          : `${groupLabel} · 内存环形运行日志`;
+    } else if (item.id === 'settings') {
+      const onMods = Object.values(modules || {}).filter(Boolean).length;
+      desc = en ? `${groupLabel} · ${onMods}/8 modules on` : `${groupLabel} · ${onMods}/8 子模块已开启`;
+    }
+
+    const lockState = isModuleProtected(item.id)
+      ? isModuleLocked(item.id)
+        ? 'locked'
+        : 'unlocked'
+      : '';
+    return { title: item.label, badge, desc, statusLabel, statusKind, lockState };
+  }
+
+  function selectLang(nextLang) {
+    lang = nextLang === 'en' ? 'en' : 'zh';
     hasExplicitLang = true;
     localStorage.setItem('vane_lang', lang);
   }
 
-  function cycleTheme() {
-    themeMode = themeMode === 'dark' ? 'light' : themeMode === 'light' ? 'auto' : 'dark';
-  }
-
-  function themeLabel() {
-    if (themeMode === 'light') return t.themeLight;
-    if (themeMode === 'auto') return t.themeAuto;
-    return t.themeDark;
-  }
-
-  function themeIcon() {
-    if (themeMode === 'light') return 'sun';
-    if (themeMode === 'auto') return 'monitor';
-    return 'moon';
+  function toggleLang() {
+    selectLang(lang === 'zh' ? 'en' : 'zh');
   }
 
   function dismissToast(id) {
@@ -283,9 +587,9 @@
     toastTimers.set(id, setTimeout(() => dismissToast(id), duration));
   }
 
-  function showToast(msg, type = 'info') {
+  function showToast(msg, type = 'info', customDuration = 0) {
     const id = nextToastId++;
-    const duration = type === 'error' || type === 'warn' ? 6000 : 3500;
+    const duration = customDuration > 0 ? customDuration : type === 'error' || type === 'warn' ? 6000 : 3500;
     toasts = [...toasts.slice(-3), { id, message: String(msg), type }];
     toastTimers.set(id, setTimeout(() => dismissToast(id), duration));
   }
@@ -316,6 +620,75 @@
     }
   }
 
+  function requestReauth({ title = '', description = '', actionLabel = '', unlockModule = '', requireMfa = false } = {}) {
+    return new Promise((resolve) => {
+      if (reauthState.open && reauthState.resolve) {
+        reauthState.resolve(null);
+      }
+      reauthState = {
+        open: true,
+        title,
+        description,
+        actionLabel,
+        unlockModule,
+        requireMfa: Boolean(requireMfa),
+        resolve,
+      };
+    });
+  }
+
+  function finishReauth(token, unlockedMap = null) {
+    if (unlockedMap) syncUnlockedModules(unlockedMap);
+    const fn = reauthState.resolve;
+    reauthState = {
+      open: false,
+      title: '',
+      description: '',
+      actionLabel: '',
+      unlockModule: '',
+      requireMfa: false,
+      resolve: null,
+    };
+    fn?.(token || null);
+  }
+
+  async function unlockModuleFlow(modId) {
+    const modName = t.nav?.[modId] || modId;
+    const tok = await requestReauth({
+      title: t.reauth.moduleTitle.replace('{name}', modName),
+      description: t.reauth.moduleDesc,
+      actionLabel: t.reauth.unlockBtn,
+      unlockModule: modId,
+    });
+    if (tok && modId === 'docker' && modules.docker && containers.length === 0) {
+      apiFetch('/api/docker/containers')
+        .then((r) => {
+          containers = r.containers || [];
+          dockerError = '';
+        })
+        .catch(() => {});
+    }
+    return tok;
+  }
+
+  async function relockCurrentModule(modId) {
+    try {
+      const r = await apiFetch('/api/auth/module-lock', {
+        method: 'POST',
+        body: JSON.stringify({ module: modId }),
+      });
+      syncUnlockedModules(r.unlocked_modules || {});
+      showToast(t.reauth.relockedToast, 'info');
+      if (activeTab === modId) {
+        activeTab = 'dashboard';
+        syncUrlHash('dashboard', 'general', false);
+        await refreshActiveView(true);
+      }
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  }
+
   function moduleStatusDot(id) {
     if (id === 'dashboard') {
       if ((dashboard?.bans?.length || 0) > 0) return 'warn';
@@ -327,7 +700,7 @@
     return '';
   }
 
-  function clearSessionState() {
+  function clearSessionState(wipeRoute = false) {
     authenticated = false;
     mustChangePassword = false;
     dashboard = null;
@@ -338,8 +711,40 @@
     logs = [];
     logModules = [];
     restartRequiredFields = [];
-    mobileMoreOpen = false;
     ptyEverOpened = false;
+    unreadNotifications = 0;
+    inboxModalOpen = false;
+    userMenuOpen = false;
+    unlockedModules = {};
+    lockdownWarnings = [];
+    lockdownKernelEnforced = true;
+    if (wipeRoute) {
+      pendingPostLoginRoute = null;
+      activeTab = 'dashboard';
+      settingsSubTab = 'general';
+    } else if (activeTab !== 'dashboard' || settingsSubTab !== 'general') {
+      pendingPostLoginRoute = { tab: activeTab, sub: settingsSubTab };
+    }
+    clearUrlHash();
+  }
+
+  function extractApiErrorCode(data) {
+    if (!data || typeof data !== 'object') return '';
+    if (typeof data.code === 'string' && data.code.trim()) return data.code.trim();
+    if (typeof data.error === 'string' && /^[A-Z0-9_]+$/.test(data.error.trim())) return data.error.trim();
+    return '';
+  }
+
+  function makeApiError(resStatus, data, fallbackMsg = '') {
+    const code = extractApiErrorCode(data);
+    const rawMsg = data?.message || data?.error || fallbackMsg || `HTTP ${resStatus}`;
+    const err = new Error(localizeError(rawMsg, lang, code));
+    err.status = resStatus;
+    err.code = code;
+    err.data = data || {};
+    err.mfa_required = Boolean(data?.mfa_required || code === 'MFA_REAUTH_REQUIRED');
+    err.module = data?.module || '';
+    return err;
   }
 
   async function apiFetch(path, options = {}) {
@@ -348,16 +753,26 @@
       ...options,
     });
     const data = await res.json().catch(() => ({}));
-    if (res.status === 403 && data.error === 'MUST_CHANGE_INITIAL_PASSWORD') {
+    const errCode = extractApiErrorCode(data);
+    if (res.status === 403 && errCode === 'MUST_CHANGE_INITIAL_PASSWORD') {
       mustChangePassword = true;
-      throw new Error(localizeError(data.message || 'Must change initial password', lang, data.error));
+      throw makeApiError(res.status, data, 'Must change initial password');
+    }
+    if (res.status === 403 && errCode === 'MODULE_REAUTH_REQUIRED' && data.module) {
+      const copy = { ...unlockedModules };
+      delete copy[data.module];
+      unlockedModules = copy;
     }
     if (res.status === 401 && !path.startsWith('/api/auth/')) {
       clearSessionState();
-      throw new Error(t.errors.UNAUTHORIZED);
+      const err = new Error(t.errors.UNAUTHORIZED);
+      err.status = 401;
+      err.code = 'UNAUTHORIZED';
+      err.data = data;
+      throw err;
     }
     if (!res.ok) {
-      throw new Error(localizeError(data.message || data.error || `HTTP ${res.status}`, lang, data.error));
+      throw makeApiError(res.status, data);
     }
     return data;
   }
@@ -365,16 +780,20 @@
   function applyAuthStatus(st) {
     authenticated = Boolean(st.authenticated);
     mustChangePassword = Boolean(st.must_change_password);
+    if ('initial_setup' in st) initialSetup = Boolean(st.initial_setup);
     username = st.username || 'admin';
     if ('password_login_enabled' in st) passwordLoginEnabled = Boolean(st.password_login_enabled);
     if ('totp_enabled' in st) totpEnabled = Boolean(st.totp_enabled);
-    if ('has_ed25519_keys' in st) hasEd25519Keys = Boolean(st.has_ed25519_keys);
-    if (Array.isArray(st.ed25519_key_ids)) ed25519KeyIds = st.ed25519_key_ids;
+    if ('passkey_enabled' in st) passkeyEnabled = Boolean(st.passkey_enabled);
+    if ('has_passkeys' in st) hasPasskeys = Boolean(st.has_passkeys);
     sessionTtlSecs = st.session_ttl_secs || 3600;
     if (st.language && !hasExplicitLang) {
       lang = st.language === 'en' ? 'en' : 'zh';
     }
     if (st.modules) modules = st.modules;
+    if (st.module_reauth) moduleReauth = st.module_reauth;
+    if (st.unlocked_modules) syncUnlockedModules(st.unlocked_modules);
+    if (typeof st.unread_notifications === 'number') unreadNotifications = st.unread_notifications;
   }
 
   async function checkAuthStatus() {
@@ -384,14 +803,20 @@
       const st = await apiFetch('/api/auth/status');
       applyAuthStatus(st);
       if (authenticated && !mustChangePassword) {
-        if (!modules[activeTab] && !['dashboard', 'logs', 'settings'].includes(activeTab)) {
+        pendingPostLoginRoute = null;
+        if (!isTabAvailable(activeTab)) {
           activeTab = 'dashboard';
+          settingsSubTab = 'general';
         }
+        syncUrlHash(activeTab, settingsSubTab, false);
         await refreshActiveView();
+      } else {
+        clearUrlHash();
       }
     } catch (err) {
       authenticated = false;
       authConnError = err?.message || 'Connection failed';
+      clearUrlHash();
     } finally {
       loading = false;
     }
@@ -411,18 +836,37 @@
     applyAuthStatus(st);
     if (toastMsg) showToast(toastMsg, 'success');
     if (authenticated && !mustChangePassword) {
+      if (pendingPostLoginRoute) {
+        activeTab = pendingPostLoginRoute.tab;
+        settingsSubTab = pendingPostLoginRoute.sub;
+        pendingPostLoginRoute = null;
+      }
       if (!isTabAvailable(activeTab)) {
         activeTab = 'dashboard';
+        settingsSubTab = 'general';
       }
+      if (activeTab === 'settings') settingsMenuOpen = true;
       syncUrlHash(activeTab, settingsSubTab, false);
       await refreshActiveView();
+    } else {
+      clearUrlHash();
     }
   }
 
   async function logout() {
     await apiFetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
-    clearSessionState();
+    clearSessionState(true);
     await checkAuthStatus();
+  }
+
+  function requestLogout() {
+    askConfirm({
+      title: t.logoutConfirmTitle,
+      message: t.logoutConfirmDesc,
+      confirmLabel: t.logout,
+      danger: true,
+      onConfirm: logout,
+    });
   }
 
   async function ensureNetworkInfo(force = false) {
@@ -444,14 +888,20 @@
       if (['dashboard', 'reverse_proxy', 'port_forward', 'ddns', 'acme', 'stun', 'cron'].includes(tab)) {
         tasks.push(
           apiFetch('/api/dashboard').then((r) => {
-            if (myNonce === refreshNonce) dashboard = r;
+            if (myNonce === refreshNonce) {
+              dashboard = r;
+              if (typeof r?.unread_notifications === 'number') unreadNotifications = r.unread_notifications;
+            }
           })
         );
       } else if (!dashboard) {
         tasks.push(
           apiFetch('/api/dashboard')
             .then((r) => {
-              if (myNonce === refreshNonce) dashboard = r;
+              if (myNonce === refreshNonce) {
+                dashboard = r;
+                if (typeof r?.unread_notifications === 'number') unreadNotifications = r.unread_notifications;
+              }
             })
             .catch(() => {})
         );
@@ -482,6 +932,7 @@
               if (myNonce !== refreshNonce) return;
               settingsJson = r;
               if (r?.modules) modules = r.modules;
+              if (r?.module_reauth) moduleReauth = r.module_reauth;
             })
           );
         }
@@ -491,7 +942,7 @@
         tasks.push(ensureNetworkInfo(!silent));
       }
 
-      if ((tab === 'docker' || tab === 'web_terminal' || tab === 'cron') && modules.docker) {
+      if ((tab === 'docker' || tab === 'web_terminal' || tab === 'cron') && modules.docker && !isModuleLocked('docker')) {
         tasks.push(
           apiFetch('/api/docker/containers')
             .then((r) => {
@@ -546,25 +997,58 @@
 
   async function switchTab(id, sub = 'general') {
     if (!isTabAvailable(id)) return;
+    if (isModuleLocked(id)) {
+      const tok = await unlockModuleFlow(id);
+      if (!tok) return;
+    }
     activeTab = id;
     if (id === 'settings') settingsSubTab = sub;
-    mobileMoreOpen = false;
     syncUrlHash(id, settingsSubTab, true);
     await refreshActiveView();
   }
 
+  async function navigateTarget(target) {
+    const raw = String(target || 'dashboard').replace(/^#\/?/, '');
+    const [tabPart, subPart] = raw.split('/');
+    if (tabPart === 'settings') {
+      const validSub = ['general', 'appearance', 'security', 'notifications', 'backup', 'update'].includes(subPart)
+        ? subPart
+        : 'general';
+      await switchTab('settings', validSub);
+      return;
+    }
+    if (VALID_TABS.has(tabPart) && isTabAvailable(tabPart)) {
+      await switchTab(tabPart);
+      return;
+    }
+    showToast(t.errors.MODULE_DISABLED, 'warn');
+  }
+
   async function toggleModule(key) {
+    const turningOff = Boolean(modules[key]);
+    let reauthToken = '';
+    if (turningOff && isModuleLocked(key)) {
+      const tok = await requestReauth({
+        title: t.reauth.disableModuleTitle,
+        description: t.reauth.disableModuleDesc.replace('{name}', t.nav[key] || key),
+        actionLabel: t.reauth.verifyBtn,
+      });
+      if (!tok) return;
+      reauthToken = tok;
+    }
     const updated = { ...modules, [key]: !modules[key] };
     try {
+      const payload = reauthToken ? { ...updated, reauth_token: reauthToken } : updated;
       const r = await apiFetch('/api/modules', {
         method: 'PUT',
-        body: JSON.stringify(updated),
+        body: JSON.stringify(payload),
       });
       modules = r.modules;
+      if (r.unlocked_modules) syncUnlockedModules(r.unlocked_modules);
       if (settingsJson) settingsJson.modules = r.modules;
       if (!modules[activeTab] && !['dashboard', 'logs', 'settings'].includes(activeTab)) {
         activeTab = 'settings';
-        syncUrlHash(activeTab, settingsSubTab);
+        syncUrlHash(activeTab, settingsSubTab, false);
       }
       showToast(`${t.nav[key] || key}: ${modules[key] ? t.enabled : t.disabled}`, 'success');
       await refreshActiveView();
@@ -573,25 +1057,113 @@
     }
   }
 
-  async function saveFullSettings(nextObj, renames = []) {
+  async function toggleModuleReauth(key, retryState = {}) {
+    const wasOn = Boolean(moduleReauth?.[key]);
+    let reauthToken = retryState.reauthToken || '';
+    if (wasOn && !reauthToken) {
+      const tok = await requestReauth({
+        title: t.reauth.disableModuleReauthTitle,
+        description: t.reauth.disableModuleReauthDesc.replace('{name}', t.nav[key] || key),
+        actionLabel: t.reauth.verifyBtn,
+        requireMfa: true,
+      });
+      if (!tok) return;
+      reauthToken = tok;
+    }
+    try {
+      const r = await apiFetch('/api/modules/reauth', {
+        method: 'PUT',
+        headers: reauthToken ? { 'x-vane-reauth-token': reauthToken } : {},
+        body: JSON.stringify({
+          module: key,
+          require_reauth: !wasOn,
+          reauth_token: reauthToken,
+        }),
+      });
+      if (r.module_reauth) moduleReauth = r.module_reauth;
+      if (r.unlocked_modules) syncUnlockedModules(r.unlocked_modules);
+      if (settingsJson) {
+        settingsJson.module_reauth = moduleReauth;
+        if (settingsJson.web_terminal && key === 'web_terminal') {
+          settingsJson.web_terminal.require_reauth = Boolean(moduleReauth.web_terminal);
+        }
+      }
+      showToast(
+        `${t.nav[key] || key}: ${!wasOn ? t.cfg.moduleReauthEnabledToast : t.cfg.moduleReauthDisabledToast}`,
+        'success'
+      );
+    } catch (err) {
+      if (
+        err?.status === 403 &&
+        (err?.code === 'MFA_REAUTH_REQUIRED' || err?.code === 'REAUTH_REQUIRED') &&
+        !retryState.retried
+      ) {
+        const tok = await requestReauth({
+          title: t.reauth.disableModuleReauthTitle,
+          description: t.reauth.disableModuleReauthDesc.replace('{name}', t.nav[key] || key),
+          actionLabel: t.reauth.verifyBtn,
+          requireMfa: Boolean(err?.mfa_required || err?.code === 'MFA_REAUTH_REQUIRED'),
+        });
+        if (!tok) return;
+        return toggleModuleReauth(key, { retried: true, reauthToken: tok });
+      }
+      showToast(err.message, 'error');
+    }
+  }
+
+  async function saveFullSettings(nextObj, renames = [], extraHeaders = {}, retryState = {}) {
     try {
       const payload = renames?.length ? { ...nextObj, _renames: renames } : nextObj;
       const res = await fetch('/api/settings', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...(extraHeaders || {}) },
         body: JSON.stringify(payload),
       });
       const data = await res.json().catch(() => ({}));
-      if (res.status === 403 && data.error === 'MUST_CHANGE_INITIAL_PASSWORD') {
+      const errCode = extractApiErrorCode(data);
+      if (res.status === 403 && errCode === 'MUST_CHANGE_INITIAL_PASSWORD') {
         mustChangePassword = true;
-        throw new Error(localizeError(data.message, lang, data.error));
+        throw makeApiError(res.status, data);
+      }
+      if (res.status === 403 && errCode === 'MODULE_REAUTH_REQUIRED' && data.module) {
+        const copy = { ...unlockedModules };
+        delete copy[data.module];
+        unlockedModules = copy;
+        const retriedModules = retryState.retriedModules instanceof Set ? retryState.retriedModules : new Set();
+        if (!retriedModules.has(data.module)) {
+          const tok = await unlockModuleFlow(data.module);
+          if (!tok) return false;
+          const nextRetried = new Set(retriedModules);
+          nextRetried.add(data.module);
+          return saveFullSettings(nextObj, renames, extraHeaders, { ...retryState, retriedModules: nextRetried });
+        }
+      }
+      if (
+        res.status === 403 &&
+        (errCode === 'REAUTH_REQUIRED' || errCode === 'MFA_REAUTH_REQUIRED') &&
+        !retryState.retriedReauth
+      ) {
+        const needMfa = Boolean(data.mfa_required || errCode === 'MFA_REAUTH_REQUIRED');
+        const tok = await requestReauth({
+          title: t.reauth.sensitiveSettingsTitle,
+          description: needMfa ? t.reauth.sensitiveSettingsMfaDesc : t.reauth.sensitiveSettingsDesc,
+          actionLabel: t.saveSettings,
+          requireMfa: needMfa,
+        });
+        if (!tok) return false;
+        return saveFullSettings(
+          nextObj,
+          renames,
+          { ...(extraHeaders || {}), 'x-vane-reauth-token': tok },
+          { ...retryState, retriedReauth: true }
+        );
       }
       if (res.status === 401) {
         clearSessionState();
         throw new Error(t.errors.UNAUTHORIZED);
       }
       if (!res.ok) {
-        throw new Error(localizeError(data.message || data.error || `HTTP ${res.status}`, lang, data.error));
+        throw makeApiError(res.status, data);
       }
       const restartHdr = res.headers.get('x-vane-restart-required');
       if (restartHdr) {
@@ -604,6 +1176,9 @@
       settingsJson = data;
       if (data?.modules) modules = data.modules;
       if (data?.admin?.session_ttl_secs) sessionTtlSecs = data.admin.session_ttl_secs;
+      if (data?.admin && 'password_login_enabled' in data.admin) {
+        passwordLoginEnabled = Boolean(data.admin.password_login_enabled);
+      }
       await refreshActiveView(true);
       return true;
     } catch (err) {
@@ -624,13 +1199,29 @@
             method: 'POST',
             body: JSON.stringify({ enable }),
           });
+          const isActive = 'lockdown' in r ? Boolean(r.lockdown) : Boolean(r.active);
+          const warnings = Array.isArray(r.warnings)
+            ? r.warnings.map((w) => String(w || '').trim()).filter(Boolean)
+            : [];
+          const kernelEnforced = r.kernel_enforced !== false;
+          lockdownWarnings = isActive ? warnings : [];
+          lockdownKernelEnforced = isActive ? kernelEnforced : true;
+
           if (dashboard?.firewall) {
             dashboard = {
               ...dashboard,
-              firewall: { ...dashboard.firewall, lockdown: Boolean(r.lockdown) },
+              firewall: { ...dashboard.firewall, lockdown: isActive },
             };
           }
-          showToast(r.lockdown ? t.lockdownEnabledToast : t.lockdownDisabledToast, r.lockdown ? 'warn' : 'success');
+          if (!kernelEnforced) {
+            const detail = warnings.length ? ` (${warnings.join(' · ')})` : '';
+            showToast(`${t.lockdownKernelNotEnforcedToast}${detail}`, 'warn', 10000);
+          } else if (warnings.length > 0) {
+            showToast(isActive ? t.lockdownEnabledToast : t.lockdownDisabledToast, isActive ? 'warn' : 'success');
+            showToast(`${t.lockdownWarningsPrefix}: ${warnings.join(' · ')}`, 'warn', 10000);
+          } else {
+            showToast(isActive ? t.lockdownEnabledToast : t.lockdownDisabledToast, isActive ? 'warn' : 'success');
+          }
           dashboard = await apiFetch('/api/dashboard').catch(() => dashboard);
         } catch (err) {
           showToast(err.message, 'error');
@@ -639,21 +1230,20 @@
     });
   }
 
-  function openContainerShell(containerName) {
+  async function openContainerShell(containerName) {
+    if (isModuleLocked('docker')) {
+      const tok = await unlockModuleFlow('docker');
+      if (!tok) return;
+    }
     terminalInitialTarget = `container:${containerName}`;
     terminalTargetNonce += 1;
-    switchTab('web_terminal');
+    await switchTab('web_terminal');
   }
 
   checkAuthStatus();
 </script>
 
-<svelte:window
-  onhashchange={handleHashChange}
-  onkeydown={(e) => {
-    if (e.key === 'Escape' && !e.defaultPrevented && mobileMoreOpen) mobileMoreOpen = false;
-  }}
-/>
+<svelte:window onhashchange={handleHashChange} />
 
 <ToastStack
   {toasts}
@@ -671,7 +1261,41 @@
   danger={confirmState.danger}
   busy={confirmState.busy}
   onConfirm={runConfirmedAction}
-  onCancel={() => { confirmState.open = false; }}
+  onCancel={() => { if (!confirmState.busy) confirmState.open = false; }}
+/>
+<ReauthModal
+  open={reauthState.open}
+  title={reauthState.title}
+  description={reauthState.description}
+  actionLabel={reauthState.actionLabel}
+  unlockModule={reauthState.unlockModule}
+  requireMfa={reauthState.requireMfa}
+  mfaConfigured={totpEnabled || (passkeyEnabled && hasPasskeys)}
+  {username}
+  {t}
+  {lang}
+  {apiFetch}
+  onSuccess={(tok, unlocked) => finishReauth(tok, unlocked)}
+  onCancel={() => finishReauth(null)}
+/>
+<NotificationInboxPanel
+  open={inboxModalOpen}
+  {sidebarCollapsed}
+  {t}
+  {lang}
+  {apiFetch}
+  {showToast}
+  {askConfirm}
+  onClose={() => (inboxModalOpen = false)}
+  onNavigate={(mod) => {
+    inboxModalOpen = false;
+    navigateTarget(mod);
+  }}
+  onOpenChannelSettings={() => {
+    inboxModalOpen = false;
+    switchTab('settings', 'notifications');
+  }}
+  onUnreadChange={(n) => (unreadNotifications = Number(n || 0))}
 />
 
 {#if loading}
@@ -688,98 +1312,396 @@
     {toggleLang}
     {authenticated}
     {mustChangePassword}
+    {initialSetup}
     {username}
     {passwordLoginEnabled}
     {totpEnabled}
-    {hasEd25519Keys}
-    {ed25519KeyIds}
+    {passkeyEnabled}
+    {hasPasskeys}
     connError={authConnError}
     onRetryStatus={checkAuthStatus}
     {apiFetch}
-    {showToast}
     onAuthenticated={handleAuthenticated}
     onLogout={logout}
   />
 {:else}
-  <div class="layout">
-    <!-- 桌面端左侧分组导航栏 -->
-    <aside class="sidebar">
+  {@const activeNav = navItems.find((n) => n.id === activeTab)}
+  {@const activeSubLabel = activeTab === 'settings' ? settingsSubItems.find((s) => s.id === settingsSubTab)?.label : ''}
+  <div class="layout {sidebarCollapsed ? 'sidebar-collapsed' : ''}">
+    <!-- 桌面端左侧悬浮玻璃侧边栏（对齐 Arcane 布局：分组导航 + 可展开设置树 + 底部版本/消息圆钮/用户弹框/折叠） -->
+    <aside class="sidebar" onmouseleave={hideSidebarFlyout}>
       <div class="brand">
         <img src="/icon.svg" alt="Vane" class="brand-icon" />
-        <div>
-          <div style="font-size:16px;font-weight:700;letter-spacing:-0.01em;">Vane</div>
-          <div class="mono" style="font-size:11px;color:var(--text-secondary);">{t.dualStackTag}</div>
-        </div>
+        {#if !sidebarCollapsed}
+          <div style="min-width:0;flex:1;">
+            <div class="brand-name">Vane</div>
+            <div class="brand-sub">{t.dualStackTag}</div>
+          </div>
+        {/if}
       </div>
 
-      {#each navGroups as group (group.label)}
-        <div class="nav-group-label">{group.label}</div>
-        {#each group.items as item (item.id)}
-          {@const dot = moduleStatusDot(item.id)}
+      <div class="sidebar-scroll" onscroll={hideSidebarFlyout}>
+        {#each navGroups as group, gIdx (group.label)}
+          <div class="nav-group-label {gIdx === 0 ? 'first' : ''}">{group.label}</div>
+          {#each group.items as item (item.id)}
+            {@const dot = moduleStatusDot(item.id)}
+            {@const collapsedCount =
+              item.id === 'dashboard'
+                ? (dashboard?.bans?.length || 0)
+                : typeof item.count === 'number'
+                  ? item.count
+                  : 0}
+            {@const isSettingsItem = item.id === 'settings'}
+            <button
+              type="button"
+              class="nav-btn {activeTab === item.id ? 'active' : ''}"
+              aria-label={item.label}
+              aria-current={activeTab === item.id ? 'page' : undefined}
+              aria-expanded={isSettingsItem && !sidebarCollapsed ? settingsMenuOpen : undefined}
+              onmouseenter={(e) => showSidebarFlyout(e.currentTarget, buildNavFlyout(item, group.label))}
+              onfocus={(e) => showSidebarFlyout(e.currentTarget, buildNavFlyout(item, group.label))}
+              onmouseleave={hideSidebarFlyout}
+              onblur={hideSidebarFlyout}
+              onclick={() => {
+                hideSidebarFlyout();
+                if (isSettingsItem && !sidebarCollapsed) {
+                  if (activeTab === 'settings') {
+                    settingsMenuOpen = !settingsMenuOpen;
+                  } else {
+                    settingsMenuOpen = true;
+                    switchTab('settings', settingsSubTab);
+                  }
+                } else {
+                  switchTab(item.id);
+                }
+              }}
+            >
+              <Icons name={item.id} size={17} />
+              {#if !sidebarCollapsed}
+                <span class="nav-label">{item.label}</span>
+                <span class="nav-meta">
+                  {#if isModuleProtected(item.id)}
+                    <span style="display:inline-flex;color:{isModuleLocked(item.id) ? 'var(--text-muted)' : 'var(--accent)'};">
+                      <Icons name={isModuleLocked(item.id) ? 'lock' : 'unlock'} size={12} />
+                    </span>
+                  {/if}
+                  {#if dot}<span class="status-dot {dot}"></span>{/if}
+                  {#if typeof item.count === 'number'}
+                    <span class="nav-count num">{item.count}</span>
+                  {/if}
+                  {#if isSettingsItem}
+                    <span class="nav-chevron {settingsMenuOpen ? 'open' : ''}">
+                      <Icons name="chevron_right" size={14} />
+                    </span>
+                  {/if}
+                </span>
+              {:else}
+                {#if collapsedCount > 0}
+                  <span class="nav-badge-collapsed num {dot === 'danger' ? 'danger' : dot === 'warn' ? 'warn' : ''}">
+                    {collapsedCount > 99 ? '99+' : collapsedCount}
+                  </span>
+                {:else if dot}
+                  <span class="status-dot {dot} nav-dot-collapsed"></span>
+                {/if}
+                {#if isModuleProtected(item.id)}
+                  <span
+                    class="nav-lock-collapsed {isModuleLocked(item.id) ? '' : 'unlocked'}"
+                    aria-hidden="true"
+                  >
+                    <Icons name={isModuleLocked(item.id) ? 'lock' : 'unlock'} size={9} />
+                  </span>
+                {/if}
+              {/if}
+            </button>
+
+            {#if isSettingsItem && !sidebarCollapsed && settingsMenuOpen}
+              <div class="nav-sub-list">
+                {#each settingsSubItems as sub (sub.id)}
+                  <button
+                    type="button"
+                    class="nav-sub-btn {activeTab === 'settings' && settingsSubTab === sub.id ? 'active' : ''}"
+                    onclick={() => switchTab('settings', sub.id)}
+                  >
+                    <Icons name={sub.icon} size={14} />
+                    <span class="nav-label">{sub.label}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          {/each}
+        {/each}
+      </div>
+
+      <!-- Arcane 底部双行区：版本 + 圆形消息通知按钮 / 用户弹框 + 侧边栏折叠按钮 -->
+      <div class="sidebar-footer">
+        <div class="sidebar-footer-row">
+          {#if !sidebarCollapsed}
+            <button
+              type="button"
+              class="sidebar-ver-btn mono"
+              title={t.cfg.tabUpdate}
+              onclick={() => {
+                settingsMenuOpen = true;
+                switchTab('settings', 'update');
+              }}
+            >
+              v0.1.0
+            </button>
+          {/if}
           <button
             type="button"
-            class="nav-btn {activeTab === item.id ? 'active' : ''}"
-            aria-current={activeTab === item.id ? 'page' : undefined}
-            onclick={() => switchTab(item.id)}
+            class="activity-circle-btn {inboxModalOpen ? 'active' : ''}"
+            title={t.inbox.topbarLabel}
+            aria-label={t.inbox.topbarLabel}
+            aria-expanded={inboxModalOpen}
+            onclick={() => {
+              userMenuOpen = false;
+              inboxModalOpen = !inboxModalOpen;
+            }}
           >
-            <Icons name={item.id} size={17} />
-            <span>{item.label}</span>
-            <span class="nav-meta">
-              {#if dot}<span class="status-dot {dot}"></span>{/if}
-              {#if typeof item.count === 'number'}
-                <span class="nav-count num">{item.count}</span>
-              {/if}
-            </span>
-          </button>
-        {/each}
-      {/each}
-
-      <div style="margin-top:auto;padding-top:12px;border-top:1px solid var(--border-subtle);display:grid;gap:6px;">
-        <div style="display:flex;gap:6px;">
-          <button type="button" class="btn btn-sm" style="flex:1;" onclick={toggleLang}>
-            <Icons name="ddns" size={14} />
-            <span>{lang === 'zh' ? 'EN' : '中文'}</span>
-          </button>
-          <button type="button" class="btn btn-sm" style="flex:1;" onclick={cycleTheme}>
-            <Icons name={themeIcon()} size={14} />
-            <span>{themeLabel()}</span>
+            <Icons name="bell" size={15} />
+            {#if unreadNotifications > 0}
+              <span class="activity-circle-badge num">{unreadNotifications > 99 ? '99+' : unreadNotifications}</span>
+            {/if}
           </button>
         </div>
-        <button type="button" class="btn btn-sm" onclick={logout}>
-          <Icons name="lock" size={14} />
-          <span>{t.logout}</span>
-        </button>
+
+        <div class="sidebar-footer-row">
+          <button
+            bind:this={userBtnEl}
+            type="button"
+            class="sidebar-user-btn {userMenuOpen ? 'open' : ''}"
+            aria-haspopup="menu"
+            aria-expanded={userMenuOpen}
+            onclick={() => {
+              inboxModalOpen = false;
+              toggleUserMenu();
+            }}
+          >
+            <span class="sidebar-avatar" aria-hidden="true">
+              {(username || 'A').slice(0, 1).toUpperCase()}
+            </span>
+            {#if !sidebarCollapsed}
+              <span class="sidebar-username">{username}</span>
+            {/if}
+          </button>
+          <button
+            type="button"
+            class="sidebar-pin-btn"
+            title={sidebarCollapsed ? t.expandSidebar : t.collapseSidebar}
+            aria-label={sidebarCollapsed ? t.expandSidebar : t.collapseSidebar}
+            aria-expanded={!sidebarCollapsed}
+            onclick={toggleSidebar}
+          >
+            <Icons name="panel_left" size={15} />
+          </button>
+        </div>
       </div>
     </aside>
 
-    <!-- 主内容区 -->
-    <main class="main-area">
-      <header class="topbar">
-        <div>
-          <h1 style="font-size:21px;font-weight:700;letter-spacing:-0.01em;">
-            {navItems.find((n) => n.id === activeTab)?.label || t.nav.dashboard}
-          </h1>
-          <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">
-            {t.adminLabel}: <span class="mono">{username}</span> · {t.sessionTtl}: <span class="num">{Math.round(sessionTtlSecs / 60)}m</span>
+    <!-- Arcane 用户弹出菜单（Screenshot 7） -->
+    {#if userMenuOpen}
+      <div id="vane-user-popover" class="user-popover" role="menu" style={userMenuStyle}>
+        <div class="user-popover-head">
+          <span class="sidebar-avatar" style="width:34px;height:34px;font-size:14px;" aria-hidden="true">
+            {(username || 'A').slice(0, 1).toUpperCase()}
+          </span>
+          <div style="min-width:0;flex:1;">
+            <div style="font-size:14px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{username}</div>
+            <div style="font-size:11.5px;color:var(--text-muted);">{t.adminLabel} · Vane</div>
           </div>
         </div>
-        <div class="btn-group">
-          <button type="button" class="btn btn-sm" disabled={refreshing} onclick={() => refreshActiveView()}>
-            <Icons name="refresh" size={14} />
-            <span>{refreshing ? t.common.loading : t.refresh}</span>
+        <div class="user-popover-sep"></div>
+        <button
+          type="button"
+          class="user-popover-item"
+          role="menuitem"
+          onclick={() => {
+            userMenuOpen = false;
+            settingsMenuOpen = true;
+            switchTab('settings', 'security');
+          }}
+        >
+          <Icons name="user" size={15} />
+          <span>{t.cfg.tabSecurity}</span>
+        </button>
+        <button
+          type="button"
+          class="user-popover-item"
+          role="menuitem"
+          onclick={() => {
+            userMenuOpen = false;
+            settingsMenuOpen = true;
+            switchTab('settings', 'appearance');
+          }}
+        >
+          <Icons name="palette" size={15} />
+          <span>{t.cfg.tabAppearance}</span>
+        </button>
+        {#if pwaState.canPrompt}
+          <button
+            type="button"
+            class="user-popover-item"
+            role="menuitem"
+            onclick={() => {
+              userMenuOpen = false;
+              handleInstallPwa();
+            }}
+          >
+            <Icons name="download" size={15} />
+            <span>{t.cfg.pwaInstallBtn}</span>
           </button>
-          {#if dashboard?.firewall}
-            <button
-              type="button"
-              class="btn btn-sm {dashboard.firewall.lockdown ? 'btn-primary' : 'btn-danger'}"
-              onclick={() => requestLockdownToggle(!dashboard.firewall.lockdown)}
+        {/if}
+        <div class="user-popover-sep"></div>
+        <button
+          type="button"
+          class="user-popover-item danger"
+          role="menuitem"
+          onclick={() => {
+            userMenuOpen = false;
+            requestLogout();
+          }}
+        >
+          <Icons name="logout" size={15} />
+          <span>{t.logout}</span>
+        </button>
+      </div>
+    {/if}
+
+    <!-- 侧边栏折叠态悬停详情浮层 -->
+    {#if sidebarCollapsed && sidebarFlyout}
+      <div
+        class="sidebar-flyout"
+        role="tooltip"
+        style={`top:${sidebarFlyout.top}px;left:${sidebarFlyout.left}px;`}
+      >
+        <div class="sidebar-flyout-head">
+          <span class="sidebar-flyout-title">{sidebarFlyout.title}</span>
+          {#if sidebarFlyout.badge}
+            <span class="badge badge-muted num" style="padding:1px 7px;font-size:11px;">{sidebarFlyout.badge}</span>
+          {/if}
+          {#if sidebarFlyout.lockState}
+            <span
+              class="badge {sidebarFlyout.lockState === 'locked' ? 'badge-muted' : 'badge-ok'}"
+              style="padding:1px 7px;font-size:11px;"
             >
-              <Icons name="shield" size={14} />
-              <span>{dashboard.firewall.lockdown ? t.lockdownOn : t.lockdownOff}</span>
-            </button>
+              <Icons name={sidebarFlyout.lockState === 'locked' ? 'lock' : 'unlock'} size={10} />
+              <span>
+                {sidebarFlyout.lockState === 'locked'
+                  ? lang === 'en'
+                    ? 'Re-auth'
+                    : '需二次验证'
+                  : lang === 'en'
+                    ? 'Unlocked'
+                    : '已解锁'}
+              </span>
+            </span>
+          {/if}
+          {#if sidebarFlyout.statusLabel}
+            <span class="badge {sidebarFlyout.statusKind === 'danger' ? 'badge-danger' : 'badge-warn'}" style="padding:1px 7px;font-size:11px;">
+              {sidebarFlyout.statusLabel}
+            </span>
           {/if}
         </div>
-      </header>
+        {#if sidebarFlyout.desc}
+          <div class="sidebar-flyout-desc">{sidebarFlyout.desc}</div>
+        {/if}
+      </div>
+    {/if}
+
+    <!-- 右侧独立圆角主内容玻璃外壳 -->
+    <div class="main-shell">
+      <!-- 移动端顶部悬浮面包屑胶囊（对齐 Arcane Screenshot 5） -->
+      <div class="mobile-topbar">
+        <div class="mobile-crumb">
+          {#if activeTab !== 'dashboard'}
+            <button type="button" class="mobile-crumb-back" aria-label={t.nav.dashboard} onclick={() => switchTab('dashboard')}>
+              <Icons name="arrow_left" size={16} />
+            </button>
+          {/if}
+          <Icons name={activeTab} size={16} />
+          <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+            {activeNav?.label || t.nav.dashboard}
+          </span>
+          {#if activeSubLabel}
+            <Icons name="chevron_right" size={13} />
+            <span style="color:var(--text-secondary);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+              {activeSubLabel}
+            </span>
+          {/if}
+        </div>
+        <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+          <button
+            type="button"
+            class="activity-circle-btn {inboxModalOpen ? 'active' : ''}"
+            aria-label={t.inbox.topbarLabel}
+            onclick={() => {
+              userMenuOpen = false;
+              inboxModalOpen = !inboxModalOpen;
+            }}
+          >
+            <Icons name="bell" size={15} />
+            {#if unreadNotifications > 0}
+              <span class="activity-circle-badge num">{unreadNotifications > 99 ? '99+' : unreadNotifications}</span>
+            {/if}
+          </button>
+          <button
+            bind:this={mobileUserBtnEl}
+            type="button"
+            class="mobile-avatar-btn"
+            aria-label={username || t.adminLabel}
+            aria-haspopup="menu"
+            aria-expanded={userMenuOpen}
+            onclick={() => {
+              inboxModalOpen = false;
+              toggleUserMenu(mobileUserBtnEl, true);
+            }}
+          >
+            <span class="sidebar-avatar" style="width:28px;height:28px;font-size:12px;" aria-hidden="true">
+              {(username || 'A').slice(0, 1).toUpperCase()}
+            </span>
+          </button>
+        </div>
+      </div>
+
+      <main class="main-area">
+        <header class="topbar">
+          <div>
+            <h1 class="topbar-title">
+              {activeSubLabel || activeNav?.label || t.nav.dashboard}
+            </h1>
+            {#if activeTab === 'settings' && activeSubLabel}
+              <div class="topbar-sub">{t.nav.settings}</div>
+            {/if}
+          </div>
+          <div class="btn-group">
+            {#if isModuleProtected(activeTab) && !isModuleLocked(activeTab)}
+              <button
+                type="button"
+                class="btn btn-sm"
+                style="color:var(--accent);border-color:color-mix(in srgb, var(--accent) 40%, var(--border-subtle));"
+                onclick={() => relockCurrentModule(activeTab)}
+              >
+                <Icons name="unlock" size={13} />
+                <span>{t.reauth.relockModule}</span>
+              </button>
+            {/if}
+            <button type="button" class="btn btn-sm" disabled={refreshing} onclick={() => refreshActiveView()}>
+              <Icons name="refresh" size={14} />
+              <span>{refreshing ? t.common.loading : t.refresh}</span>
+            </button>
+            {#if dashboard?.firewall}
+              <button
+                type="button"
+                class="btn btn-sm {dashboard.firewall.lockdown ? 'btn-primary' : 'btn-danger'}"
+                onclick={() => requestLockdownToggle(!dashboard.firewall.lockdown)}
+              >
+                <Icons name="shield" size={14} />
+                <span>{dashboard.firewall.lockdown ? t.lockdownOn : t.lockdownOff}</span>
+              </button>
+            {/if}
+          </div>
+        </header>
 
       {#if dashboard?.firewall?.lockdown}
         <div class="banner banner-danger" role="alert">
@@ -788,6 +1710,13 @@
             <div style="min-width:0;">
               <div style="font-weight:700;">{t.lockdownActiveBannerTitle}</div>
               <div style="font-size:12px;color:var(--text-secondary);">{t.lockdownActiveBannerDesc}</div>
+              {#if !lockdownKernelEnforced || lockdownWarnings.length > 0}
+                <div style="font-size:12px;color:var(--warn);margin-top:4px;word-break:break-word;">
+                  {t.lockdownDegradedBannerHint}{!lockdownKernelEnforced
+                    ? `${t.lockdownKernelNotEnforcedToast}${lockdownWarnings.length ? ` (${lockdownWarnings.join(' · ')})` : ''}`
+                    : lockdownWarnings.join(' · ')}
+                </div>
+              {/if}
             </div>
           </div>
           <button type="button" class="btn btn-xs btn-primary" onclick={() => requestLockdownToggle(false)}>
@@ -813,12 +1742,41 @@
         </div>
       {/if}
 
-      {#if activeTab === 'dashboard'}
+      {#key activeTab === 'settings' ? `settings:${settingsSubTab}` : activeTab}
+        <div class="view-stage">
+          {#if isModuleLocked(activeTab)}
+            <div class="card module-lock-gate">
+          <div style="width:52px;height:52px;border-radius:14px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;margin:0 auto 14px;">
+            <Icons name="lock" size={24} />
+          </div>
+          <h2 style="font-size:18px;font-weight:700;margin-bottom:8px;">
+            {t.reauth.moduleLockedTitle.replace('{name}', t.nav[activeTab] || activeTab)}
+          </h2>
+          <p style="font-size:13px;color:var(--text-secondary);margin-bottom:18px;line-height:1.55;">
+            {t.reauth.moduleLockedDesc}
+          </p>
+          <button
+            type="button"
+            class="btn btn-primary"
+            onclick={async () => {
+              const tok = await unlockModuleFlow(activeTab);
+              if (tok) await refreshActiveView();
+            }}
+          >
+            <Icons name="shield" size={15} />
+            <span>{t.reauth.unlockBtn}</span>
+          </button>
+        </div>
+      {:else if activeTab === 'dashboard'}
         <DashboardView
           {t}
           {lang}
           {dashboard}
           {settingsJson}
+          {networkInfo}
+          onEnsureNetworkInfo={ensureNetworkInfo}
+          onSaveSettings={saveFullSettings}
+          {askConfirm}
           onRefresh={refreshActiveView}
           onNavigate={(tab) => switchTab(tab)}
           {apiFetch}
@@ -884,7 +1842,22 @@
         <SettingsView
           {t}
           {lang}
+          onSelectLang={selectLang}
+          {themeMode}
+          onSelectThemeMode={(m) => (themeMode = m)}
+          {oledMode}
+          onToggleOledMode={() => (oledMode = !oledMode)}
+          {accentColor}
+          onSelectAccentColor={(c) => (accentColor = c)}
+          accentPresets={ACCENT_PRESETS}
+          {sidebarCollapsed}
+          onToggleSidebar={toggleSidebar}
+          {pwaState}
+          onInstallPwa={handleInstallPwa}
           {modules}
+          {moduleReauth}
+          {isModuleLocked}
+          onNavigate={switchTab}
           {settingsJson}
           {networkInfo}
           subTab={settingsSubTab}
@@ -893,6 +1866,7 @@
             syncUrlHash('settings', sub, false);
           }}
           onToggleModule={toggleModule}
+          onToggleModuleReauth={toggleModuleReauth}
           onSaveSettings={saveFullSettings}
           onAuthRefresh={refreshAuthStatusOnly}
           onBackupRestored={(st) => {
@@ -902,14 +1876,17 @@
             }
           }}
           {askConfirm}
+          {requestReauth}
           {apiFetch}
           {showToast}
           onRefresh={refreshActiveView}
         />
-      {/if}
+          {/if}
+        </div>
+      {/key}
 
-      <!-- Web 终端加载后保持挂载（切 Tab 时用 CSS 隐藏，不误杀正在运行的 PTY 会话） -->
-      {#if modules.web_terminal && (ptyEverOpened || activeTab === 'web_terminal')}
+      <!-- Web 终端加载后保持挂载（切 Tab 时用 CSS 隐藏，不误杀正在运行的 PTY 会话；受二次验证锁定时卸载保护） -->
+      {#if modules.web_terminal && !isModuleLocked('web_terminal') && (ptyEverOpened || activeTab === 'web_terminal')}
         <div style={activeTab === 'web_terminal' ? '' : 'display:none;'}>
           {#if TerminalComp}
             <TerminalComp
@@ -919,7 +1896,14 @@
               initialTarget={terminalInitialTarget}
               targetNonce={terminalTargetNonce}
               {containers}
-              requireReauth={Boolean(settingsJson?.web_terminal?.require_reauth)}
+              maxSessions={Number(settingsJson?.web_terminal?.max_sessions || 10)}
+              requireReauth={isModuleLocked('web_terminal')}
+              dockerRequireReauth={isModuleLocked('docker')}
+              onUnlockModule={unlockModuleFlow}
+              {settingsJson}
+              onSaveSettings={saveFullSettings}
+              {askConfirm}
+              {requestReauth}
               {apiFetch}
               {showToast}
             />
@@ -933,67 +1917,51 @@
           {/if}
         </div>
       {/if}
-    </main>
+      </main>
+    </div>
 
-    <!-- 移动端底部拇指区悬浮导航栏 + 全功能抽屉入口 -->
-    <nav class="mobile-tabbar">
-      {#each mobilePrimaryItems as item (item.id)}
-        <button
-          type="button"
-          class="tab-btn {activeTab === item.id ? 'active' : ''}"
-          aria-current={activeTab === item.id ? 'page' : undefined}
-          onclick={() => switchTab(item.id)}
-        >
-          <Icons name={item.id} size={18} />
-          <span>{item.label}</span>
-        </button>
-      {/each}
+    <!-- 移动端底部悬浮磨砂胶囊 Dock：左侧全部已启用模块支持横向滑动并自动贴靠，右侧固定「系统设置」 -->
+    <nav class="mobile-dock" aria-label={t.nav.dashboard}>
+      <div
+        bind:this={mobileDockScrollEl}
+        class="mobile-dock-scroll {dockCanScrollLeft ? 'fade-left' : ''} {dockCanScrollRight ? 'fade-right' : ''}"
+        onscroll={updateDockScrollState}
+        onwheel={handleDockWheel}
+      >
+        {#each mobileScrollItems as item (item.id)}
+          <button
+            type="button"
+            data-dock-id={item.id}
+            class="dock-btn dock-scroll-item {activeTab === item.id ? 'active' : ''}"
+            aria-current={activeTab === item.id ? 'page' : undefined}
+            onclick={() => switchTab(item.id)}
+          >
+            <span class="dock-icon-wrap">
+              <Icons name={item.id} size={18} />
+              {#if isModuleProtected(item.id)}
+                <span class="dock-lock-badge {isModuleLocked(item.id) ? '' : 'unlocked'}" aria-hidden="true">
+                  <Icons name={isModuleLocked(item.id) ? 'lock' : 'unlock'} size={8} />
+                </span>
+              {/if}
+            </span>
+            <span>{item.label}</span>
+          </button>
+        {/each}
+      </div>
+
+      <span class="mobile-dock-divider" aria-hidden="true"></span>
+
       <button
         type="button"
-        class="tab-btn {mobileMoreOpen || !mobilePrimaryItems.some((p) => p.id === activeTab) ? 'active' : ''}"
-        onclick={() => mobileMoreOpen = !mobileMoreOpen}
+        class="dock-btn dock-fixed-settings {activeTab === 'settings' ? 'active' : ''}"
+        aria-current={activeTab === 'settings' ? 'page' : undefined}
+        onclick={() => switchTab('settings', settingsSubTab)}
       >
-        <Icons name="more" size={18} />
-        <span>{t.more}</span>
+        <span class="dock-icon-wrap">
+          <Icons name="settings" size={18} />
+        </span>
+        <span>{t.nav.settings}</span>
       </button>
     </nav>
-
-    {#if mobileMoreOpen}
-      <div class="drawer-backdrop" role="presentation" onclick={(e) => { if (e.target === e.currentTarget) mobileMoreOpen = false; }}>
-        <div class="drawer-panel" role="dialog" aria-modal="true" aria-label={t.more}>
-          <div class="drawer-header">
-            <span class="card-title">{t.navGroups.overview} / {t.more}</span>
-            <button type="button" class="btn btn-sm" onclick={() => mobileMoreOpen = false}>{t.close}</button>
-          </div>
-          <div class="drawer-body">
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px;">
-              {#each navItems as item (item.id)}
-                {@const dot = moduleStatusDot(item.id)}
-                <button
-                  type="button"
-                  class="btn {activeTab === item.id ? 'btn-primary' : ''}"
-                  style="justify-content:flex-start;min-width:0;overflow:hidden;"
-                  onclick={() => switchTab(item.id)}
-                >
-                  <Icons name={item.id} size={16} />
-                  <span style="overflow:hidden;text-overflow:ellipsis;">{item.label}</span>
-                  <span class="nav-meta">
-                    {#if dot}<span class="status-dot {dot}"></span>{/if}
-                    {#if typeof item.count === 'number'}
-                      <span class="nav-count num">{item.count}</span>
-                    {/if}
-                  </span>
-                </button>
-              {/each}
-            </div>
-            <div style="display:flex;gap:8px;padding-top:12px;border-top:1px solid var(--border-subtle);">
-              <button type="button" class="btn" style="flex:1;" onclick={toggleLang}>{lang === 'zh' ? 'EN' : '中文'}</button>
-              <button type="button" class="btn" style="flex:1;" onclick={cycleTheme}>{themeLabel()}</button>
-              <button type="button" class="btn btn-danger" onclick={logout}>{t.logout}</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    {/if}
   </div>
 {/if}

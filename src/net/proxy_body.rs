@@ -26,6 +26,7 @@ pub struct StreamBody {
     timer: Pin<Box<tokio::time::Sleep>>,
     exceeded: Arc<AtomicBool>,
     _driver: Option<Driver>,
+    activity: Option<super::proxy_io::ActiveRequestGuard>,
 }
 impl StreamBody {
     pub fn new(
@@ -35,6 +36,17 @@ impl StreamBody {
         exceeded: Arc<AtomicBool>,
         driver: Option<Driver>,
     ) -> Self {
+        Self::with_activity(inner, limit, timeout, exceeded, driver, None)
+    }
+
+    pub(crate) fn with_activity(
+        inner: Incoming,
+        limit: Option<u64>,
+        timeout: Duration,
+        exceeded: Arc<AtomicBool>,
+        driver: Option<Driver>,
+        activity: Option<super::proxy_io::ActiveRequestGuard>,
+    ) -> Self {
         Self {
             inner,
             remaining: limit,
@@ -42,6 +54,7 @@ impl StreamBody {
             timer: Box::pin(tokio::time::sleep(timeout)),
             exceeded,
             _driver: driver,
+            activity,
         }
     }
 }
@@ -59,6 +72,9 @@ impl Body for StreamBody {
                     self.timer
                         .as_mut()
                         .reset(tokio::time::Instant::now() + timeout);
+                    if let Some(ref activity) = self.activity {
+                        activity.touch();
+                    }
                     if let Some(data) = frame.data_ref() {
                         if let Some(left) = self.remaining.as_mut() {
                             if data.len() as u64 > *left {

@@ -128,3 +128,167 @@ async fn cross_family_v6_to_v4_tcp_round_robin_proxy_v2_and_quota_release() {
     let _ = stop_tx.send(true);
     task.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn tcp_forward_enforces_fail2ban_and_per_peer_quota() {
+    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = backend.local_addr().unwrap();
+    let backend_task = tokio::spawn(async move {
+        while let Ok((mut s, _)) = backend.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                while s.read(&mut buf).await.unwrap_or(0) > 0 {}
+            });
+        }
+    });
+
+    let listen_port = free_tcp_port(false);
+    let cfg = PortForwardConfig {
+        name: "quota_f2b_tcp".into(),
+        proto: "tcp".into(),
+        stack: "ipv4_only".into(),
+        listen_port,
+        target: backend_addr.to_string(),
+        open_wan_firewall: false,
+        max_concurrent_conns: 16,
+        ..Default::default()
+    };
+
+    let fw_cfg = FirewallConfig {
+        auto_manage: false,
+        ..Default::default()
+    };
+    let fw = FirewallManager::detect_and_init(fw_cfg).await;
+    let quota = ConnectionQuota::new(32);
+    let f2b = Arc::new(Fail2Ban::new());
+    let (stop_tx, stop_rx) = watch::channel(false);
+
+    let opts = PortForwardRuntimeOptions::default()
+        .with_fail2ban(Some(f2b.clone()))
+        .with_max_conns_per_peer(2);
+
+    let task = tokio::spawn(run_port_forward_rule_with_options(
+        cfg,
+        0,
+        quota.clone(),
+        fw,
+        stop_rx,
+        opts,
+    ));
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // 单来源最多占 2 个并发连接，第 3 个应被立即关闭
+    let c1 = TcpStream::connect(("127.0.0.1", listen_port)).await.unwrap();
+    let c2 = TcpStream::connect(("127.0.0.1", listen_port)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(quota.active_connections(), 2);
+
+    let mut c3 = TcpStream::connect(("127.0.0.1", listen_port)).await.unwrap();
+    let mut buf = [0u8; 8];
+    let n = tokio::time::timeout(Duration::from_secs(2), c3.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert_eq!(n, 0, "third connection from same peer should be rejected by PeerQuota");
+
+    drop(c1);
+    drop(c2);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(quota.active_connections(), 0);
+
+    // Fail2Ban 封禁来源在 accept 阶段直接断开
+    let k = BanKey::from_peer("127.0.0.1".parse().unwrap());
+    for _ in 0..3 {
+        f2b.record_failure(k, 3, 600, "test");
+    }
+    let mut banned = TcpStream::connect(("127.0.0.1", listen_port)).await.unwrap();
+    let n2 = tokio::time::timeout(Duration::from_secs(2), banned.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert_eq!(n2, 0, "banned peer should be rejected immediately");
+
+    let _ = stop_tx.send(true);
+    task.await.unwrap().unwrap();
+    backend_task.abort();
+    let _ = backend_task.await;
+    assert_eq!(quota.active_connections(), 0);
+}
+
+#[tokio::test]
+async fn udp_proxy_pooled_buffers_peer_quota_fail2ban_and_clean_shutdown() {
+    let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = backend.local_addr().unwrap();
+    let backend_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 4096];
+        while let Ok((n, peer)) = backend.recv_from(&mut buf).await {
+            let _ = backend.send_to(&buf[..n], peer).await;
+        }
+    });
+
+    let listen_port = free_udp_port();
+    let cfg = PortForwardConfig {
+        name: "udp_pool_test".into(),
+        proto: "udp".into(),
+        stack: "ipv4_only".into(),
+        listen_port,
+        target: backend_addr.to_string(),
+        open_wan_firewall: false,
+        max_concurrent_conns: 16,
+        ..Default::default()
+    };
+
+    let fw_cfg = FirewallConfig {
+        auto_manage: false,
+        ..Default::default()
+    };
+    let fw = FirewallManager::detect_and_init(fw_cfg).await;
+    let quota = ConnectionQuota::new(32);
+    let f2b = Arc::new(Fail2Ban::new());
+    let (stop_tx, stop_rx) = watch::channel(false);
+
+    let opts = PortForwardRuntimeOptions::default()
+        .with_fail2ban(Some(f2b.clone()))
+        .with_max_conns_per_peer(2);
+
+    let task = tokio::spawn(run_port_forward_rule_with_options(
+        cfg,
+        0,
+        quota.clone(),
+        fw,
+        stop_rx,
+        opts,
+    ));
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let proxy_addr: SocketAddr = format!("127.0.0.1:{}", listen_port).parse().unwrap();
+    let payload: Vec<u8> = (0..2048).map(|i| (i % 251) as u8).collect();
+    let c1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let c2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let c3 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // 前 2 个不同源端口会话均可通过缓冲池正常往返
+    for c in [&c1, &c2] {
+        c.send_to(&payload, proxy_addr).await.unwrap();
+        let mut r = vec![0u8; 4096];
+        let (rn, _) = tokio::time::timeout(Duration::from_secs(2), c.recv_from(&mut r))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&r[..rn], &payload[..]);
+    }
+    assert_eq!(quota.active_connections(), 2);
+
+    // 第 3 个来自同一 BanKey 的 UDP 会话被单来源 PeerQuota 拦截
+    c3.send_to(b"blocked-by-peer-quota", proxy_addr).await.unwrap();
+    let mut r3 = [0u8; 64];
+    assert!(tokio::time::timeout(Duration::from_millis(150), c3.recv_from(&mut r3)).await.is_err());
+    assert_eq!(quota.active_connections(), 2);
+
+    // 停机取消立即终止全部 UDP 会话任务并归还全局与规则配额
+    let _ = stop_tx.send(true);
+    task.await.unwrap().unwrap();
+    backend_task.abort();
+    let _ = backend_task.await;
+    assert_eq!(quota.active_connections(), 0);
+}

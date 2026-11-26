@@ -9,7 +9,7 @@ use tokio::{io::{AsyncRead, AsyncWrite}, sync::Semaphore};
 #[derive(Clone, Copy, Default)]
 pub enum AddressFamily { #[default] Any, Ipv4, Ipv6 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SsrfPolicy {
     /// 生产默认：阻止回环、未指定与链路本地地址（云元数据 169.254.169.254 / fe80::/10）
     BlockLoopbackAndLinkLocal,
@@ -29,41 +29,91 @@ impl Default for SsrfPolicy {
     }
 }
 
-fn is_ip_allowed(ip: std::net::IpAddr, policy: SsrfPolicy) -> bool {
-    let ip = match ip {
-        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(std::net::IpAddr::V6(v6)),
-        v4 => v4,
-    };
-    match policy {
-        SsrfPolicy::AllowLoopback => match ip {
-            std::net::IpAddr::V4(v4) => !v4.is_unspecified() && !v4.is_link_local() && !v4.is_multicast(),
-            std::net::IpAddr::V6(v6) => !v6.is_unspecified() && !v6.is_unicast_link_local() && !v6.is_multicast(),
+impl SsrfPolicy {
+    /// 公共云 API / 公网探测策略：生产环境强制 PublicOnly，测试环境允许本地模拟回环服务
+    pub fn public_or_test() -> Self {
+        if cfg!(test) {
+            Self::AllowLoopback
+        } else {
+            Self::PublicOnly
+        }
+    }
+}
+
+fn is_special_blocked_v4(v4: std::net::Ipv4Addr) -> bool {
+    let o = v4.octets();
+    // 0.0.0.0/8 (含未指定), 169.254.0.0/16 链路本地, 192.0.0.0/24 IETF 协议,
+    // 198.18.0.0/15 基准测试, 224.0.0.0/4 多播, 240.0.0.0/4 保留及 255.255.255.255 广播
+    o[0] == 0
+        || v4.is_link_local()
+        || v4.is_broadcast()
+        || v4.is_multicast()
+        || o[0] >= 240
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+}
+
+pub(crate) fn is_ip_allowed(ip: std::net::IpAddr, policy: SsrfPolicy) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => match policy {
+            SsrfPolicy::AllowLoopback => !is_special_blocked_v4(v4),
+            SsrfPolicy::BlockLoopbackAndLinkLocal => !v4.is_loopback() && !is_special_blocked_v4(v4),
+            SsrfPolicy::PublicOnly => crate::daemon::netlink_ip::is_public_ipv4(v4),
         },
-        SsrfPolicy::BlockLoopbackAndLinkLocal => match ip {
-            std::net::IpAddr::V4(v4) => {
-                !v4.is_loopback() && !v4.is_unspecified() && !v4.is_link_local() && !v4.is_multicast()
+        std::net::IpAddr::V6(v6) => {
+            // 1. ::ffff:0:0/96 IPv4-mapped 解包并递归校验
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_ip_allowed(std::net::IpAddr::V4(v4), policy);
             }
-            std::net::IpAddr::V6(v6) => {
-                !v6.is_loopback() && !v6.is_unspecified() && !v6.is_unicast_link_local() && !v6.is_multicast()
+            let segs = v6.segments();
+            // 2. NAT64 Well-Known Prefix 64:ff9b::/96 -> 解包内嵌 IPv4 递归校验
+            if segs[0] == 0x0064
+                && segs[1] == 0xff9b
+                && segs[2] == 0
+                && segs[3] == 0
+                && segs[4] == 0
+                && segs[5] == 0
+            {
+                let o = v6.octets();
+                let embedded = std::net::Ipv4Addr::new(o[12], o[13], o[14], o[15]);
+                return is_ip_allowed(std::net::IpAddr::V4(embedded), policy);
             }
-        },
-        SsrfPolicy::PublicOnly => match ip {
-            std::net::IpAddr::V4(v4) => {
-                !v4.is_loopback()
-                    && !v4.is_unspecified()
-                    && !v4.is_link_local()
-                    && !v4.is_private()
-                    && !v4.is_multicast()
-                    && !(v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64)
+            // 3. NAT64 Local-Use Prefix 64:ff9b:1::/48（RFC 8215 仅限私网翻译）：
+            //    若为 /96 形态解包内嵌 IPv4 亦不得绕过，非公网场景一律拒绝
+            if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2] == 0x0001 {
+                return false;
             }
-            std::net::IpAddr::V6(v6) => {
-                !v6.is_loopback()
-                    && !v6.is_unspecified()
-                    && !v6.is_unicast_link_local()
-                    && !v6.is_unique_local()
-                    && !v6.is_multicast()
+            // 4. IPv6 特殊与废弃地址段：
+            //    :: (未指定), ::/96 (IPv4-compatible，::1 单独按回环判断),
+            //    ::ffff:0:0:0/96 (SIIT IPv4-translated), fe80::/10 (链路本地),
+            //    fec0::/10 (废弃站点本地), 100::/64 (Discard-Only), ff00::/8 (多播)
+            if v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || v6.is_multicast()
+                || (segs[0] & 0xffc0) == 0xfec0
+                || (segs[0] == 0x0100 && segs[1] == 0 && segs[2] == 0 && segs[3] == 0)
+                || (segs[0] == 0
+                    && segs[1] == 0
+                    && segs[2] == 0
+                    && segs[3] == 0
+                    && segs[4] == 0xffff
+                    && segs[5] == 0)
+                || (segs[0] == 0
+                    && segs[1] == 0
+                    && segs[2] == 0
+                    && segs[3] == 0
+                    && segs[4] == 0
+                    && segs[5] == 0
+                    && !v6.is_loopback())
+            {
+                return false;
             }
-        },
+            match policy {
+                SsrfPolicy::AllowLoopback => true,
+                SsrfPolicy::BlockLoopbackAndLinkLocal => !v6.is_loopback(),
+                SsrfPolicy::PublicOnly => crate::daemon::netlink_ip::is_public_gua_ipv6(v6),
+            }
+        }
     }
 }
 

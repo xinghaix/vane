@@ -1,19 +1,43 @@
 //! 基于 Hyper 的双栈 HTTP/1.1、HTTP/2 流式反代，连接和升级任务随监听器回收。
-use crate::{config::{cidr_contains,parse_cidr,ReverseProxyConfig,ReverseProxyRule},firewall::{FirewallManager,FirewallRule},net::{dual_stack::{bind_dual_stack_tcp,StackMode},listener::ConnectionQuota,tls_resolver::{CertTable,DynamicCertResolver}}};
-use super::{proxy_body::{StreamBody,Driver},proxy_io::TimedIo,update_rule_status,RuleRuntimeStatus,RuleStatusMap};
+use crate::{
+    config::{cidr_contains, parse_cidr, ReverseProxyConfig, ReverseProxyRule},
+    firewall::{FirewallManager, FirewallRule},
+    net::{
+        dual_stack::{bind_dual_stack_tcp_with_reuse_port, BanKey, StackMode},
+        listener::{ConnectionQuota, PeerQuota},
+        tls_resolver::{CertTable, DynamicCertResolver},
+    },
+    security::{
+        fail2ban::Fail2Ban,
+        proxy_gate::{
+            parse_query_pairs, percent_encode_query, render_gate_login_html, render_gate_logout_html,
+            sanitize_next_path, GATE_LOGIN_PATH, GATE_LOGOUT_PATH, PROXY_GATE_COOKIE_NAME,
+        },
+    },
+};
+use super::{
+    proxy_body::{Driver, StreamBody},
+    proxy_io::{ActiveRequestGuard, HttpActivity, TimedIo},
+    update_rule_status, RuleRuntimeStatus, RuleStatusMap,
+};
 use arc_swap::ArcSwap;
 use axum::body::Body;
 use http::{HeaderMap,HeaderValue,Method,Request,Response,StatusCode,Uri,Version,header};
+use http_body_util::{BodyExt, Limited};
 use hyper::{body::Incoming,service::service_fn};
 use hyper_util::rt::{TokioIo,TokioTimer};
-use std::{collections::BTreeMap,convert::Infallible,future::Future,net::{IpAddr,SocketAddr},sync::{Arc,atomic::{AtomicBool,Ordering}},time::Duration};
+use std::{collections::BTreeMap,convert::Infallible,future::Future,net::{IpAddr,SocketAddr},pin::Pin,sync::{Arc,atomic::{AtomicBool,Ordering}},time::Duration};
 use tokio::{net::{TcpListener,TcpStream},sync::watch};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::{sync::CancellationToken,task::TaskTracker};
 
 pub const HOP_BY_HOP_HEADERS:&[&str]=&["connection","keep-alive","proxy-authenticate","proxy-authorization","te","trailer","trailers","transfer-encoding","upgrade"];
 
-pub fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+fn rule_uses_case_insensitive_prefix(rule: &ReverseProxyRule) -> bool {
+    rule.auth_gate || !rule.allowed_cidrs.is_empty() || !rule.denied_cidrs.is_empty()
+}
+
+pub fn path_matches_prefix_ci(path: &str, prefix: &str, case_insensitive: bool) -> bool {
     if prefix.is_empty() || prefix == "/" {
         return true;
     }
@@ -21,8 +45,18 @@ pub fn path_matches_prefix(path: &str, prefix: &str) -> bool {
     if clean_prefix.is_empty() {
         return true;
     }
-    path.strip_prefix(clean_prefix)
-        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    if case_insensitive {
+        path.get(..clean_prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(clean_prefix))
+            && (path.len() == clean_prefix.len() || path.as_bytes()[clean_prefix.len()] == b'/')
+    } else {
+        path.strip_prefix(clean_prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    }
+}
+
+pub fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    path_matches_prefix_ci(path, prefix, false)
 }
 
 pub fn normalize_unreserved_percent(path: &str) -> String {
@@ -51,34 +85,56 @@ pub fn normalize_unreserved_percent(path: &str) -> String {
 }
 
 pub fn is_canonical_request_path(path: &str) -> bool {
-    if !path.starts_with('/') || path.contains("//") || path.contains('\\') || path.contains('\0') {
+    if !path.starts_with('/')
+        || path.contains("//")
+        || path.contains('\\')
+        || path.contains('\0')
+        || path.contains(';')
+    {
         return false;
     }
     let lower = path.to_ascii_lowercase();
-    if lower.contains("%2f") || lower.contains("%5c") || lower.contains("%2e") || lower.contains("%00") {
+    if lower.contains("%2f")
+        || lower.contains("%5c")
+        || lower.contains("%2e")
+        || lower.contains("%00")
+        || lower.contains("%3b")
+    {
         return false;
     }
     let decoded = normalize_unreserved_percent(path);
     !decoded.split('/').any(|seg| seg == "." || seg == "..")
 }
 
-pub fn match_rule<'a>(rules: &'a [ReverseProxyRule], host: &str, path: &str) -> Option<&'a ReverseProxyRule> {
-    let clean_host = host
-        .parse::<http::uri::Authority>()
+fn clean_host_only(host: &str) -> String {
+    host.parse::<http::uri::Authority>()
         .map(|value| value.host().trim_matches(['[', ']']).to_ascii_lowercase())
-        .unwrap_or_else(|_| host.to_ascii_lowercase());
+        .unwrap_or_else(|_| host.to_ascii_lowercase())
+}
+
+fn host_matches_rule(r: &ReverseProxyRule, clean_host: &str) -> bool {
+    r.enabled
+        && (r.host.eq_ignore_ascii_case(clean_host)
+            || r.host.strip_prefix("*.").is_some_and(|suffix| {
+                clean_host
+                    .split_once('.')
+                    .is_some_and(|(head, tail)| !head.is_empty() && tail.eq_ignore_ascii_case(suffix))
+            }))
+}
+
+fn has_gated_rule_for_host(rules: &[ReverseProxyRule], host: &str) -> bool {
+    let clean_host = clean_host_only(host);
+    rules.iter().any(|r| r.auth_gate && host_matches_rule(r, &clean_host))
+}
+
+pub fn match_rule<'a>(rules: &'a [ReverseProxyRule], host: &str, path: &str) -> Option<&'a ReverseProxyRule> {
+    let clean_host = clean_host_only(host);
     let norm_path = normalize_unreserved_percent(path);
     rules
         .iter()
         .filter(|r| {
-            r.enabled
-                && (r.host.eq_ignore_ascii_case(&clean_host)
-                    || r.host.strip_prefix("*.").is_some_and(|suffix| {
-                        clean_host
-                            .split_once('.')
-                            .is_some_and(|(head, tail)| !head.is_empty() && tail.eq_ignore_ascii_case(suffix))
-                    }))
-                && path_matches_prefix(&norm_path, &r.path_prefix)
+            host_matches_rule(r, &clean_host)
+                && path_matches_prefix_ci(&norm_path, &r.path_prefix, rule_uses_case_insensitive_prefix(r))
         })
         .max_by_key(|r| {
             let clean_len = r.path_prefix.trim_end_matches('/').len();
@@ -108,17 +164,29 @@ pub fn check_rule_cidr_access(rule: &ReverseProxyRule, client_ip: IpAddr) -> boo
 }
 
 pub fn rewrite_request_path(path: &str, rule: &ReverseProxyRule) -> String {
+    let (raw_path, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+    let norm_path = normalize_unreserved_percent(raw_path);
     let clean_prefix = rule.path_prefix.trim_end_matches('/');
-    if !rule.strip_prefix || clean_prefix.is_empty() {
-        return path.to_string();
-    }
-    let stripped = path.strip_prefix(clean_prefix).unwrap_or(path);
-    if stripped.is_empty() {
-        "/".to_string()
-    } else if stripped.starts_with('/') {
-        stripped.to_string()
+    let rewritten_path = if !rule.strip_prefix || clean_prefix.is_empty() {
+        norm_path
+    } else if path_matches_prefix_ci(&norm_path, clean_prefix, rule_uses_case_insensitive_prefix(rule)) {
+        let stripped = &norm_path[clean_prefix.len()..];
+        if stripped.is_empty() {
+            "/".to_string()
+        } else if stripped.starts_with('/') {
+            stripped.to_string()
+        } else {
+            format!("/{stripped}")
+        }
     } else {
-        format!("/{}", stripped)
+        norm_path
+    };
+    match query {
+        Some(q) => format!("{rewritten_path}?{q}"),
+        None => rewritten_path,
     }
 }
 
@@ -127,7 +195,13 @@ pub fn render_redirect_location(
     path: &str,
     stun_addrs: &BTreeMap<String, String>,
 ) -> String {
-    render_redirect_location_safe(template, path, stun_addrs).unwrap_or_else(|| template.to_string())
+    render_redirect_location_safe(template, path, stun_addrs).unwrap_or_else(|| {
+        if template.starts_with("//") || template.starts_with("/\\") {
+            "/".to_string()
+        } else {
+            template.to_string()
+        }
+    })
 }
 
 pub fn render_redirect_location_safe(
@@ -135,6 +209,9 @@ pub fn render_redirect_location_safe(
     path: &str,
     stun_addrs: &BTreeMap<String, String>,
 ) -> Option<String> {
+    if template.starts_with("//") || template.starts_with("/\\") {
+        return None;
+    }
     // 先在服务端模板上展开 STUN 变量并检查是否未就绪，再插入请求 {{path}}，杜绝请求路径模板注入泄露 STUN 端点
     let mut out = template.to_string();
     for (name, addr) in stun_addrs {
@@ -144,16 +221,57 @@ pub fn render_redirect_location_safe(
     if out.contains("{{stun.") {
         return None;
     }
-    Some(out.replace("{{path}}", path))
+    let mut rendered = out.replace("{{path}}", path);
+    if rendered.contains('\r') || rendered.contains('\n') || rendered.contains('\0') {
+        return None;
+    }
+    let is_absolute = rendered.starts_with("http://") || rendered.starts_with("https://");
+    if !is_absolute {
+        if rendered.starts_with("//") {
+            let collapsed = rendered.trim_start_matches('/');
+            rendered = format!("/{collapsed}");
+        }
+        if rendered.starts_with("//") || rendered.starts_with("/\\") {
+            return None;
+        }
+    }
+    Some(rendered)
 }
 
+pub type GateLoginFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(String, u64), (StatusCode, String)>> + Send + 'a>>;
+
 /// 授权策略由管理面实现；数据面不会接触密码或哈希。
-pub trait ProxyAuthorization:Send+Sync {
-    fn session(&self,headers:&HeaderMap,peer:IpAddr)->Option<[u8;32]>;
-    fn websocket_ticket(&self,ticket:&str,target:&str,peer:IpAddr)->Option<[u8;32]>;
-    fn session_alive(&self,session:&[u8;32])->bool;
-    fn trusted_origin(&self,origin:&str,authority:&str)->bool {
-        crate::web::boundary::origin_authority(origin)==crate::web::boundary::origin_authority(&format!("https://{authority}"))
+pub trait ProxyAuthorization: Send + Sync {
+    fn session(&self, headers: &HeaderMap, peer: IpAddr) -> Option<[u8; 32]>;
+    fn websocket_ticket(&self, ticket: &str, target: &str, peer: IpAddr) -> Option<[u8; 32]>;
+    fn session_alive(&self, session: &[u8; 32]) -> bool;
+    fn gate_portal_enabled(&self) -> bool {
+        false
+    }
+    fn gate_session(
+        &self,
+        _headers: &HeaderMap,
+        _host: &str,
+        _allowed_users: &[String],
+        _peer: IpAddr,
+    ) -> Option<[u8; 32]> {
+        None
+    }
+    fn gate_login<'a>(
+        &'a self,
+        _host: String,
+        _allowed_users: Vec<String>,
+        _username: String,
+        _password: String,
+        _peer: IpAddr,
+    ) -> GateLoginFuture<'a> {
+        Box::pin(async { Err((StatusCode::UNAUTHORIZED, "门禁认证未启用".to_string())) })
+    }
+    fn gate_logout(&self, _headers: &HeaderMap) {}
+    fn trusted_origin(&self, origin: &str, authority: &str) -> bool {
+        crate::web::boundary::origin_authority(origin)
+            == crate::web::boundary::origin_authority(&format!("https://{authority}"))
             && crate::web::boundary::origin_authority(origin).is_some()
     }
 }
@@ -186,9 +304,56 @@ impl Default for ProxyTimeouts {
     }
 }
 
+#[derive(Clone, Default)]
+pub struct ReverseProxyRuntimeOptions {
+    pub timeouts: ProxyTimeouts,
+    pub status_map: Option<RuleStatusMap>,
+    pub admin_listeners: Vec<SocketAddr>,
+    pub fail2ban: Option<Arc<Fail2Ban>>,
+    pub reuse_port: bool,
+    pub h2_idle_timeout: Option<Duration>,
+    pub max_conns_per_peer: Option<usize>,
+}
+
+impl ReverseProxyRuntimeOptions {
+    pub fn with_timeouts(mut self, timeouts: ProxyTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+    pub fn with_status_map(mut self, status_map: Option<RuleStatusMap>) -> Self {
+        self.status_map = status_map;
+        self
+    }
+    pub fn with_admin_listeners(mut self, admin_listeners: Vec<SocketAddr>) -> Self {
+        self.admin_listeners = admin_listeners;
+        self
+    }
+    pub fn with_fail2ban(mut self, fail2ban: Option<Arc<Fail2Ban>>) -> Self {
+        self.fail2ban = fail2ban;
+        self
+    }
+    pub fn with_reuse_port(mut self, reuse_port: bool) -> Self {
+        self.reuse_port = reuse_port;
+        self
+    }
+    pub fn with_h2_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.h2_idle_timeout = Some(timeout);
+        self
+    }
+    pub fn with_max_conns_per_peer(mut self, max_per_peer: usize) -> Self {
+        self.max_conns_per_peer = Some(max_per_peer.max(1));
+        self
+    }
+}
+
 struct Context {
-    rules:Arc<Vec<ReverseProxyRule>>,stun:Arc<ArcSwap<BTreeMap<String,String>>>,peer:SocketAddr,sni:Option<String>,
-    auth:Arc<dyn ProxyAuthorization>,executor:TrackedExecutor,
+    rules: Arc<Vec<ReverseProxyRule>>,
+    stun: Arc<ArcSwap<BTreeMap<String, String>>>,
+    peer: SocketAddr,
+    sni: Option<String>,
+    auth: Arc<dyn ProxyAuthorization>,
+    executor: TrackedExecutor,
+    admin_listeners: Arc<Vec<SocketAddr>>,
 }
 
 pub async fn run_reverse_proxy_listener(cfg:ReverseProxyConfig,table:Arc<ArcSwap<CertTable>>,global:ConnectionQuota,firewall:Arc<FirewallManager>,stun:Arc<ArcSwap<BTreeMap<String,String>>>,shutdown:watch::Receiver<bool>)->Result<(),String>{
@@ -197,10 +362,45 @@ pub async fn run_reverse_proxy_listener(cfg:ReverseProxyConfig,table:Arc<ArcSwap
 pub async fn run_reverse_proxy_authorized(cfg:ReverseProxyConfig,table:Arc<ArcSwap<CertTable>>,global:ConnectionQuota,firewall:Arc<FirewallManager>,stun:Arc<ArcSwap<BTreeMap<String,String>>>,shutdown:watch::Receiver<bool>,auth:Arc<dyn ProxyAuthorization>)->Result<(),String>{
     run_reverse_proxy_with_options(cfg,table,global,firewall,stun,shutdown,auth,ProxyTimeouts::default()).await
 }
+#[allow(clippy::too_many_arguments)]
 pub async fn run_reverse_proxy_with_options(cfg:ReverseProxyConfig,table:Arc<ArcSwap<CertTable>>,global:ConnectionQuota,firewall:Arc<FirewallManager>,stun:Arc<ArcSwap<BTreeMap<String,String>>>,shutdown:watch::Receiver<bool>,auth:Arc<dyn ProxyAuthorization>,timeouts:ProxyTimeouts)->Result<(),String>{
     run_reverse_proxy_with_status(cfg,table,global,firewall,stun,shutdown,auth,timeouts,None).await
 }
-pub async fn run_reverse_proxy_with_status(cfg:ReverseProxyConfig,table:Arc<ArcSwap<CertTable>>,global:ConnectionQuota,firewall:Arc<FirewallManager>,stun:Arc<ArcSwap<BTreeMap<String,String>>>,mut shutdown:watch::Receiver<bool>,auth:Arc<dyn ProxyAuthorization>,timeouts:ProxyTimeouts,status_map:Option<RuleStatusMap>)->Result<(),String>{
+#[allow(clippy::too_many_arguments)]
+pub async fn run_reverse_proxy_with_status(cfg:ReverseProxyConfig,table:Arc<ArcSwap<CertTable>>,global:ConnectionQuota,firewall:Arc<FirewallManager>,stun:Arc<ArcSwap<BTreeMap<String,String>>>,shutdown:watch::Receiver<bool>,auth:Arc<dyn ProxyAuthorization>,timeouts:ProxyTimeouts,status_map:Option<RuleStatusMap>)->Result<(),String>{
+    run_reverse_proxy_with_runtime_options(
+        cfg,
+        table,
+        global,
+        firewall,
+        stun,
+        shutdown,
+        auth,
+        ReverseProxyRuntimeOptions {
+            timeouts,
+            status_map,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_reverse_proxy_with_runtime_options(
+    cfg: ReverseProxyConfig,
+    table: Arc<ArcSwap<CertTable>>,
+    global: ConnectionQuota,
+    firewall: Arc<FirewallManager>,
+    stun: Arc<ArcSwap<BTreeMap<String, String>>>,
+    mut shutdown: watch::Receiver<bool>,
+    auth: Arc<dyn ProxyAuthorization>,
+    options: ReverseProxyRuntimeOptions,
+) -> Result<(), String> {
+    let status_map = options.status_map;
+    let timeouts = options.timeouts;
+    let admin_listeners = Arc::new(options.admin_listeners);
+    let fail2ban = options.fail2ban;
+    let h2_idle_override = options.h2_idle_timeout;
     let mut rt = RuleRuntimeStatus {
         name: cfg.name.clone(),
         enabled: cfg.enabled,
@@ -215,7 +415,7 @@ pub async fn run_reverse_proxy_with_status(cfg:ReverseProxyConfig,table:Arc<ArcS
         return firewall.remove_rule("reverse_proxy",&cfg.name).await;
     }
     if cfg.rules.iter().any(|rule|rule.enabled && rule.upstream_tls_mode=="insecure_skip_verify"){crate::logger::log(crate::logger::Level::Warn,"reverse_proxy","此监听器包含显式跳过上游证书校验的规则");}
-    let bound=match bind_dual_stack_tcp(cfg.listen_port,StackMode::parse(&cfg.stack)) {
+    let bound=match bind_dual_stack_tcp_with_reuse_port(cfg.listen_port,StackMode::parse(&cfg.stack),"",options.reuse_port) {
         Ok(b) => b,
         Err(e) => {
             let msg = format!("反代监听端口 {} 绑定失败: {}", cfg.listen_port, e);
@@ -236,7 +436,12 @@ pub async fn run_reverse_proxy_with_status(cfg:ReverseProxyConfig,table:Arc<ArcS
     }
     let mut tls=rustls::ServerConfig::builder().with_no_client_auth().with_cert_resolver(Arc::new(DynamicCertResolver::new(table,cfg.strict_sni)));
     tls.alpn_protocols=vec![b"h2".to_vec(),b"http/1.1".to_vec()];let acceptor=TlsAcceptor::from(Arc::new(tls));
-    let quota=ConnectionQuota::new(cfg.max_concurrent_conns);let rules=Arc::new(cfg.rules.clone());let cancel=CancellationToken::new();let _cancel=CancelOnDrop(cancel.clone());
+    let quota=ConnectionQuota::new(cfg.max_concurrent_conns);
+    let peer_quota = match options.max_conns_per_peer {
+        Some(limit) => PeerQuota::new(limit),
+        None => PeerQuota::for_rule_capacity(cfg.max_concurrent_conns),
+    };
+    let rules=Arc::new(cfg.rules.clone());let cancel=CancellationToken::new();let _cancel=CancelOnDrop(cancel.clone());
     rt.bound_v4 = bound.has_v4();
     rt.bound_v6 = bound.has_v6();
     rt.status = "running".into();
@@ -245,7 +450,22 @@ pub async fn run_reverse_proxy_with_status(cfg:ReverseProxyConfig,table:Arc<ArcS
     update_rule_status(&status_map, rt.clone());
     let mut listeners=tokio::task::JoinSet::new();
     for listener in [bound.v4,bound.v6].into_iter().flatten(){
-        listeners.spawn(accept_loop(listener,cfg.listen_port,acceptor.clone(),rules.clone(),global.clone(),quota.clone(),stun.clone(),auth.clone(),cancel.clone(),timeouts));
+        listeners.spawn(accept_loop(
+            listener,
+            cfg.listen_port,
+            acceptor.clone(),
+            rules.clone(),
+            global.clone(),
+            quota.clone(),
+            peer_quota.clone(),
+            fail2ban.clone(),
+            admin_listeners.clone(),
+            stun.clone(),
+            auth.clone(),
+            cancel.clone(),
+            timeouts,
+            h2_idle_override,
+        ));
     }
     let result=if *shutdown.borrow(){Ok(())}else{tokio::select!{_=shutdown.changed()=>Ok(()),result=listeners.join_next()=>match result{Some(Ok(result))=>result,_=>Err("反代监听任务异常结束".into())}}};
     cancel.cancel();while listeners.join_next().await.is_some(){}
@@ -262,7 +482,23 @@ pub async fn run_reverse_proxy_with_status(cfg:ReverseProxyConfig,table:Arc<ArcS
     final_res
 }
 
-async fn accept_loop(listener:TcpListener,port:u16,acceptor:TlsAcceptor,rules:Arc<Vec<ReverseProxyRule>>,global:ConnectionQuota,quota:ConnectionQuota,stun:Arc<ArcSwap<BTreeMap<String,String>>>,auth:Arc<dyn ProxyAuthorization>,cancel:CancellationToken,timeouts:ProxyTimeouts)->Result<(),String>{
+#[allow(clippy::too_many_arguments)]
+async fn accept_loop(
+    listener: TcpListener,
+    port: u16,
+    acceptor: TlsAcceptor,
+    rules: Arc<Vec<ReverseProxyRule>>,
+    global: ConnectionQuota,
+    quota: ConnectionQuota,
+    peer_quota: PeerQuota,
+    fail2ban: Option<Arc<Fail2Ban>>,
+    admin_listeners: Arc<Vec<SocketAddr>>,
+    stun: Arc<ArcSwap<BTreeMap<String, String>>>,
+    auth: Arc<dyn ProxyAuthorization>,
+    cancel: CancellationToken,
+    timeouts: ProxyTimeouts,
+    h2_idle_override: Option<Duration>,
+) -> Result<(), String> {
     let mut connections=tokio::task::JoinSet::new();
     loop {
         tokio::select! {
@@ -277,10 +513,18 @@ async fn accept_loop(listener:TcpListener,port:u16,acceptor:TlsAcceptor,rules:Ar
                         continue;
                     }
                 };
-                let Some(global_permit)=global.try_acquire()else{continue};let Some(local_permit)=quota.try_acquire()else{continue};
-                let acceptor=acceptor.clone();let rules=rules.clone();let stun=stun.clone();let auth=auth.clone();let cancel=cancel.child_token();
+                let peer_key = BanKey::from_peer(peer.ip());
+                if fail2ban.as_ref().is_some_and(|f| f.is_key_banned(peer_key)) {
+                    continue;
+                }
+                let Some(peer_permit) = peer_quota.try_acquire(peer_key) else { continue };
+                let Some(global_permit)=global.try_acquire()else{continue};
+                let Some(local_permit)=quota.try_acquire()else{continue};
+                let acceptor=acceptor.clone();let rules=rules.clone();let stun=stun.clone();let auth=auth.clone();
+                let admin_listeners=admin_listeners.clone();
+                let cancel=cancel.child_token();
                 connections.spawn(async move{
-                    let (_global,_local)=(global_permit,local_permit);let _cancel=CancelOnDrop(cancel.clone());
+                    let (_global,_local,_peer)=(global_permit,local_permit,peer_permit);let _cancel=CancelOnDrop(cancel.clone());
                     let tasks=TaskTracker::new();
                     let work=async {
                         if !sniff(&mut stream,port,&rules,timeouts.http_header).await?{return Ok(());}
@@ -289,9 +533,17 @@ async fn accept_loop(listener:TcpListener,port:u16,acceptor:TlsAcceptor,rules:Ar
                         let is_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
                         let write_timeout=Duration::from_secs(rules.iter().map(|rule|rule.read_timeout_secs).max().unwrap_or(120).clamp(1,86400));
                         let idle_timeout = write_timeout.min(Duration::from_secs(300));
+                        let req_idle_timeout = h2_idle_override.unwrap_or_else(|| idle_timeout.min(Duration::from_secs(60)));
+                        let first_req_timeout = timeouts.http_header.min(req_idle_timeout);
                         let executor=TrackedExecutor{tasks:tasks.clone(),cancel:cancel.clone()};
-                        let context=Arc::new(Context{rules,stun,peer,sni,auth,executor:executor.clone()});
-                        let service=service_fn(move |request|{let context=context.clone();async move{Ok::<_,Infallible>(handle(request,context).await)}});
+                        let context=Arc::new(Context{rules,stun,peer,sni,auth,executor:executor.clone(),admin_listeners});
+                        let activity = HttpActivity::new();
+                        let activity_svc = activity.clone();
+                        let service=service_fn(move |request|{
+                            let context=context.clone();
+                            let req_guard = activity_svc.begin_request();
+                            async move{Ok::<_,Infallible>(handle(request,context,req_guard).await)}
+                        });
                         let io = TimedIo::new(tls, idle_timeout);
                         if is_h2 {
                             let mut h2 = hyper::server::conn::http2::Builder::new(executor);
@@ -301,14 +553,28 @@ async fn accept_loop(listener:TcpListener,port:u16,acceptor:TlsAcceptor,rules:Ar
                                 .max_concurrent_streams(16)
                                 .max_send_buf_size(65536)
                                 .initial_stream_window_size(65535);
-                            let _ = h2.serve_connection(TokioIo::new(io), service).await;
+                            let mut conn = std::pin::pin!(h2.serve_connection(TokioIo::new(io), service));
+                            tokio::select! {
+                                _ = &mut conn => {}
+                                _ = activity.wait_idle_timeout(first_req_timeout, req_idle_timeout) => {
+                                    conn.as_mut().graceful_shutdown();
+                                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut conn).await;
+                                }
+                            }
                         } else {
                             let mut h1 = hyper::server::conn::http1::Builder::new();
                             h1.timer(TokioTimer::new())
                                 .header_read_timeout(timeouts.http_header)
                                 .max_buf_size(32768)
                                 .half_close(true);
-                            let _ = h1.serve_connection(TokioIo::new(io), service).with_upgrades().await;
+                            let mut conn = std::pin::pin!(h1.serve_connection(TokioIo::new(io), service).with_upgrades());
+                            tokio::select! {
+                                _ = &mut conn => {}
+                                _ = activity.wait_idle_timeout(first_req_timeout, req_idle_timeout) => {
+                                    conn.as_mut().graceful_shutdown();
+                                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut conn).await;
+                                }
+                            }
                         }
                         tasks.close();tasks.wait().await;Ok::<(),String>(())
                     };
@@ -327,7 +593,12 @@ async fn accept_loop(listener:TcpListener,port:u16,acceptor:TlsAcceptor,rules:Ar
 
 async fn sniff(stream:&mut TcpStream,port:u16,rules:&[ReverseProxyRule],header_timeout:Duration)->Result<bool,String>{
     let mut byte=[0];let n=tokio::time::timeout(Duration::from_secs(5),stream.peek(&mut byte)).await.map_err(|_|"协议嗅探超时")? .map_err(|_|"协议嗅探失败")?;
-    if n==0{return Err("空连接".into());}if byte[0]==0x16{return Ok(true);}
+    if n == 0 {
+        return Err("空连接".into());
+    }
+    if byte[0] == 0x16 {
+        return Ok(true);
+    }
     let rules=Arc::new(rules.to_vec());
     let service=service_fn(move|request:Request<Incoming>|{
         let rules=rules.clone();async move {
@@ -335,7 +606,12 @@ async fn sniff(stream:&mut TcpStream,port:u16,rules:&[ReverseProxyRule],header_t
                 let authority=match authority(&request){Ok(value)=>value,Err(status)=>return empty(status)};
                 let Ok(authority)=authority.parse::<http::uri::Authority>()else{return empty(StatusCode::BAD_REQUEST)};
                 let host=authority.host();
-                if match_rule(&rules,host,request.uri().path()).is_none(){return empty(StatusCode::NOT_FOUND);}
+                let req_path = request.uri().path();
+                if !is_canonical_request_path(req_path) {
+                    return empty(StatusCode::BAD_REQUEST);
+                }
+                let allow_portal = matches!(req_path, GATE_LOGIN_PATH | GATE_LOGOUT_PATH) && has_gated_rule_for_host(&rules, host);
+                if !allow_portal && match_rule(&rules,host,req_path).is_none(){return empty(StatusCode::NOT_FOUND);}
                 let path=request.uri().path_and_query().map(|path|path.as_str()).unwrap_or("/");
                 let location=if port==443{format!("https://{host}{path}")}else{format!("https://{host}:{port}{path}")};
                 Response::builder().status(StatusCode::PERMANENT_REDIRECT).header(header::LOCATION,location).body(Body::empty()).unwrap_or_else(|_|empty(StatusCode::BAD_REQUEST))
@@ -371,7 +647,206 @@ fn authority(request:&Request<Incoming>)->Result<String,StatusCode>{
 }
 fn is_gateway_cookie_name(name: &str) -> bool {
     let clean = name.trim();
-    clean == "vane_session" || clean == "vane_entry"
+    clean == "vane_session" || clean == "vane_entry" || clean == PROXY_GATE_COOKIE_NAME
+}
+
+fn accepts_html(headers: &HeaderMap) -> bool {
+    if let Some(mode) = headers.get("sec-fetch-mode").and_then(|v| v.to_str().ok()) {
+        if mode != "navigate" {
+            return false;
+        }
+    }
+    if headers
+        .get("x-requested-with")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("xmlhttprequest"))
+    {
+        return false;
+    }
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.to_ascii_lowercase().contains("text/html"))
+}
+
+fn gate_html_response(status: StatusCode, html: String, is_head: bool) -> Response<Body> {
+    let len = html.len();
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(header::CONTENT_LENGTH, len)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        )
+        .header(header::X_FRAME_OPTIONS, "DENY")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .body(if is_head { Body::empty() } else { Body::from(html) })
+        .unwrap_or_else(|_| empty(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+fn resolve_portal_allowed_users(
+    rules: &[ReverseProxyRule],
+    host: &str,
+    safe_next: &str,
+    peer: IpAddr,
+) -> Result<Vec<String>, StatusCode> {
+    let next_path_only = safe_next.split(['?', '#']).next().unwrap_or("/");
+    if let Some(target_rule) = match_rule(rules, host, next_path_only) {
+        if target_rule.auth_gate {
+            if !check_rule_cidr_access(target_rule, peer) {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            return Ok(target_rule.auth_gate_users.clone());
+        }
+    }
+    let clean_host = clean_host_only(host);
+    let mut any_cidr_ok = false;
+    let mut union = Vec::new();
+    for r in rules.iter().filter(|r| r.auth_gate && host_matches_rule(r, &clean_host)) {
+        if !check_rule_cidr_access(r, peer) {
+            continue;
+        }
+        any_cidr_ok = true;
+        for u in &r.auth_gate_users {
+            if !union.contains(u) {
+                union.push(u.clone());
+            }
+        }
+    }
+    if !any_cidr_ok {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(union)
+}
+
+fn has_valid_same_origin(headers: &HeaderMap, auth: &dyn ProxyAuthorization, authority: &str) -> bool {
+    if headers.get("sec-fetch-site").is_some_and(|v| v == "cross-site") {
+        return false;
+    }
+    headers.get_all(header::ORIGIN).iter().count() == 1
+        && headers
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|origin| auth.trusted_origin(origin, authority))
+}
+
+async fn handle_gate_portal(
+    request: Request<Incoming>,
+    context: Arc<Context>,
+    authority: &str,
+    host: &str,
+) -> Response<Body> {
+    let path = request.uri().path();
+    if path == GATE_LOGIN_PATH {
+        match *request.method() {
+            Method::GET | Method::HEAD => {
+                let pairs = parse_query_pairs(request.uri().query().unwrap_or(""));
+                let safe_next = sanitize_next_path(pairs.get("next").map(String::as_str).unwrap_or("/"));
+                let allowed = match resolve_portal_allowed_users(&context.rules, host, &safe_next, context.peer.ip()) {
+                    Ok(u) => u,
+                    Err(status) => return empty(status),
+                };
+                if !allowed.is_empty()
+                    && context
+                        .auth
+                        .gate_session(request.headers(), host, &allowed, context.peer.ip())
+                        .is_some()
+                {
+                    return Response::builder()
+                        .status(StatusCode::SEE_OTHER)
+                        .header(header::LOCATION, &safe_next)
+                        .header(header::CACHE_CONTROL, "no-store")
+                        .body(Body::empty())
+                        .unwrap_or_else(|_| empty(StatusCode::INTERNAL_SERVER_ERROR));
+                }
+                let html = render_gate_login_html(host, &safe_next, None);
+                gate_html_response(StatusCode::OK, html, request.method() == Method::HEAD)
+            }
+            Method::POST => {
+                if !has_valid_same_origin(request.headers(), context.auth.as_ref(), authority) {
+                    return empty(StatusCode::FORBIDDEN);
+                }
+                let body_bytes = match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    Limited::new(request.into_body(), 4096).collect(),
+                )
+                .await
+                {
+                    Ok(Ok(collected)) => collected.to_bytes(),
+                    Ok(Err(_)) => return empty(StatusCode::PAYLOAD_TOO_LARGE),
+                    Err(_) => return empty(StatusCode::REQUEST_TIMEOUT),
+                };
+                let form = parse_query_pairs(&String::from_utf8_lossy(&body_bytes));
+                let username = form.get("username").cloned().unwrap_or_default();
+                let password = form.get("password").cloned().unwrap_or_default();
+                let safe_next = sanitize_next_path(form.get("next").map(String::as_str).unwrap_or("/"));
+                let allowed = match resolve_portal_allowed_users(&context.rules, host, &safe_next, context.peer.ip()) {
+                    Ok(u) => u,
+                    Err(status) => return empty(status),
+                };
+                if allowed.is_empty() {
+                    let html = render_gate_login_html(
+                        host,
+                        &safe_next,
+                        Some("此规则尚未授权任何独立门禁账号，请先在 Vane 控制台配置"),
+                    );
+                    return gate_html_response(StatusCode::FORBIDDEN, html, false);
+                }
+                match context
+                    .auth
+                    .gate_login(host.to_string(), allowed, username, password, context.peer.ip())
+                    .await
+                {
+                    Ok((token, ttl_secs)) => {
+                        let cookie = format!(
+                            "{PROXY_GATE_COOKIE_NAME}={token}; Path=/; Max-Age={ttl_secs}; HttpOnly; Secure; SameSite=Lax"
+                        );
+                        Response::builder()
+                            .status(StatusCode::SEE_OTHER)
+                            .header(header::LOCATION, &safe_next)
+                            .header(header::SET_COOKIE, cookie)
+                            .header(header::CACHE_CONTROL, "no-store")
+                            .header(header::REFERRER_POLICY, "no-referrer")
+                            .body(Body::empty())
+                            .unwrap_or_else(|_| empty(StatusCode::INTERNAL_SERVER_ERROR))
+                    }
+                    Err((status, msg)) => {
+                        let html = render_gate_login_html(host, &safe_next, Some(&msg));
+                        gate_html_response(status, html, false)
+                    }
+                }
+            }
+            _ => empty(StatusCode::METHOD_NOT_ALLOWED),
+        }
+    } else if path == GATE_LOGOUT_PATH {
+        match *request.method() {
+            Method::GET | Method::HEAD => {
+                gate_html_response(StatusCode::OK, render_gate_logout_html(host), request.method() == Method::HEAD)
+            }
+            Method::POST => {
+                if !has_valid_same_origin(request.headers(), context.auth.as_ref(), authority) {
+                    return empty(StatusCode::FORBIDDEN);
+                }
+                context.auth.gate_logout(request.headers());
+                let clear_cookie =
+                    format!("{PROXY_GATE_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax");
+                Response::builder()
+                    .status(StatusCode::SEE_OTHER)
+                    .header(header::LOCATION, GATE_LOGIN_PATH)
+                    .header(header::SET_COOKIE, clear_cookie)
+                    .header(header::CACHE_CONTROL, "no-store")
+                    .header(header::REFERRER_POLICY, "no-referrer")
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| empty(StatusCode::INTERNAL_SERVER_ERROR))
+            }
+            _ => empty(StatusCode::METHOD_NOT_ALLOWED),
+        }
+    } else {
+        empty(StatusCode::NOT_FOUND)
+    }
 }
 
 fn remove_gateway_cookie(headers: &mut HeaderMap) {
@@ -412,7 +887,17 @@ fn response_headers(headers: &mut HeaderMap, rule: &ReverseProxyRule) -> Result<
     Ok(())
 }
 
-async fn handle(mut request: Request<Incoming>, context: Arc<Context>) -> Response<Body> {
+async fn handle(request: Request<Incoming>, context: Arc<Context>, req_guard: ActiveRequestGuard) -> Response<Body> {
+    let is_h2 = request.version() == Version::HTTP_2;
+    let mut resp = handle_inner(request, context, req_guard).await;
+    if !is_h2 && matches!(resp.status(), StatusCode::FORBIDDEN | StatusCode::MISDIRECTED_REQUEST) {
+        resp.headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    resp
+}
+
+async fn handle_inner(mut request: Request<Incoming>, context: Arc<Context>, req_guard: ActiveRequestGuard) -> Response<Body> {
     let authority = match authority(&request) {
         Ok(value) => value,
         Err(status) => return empty(status),
@@ -428,6 +913,12 @@ async fn handle(mut request: Request<Incoming>, context: Arc<Context>) -> Respon
     if !is_canonical_request_path(request.uri().path()) {
         return empty(StatusCode::BAD_REQUEST);
     }
+    if context.auth.gate_portal_enabled()
+        && matches!(request.uri().path(), GATE_LOGIN_PATH | GATE_LOGOUT_PATH)
+        && has_gated_rule_for_host(&context.rules, host)
+    {
+        return handle_gate_portal(request, context, &authority, host).await;
+    }
     let Some(rule) = match_rule(&context.rules, host, request.uri().path()) else {
         return empty(StatusCode::NOT_FOUND);
     };
@@ -442,24 +933,45 @@ async fn handle(mut request: Request<Incoming>, context: Arc<Context>) -> Respon
     if upgrade && rule.mode != "proxy" {
         return empty(StatusCode::BAD_REQUEST);
     }
+    let gate_sess = if rule.auth_gate {
+        context
+            .auth
+            .gate_session(request.headers(), host, &rule.auth_gate_users, context.peer.ip())
+    } else {
+        None
+    };
     let session = if rule.auth_gate {
-        context.auth.session(request.headers(), context.peer.ip())
+        gate_sess.or_else(|| context.auth.session(request.headers(), context.peer.ip()))
     } else {
         None
     };
     if rule.auth_gate && session.is_none() && !(upgrade && rule.mode == "proxy") {
-        return empty(StatusCode::UNAUTHORIZED);
-    }
-    if rule.auth_gate && !matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS) {
-        if request.headers().get_all(header::ORIGIN).iter().count() != 1
-            || request
-                .headers()
-                .get(header::ORIGIN)
-                .and_then(|v| v.to_str().ok())
-                .is_none_or(|origin| !context.auth.trusted_origin(origin, &authority))
+        if context.auth.gate_portal_enabled()
+            && request.method() == Method::GET
+            && accepts_html(request.headers())
         {
-            return empty(StatusCode::FORBIDDEN);
+            let raw_next = request.uri().path_and_query().map(|v| v.as_str()).unwrap_or("/");
+            let safe_next = sanitize_next_path(raw_next);
+            let loc = format!("{GATE_LOGIN_PATH}?next={}", percent_encode_query(&safe_next));
+            return Response::builder()
+                .status(StatusCode::FOUND)
+                .header(header::LOCATION, loc)
+                .header(header::CACHE_CONTROL, "no-store")
+                .header(header::VARY, "Accept, Cookie")
+                .body(Body::empty())
+                .unwrap_or_else(|_| empty(StatusCode::UNAUTHORIZED));
         }
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::empty())
+            .unwrap_or_else(|_| empty(StatusCode::UNAUTHORIZED));
+    }
+    if rule.auth_gate
+        && !matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS)
+        && !has_valid_same_origin(request.headers(), context.auth.as_ref(), &authority)
+    {
+        return empty(StatusCode::FORBIDDEN);
     }
     let is_head = request.method() == Method::HEAD;
     if rule.mode == "static" {
@@ -512,7 +1024,11 @@ async fn handle(mut request: Request<Incoming>, context: Arc<Context>) -> Respon
             let Some(origin)=request.headers().get(header::ORIGIN).and_then(|v|v.to_str().ok())else{return empty(StatusCode::FORBIDDEN)};
             if !context.auth.trusted_origin(origin,&authority){return empty(StatusCode::FORBIDDEN);}
             let target=format!("{authority}{path}");
-            websocket_session=ticket.as_ref().and_then(|ticket|context.auth.websocket_ticket(ticket,&target,context.peer.ip()));
+            websocket_session = gate_sess.or_else(|| {
+                ticket
+                    .as_ref()
+                    .and_then(|ticket| context.auth.websocket_ticket(ticket, &target, context.peer.ip()))
+            });
             if websocket_session.is_none(){return empty(StatusCode::UNAUTHORIZED);}
         }
         path
@@ -528,7 +1044,10 @@ async fn handle(mut request: Request<Incoming>, context: Arc<Context>) -> Respon
     let limit=if rule.max_body_mb==0{None}else{Some(rule.max_body_mb.saturating_mul(1024*1024))};
     if request.headers().get(header::CONTENT_LENGTH).and_then(|v|v.to_str().ok()).and_then(|v|v.parse::<u64>().ok()).zip(limit).is_some_and(|(length,limit)|length>limit){return empty(StatusCode::PAYLOAD_TOO_LARGE);}
     let uri:Uri=match rule.upstream.parse(){Ok(uri)=>uri,Err(_)=>return empty(StatusCode::BAD_GATEWAY)};
-    let socket=match tokio::time::timeout(Duration::from_secs(15),super::proxy_io::upstream(rule,&uri)).await{
+    let socket=match tokio::time::timeout(
+        Duration::from_secs(15),
+        super::proxy_io::upstream_with_admin_listeners(rule, &uri, &context.admin_listeners),
+    ).await{
         Ok(Ok(stream))=>stream,
         Ok(Err(e))=>{crate::logger::log(crate::logger::Level::Warn,"reverse_proxy",&format!("连接上游 {} 失败: {}", rule.host, e));return empty(StatusCode::BAD_GATEWAY);}
         Err(_)=>{crate::logger::log(crate::logger::Level::Warn,"reverse_proxy",&format!("连接上游 {} 超时", rule.host));return empty(StatusCode::BAD_GATEWAY);}
@@ -606,7 +1125,7 @@ async fn handle(mut request: Request<Incoming>, context: Arc<Context>) -> Respon
         return Response::from_parts(parts,Body::empty());
     }
     let (mut parts,body)=response.into_parts();if response_headers(&mut parts.headers,rule).is_err(){return empty(StatusCode::BAD_GATEWAY);}
-    Response::from_parts(parts,Body::new(StreamBody::new(body,None,timeout,Arc::new(AtomicBool::new(false)),Some(driver))))
+    Response::from_parts(parts,Body::new(StreamBody::with_activity(body,None,timeout,Arc::new(AtomicBool::new(false)),Some(driver),Some(req_guard))))
 }
 
 #[cfg(test)]

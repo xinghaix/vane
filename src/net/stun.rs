@@ -5,7 +5,7 @@ use crate::config::{CloudflareRedirectConfig, Config, StunConfig};
 use crate::daemon::notify::dispatch_notification;
 use crate::logger::{self, Level};
 use crate::net::dual_stack::{bind_reusable_udp, connect_tcp_with_options};
-use crate::net::http_client::{shared as http_shared, HttpRequest};
+use crate::net::http_client::{shared as http_shared, HttpRequest, SsrfPolicy};
 use crate::security::vault::Vault;
 use arc_swap::ArcSwap;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -219,20 +219,67 @@ impl PersistentUdpSockets {
     }
 }
 
-async fn resolve_server_addrs(server: &str) -> Result<Vec<SocketAddr>, String> {
-    if let Ok(sock) = server.parse::<SocketAddr>() {
-        return Ok(vec![sock]);
+/// 校验 STUN 返回的映射地址必须为非零端口的真实全球公网单播 IP（阻断回环/私网/链路本地/元数据/文档地址污染）
+pub fn is_valid_mapped_addr(addr: SocketAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
     }
-    let addrs: Vec<SocketAddr> = tokio::time::timeout(Duration::from_secs(4), tokio::net::lookup_host(server))
-        .await
-        .map_err(|_| format!("解析 STUN 服务器 {} 超时", server))?
-        .map_err(|e| format!("解析 STUN 服务器 {} 失败: {}", server, e))?
-        .take(8)
+    match addr.ip() {
+        IpAddr::V4(v4) => crate::daemon::netlink_ip::is_public_ipv4(v4),
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                crate::daemon::netlink_ip::is_public_ipv4(v4)
+            } else {
+                crate::daemon::netlink_ip::is_public_gua_ipv6(v6)
+            }
+        }
+    }
+}
+
+/// 判断给定监听规则或端口是否被当前已启用的 STUN 规则绑定（仅此时才允许开启 SO_REUSEPORT）
+pub fn is_port_or_rule_bound_by_stun(cfg: &Config, rule_name: &str, listen_port: u16) -> bool {
+    if !cfg.modules.stun || listen_port == 0 {
+        return false;
+    }
+    cfg.stun.iter().any(|s| {
+        s.enabled
+            && ((!s.bind_rule.is_empty() && s.bind_rule == rule_name)
+                || effective_local_port(s, Some(cfg)) == listen_port)
+    })
+}
+
+fn is_allowed_stun_server_ip(ip: IpAddr, allow_loopback: bool) -> bool {
+    let policy = if allow_loopback {
+        SsrfPolicy::AllowLoopback
+    } else {
+        SsrfPolicy::BlockLoopbackAndLinkLocal
+    };
+    crate::net::http_client::is_ip_allowed(ip, policy)
+}
+
+async fn resolve_server_addrs_with_policy(server: &str, allow_loopback: bool) -> Result<Vec<SocketAddr>, String> {
+    let raw: Vec<SocketAddr> = if let Ok(sock) = server.parse::<SocketAddr>() {
+        vec![sock]
+    } else {
+        tokio::time::timeout(Duration::from_secs(4), tokio::net::lookup_host(server))
+            .await
+            .map_err(|_| format!("解析 STUN 服务器 {} 超时", server))?
+            .map_err(|e| format!("解析 STUN 服务器 {} 失败: {}", server, e))?
+            .take(8)
+            .collect()
+    };
+    let filtered: Vec<SocketAddr> = raw
+        .into_iter()
+        .filter(|a| a.port() != 0 && is_allowed_stun_server_ip(a.ip(), allow_loopback))
         .collect();
-    if addrs.is_empty() {
-        return Err(format!("STUN 服务器 {} 无可用地址", server));
+    if filtered.is_empty() {
+        return Err(format!("STUN 服务器 {} 无安全可用地址", server));
     }
-    Ok(addrs)
+    Ok(filtered)
+}
+
+async fn resolve_server_addrs(server: &str) -> Result<Vec<SocketAddr>, String> {
+    resolve_server_addrs_with_policy(server, cfg!(test)).await
 }
 
 async fn probe_udp_on_socket(sock: &UdpSocket, target: SocketAddr) -> Result<SocketAddr, String> {
@@ -254,8 +301,8 @@ async fn probe_udp_on_socket(sock: &UdpSocket, target: SocketAddr) -> Result<Soc
             continue;
         }
         let mapped = parse_binding_response(&buf[..n], &tx_id).map_err(str::to_string)?;
-        if mapped.port() == 0 || mapped.ip().is_unspecified() {
-            return Err("STUN 服务器返回无效映射地址".into());
+        if !is_valid_mapped_addr(mapped) {
+            return Err("STUN 服务器返回非公网或无效映射地址".into());
         }
         return Ok(mapped);
     }
@@ -293,10 +340,12 @@ async fn probe_tcp_target(
             let (req, tx_id) = build_binding_request();
             if existing.write_all(&req).await.is_ok() {
                 if let Ok(mapped) = read_stun_tcp_response(existing, &tx_id).await {
-                    if mapped.port() != 0 && !mapped.ip().is_unspecified() {
+                    if is_valid_mapped_addr(mapped) {
                         let local = existing.local_addr().unwrap_or_else(|_| SocketAddr::new(target.ip(), local_port));
                         return Ok((mapped, local));
                     }
+                    *persistent = None;
+                    return Err("STUN 服务器返回非公网或无效映射地址".into());
                 }
             }
         }
@@ -320,8 +369,8 @@ async fn probe_tcp_target(
         .await
         .map_err(|e| format!("STUN TCP 发送失败: {}", e))?;
     let mapped = read_stun_tcp_response(&mut stream, &tx_id).await?;
-    if mapped.port() == 0 || mapped.ip().is_unspecified() {
-        return Err("STUN 服务器返回无效映射地址".into());
+    if !is_valid_mapped_addr(mapped) {
+        return Err("STUN 服务器返回非公网或无效映射地址".into());
     }
     *persistent = Some((target, stream));
     Ok((mapped, local))
@@ -431,8 +480,13 @@ pub async fn push_cloudflare_redirect_with_base(
     vault: &Vault,
     mapped: SocketAddr,
 ) -> Result<(), String> {
-    let token = vault.reveal_string(
-        &format!("stun.{}.on_change_cloudflare_redirect.api_token", rule_name),
+    if !is_valid_mapped_addr(mapped) {
+        return Err("拒绝将非公网或无效 STUN 映射地址写入 Cloudflare Redirect".into());
+    }
+    let ename = crate::config::encode_secret_segment(rule_name);
+    let token = vault.reveal_string_with_legacy(
+        &format!("stun.{ename}.on_change_cloudflare_redirect.api_token"),
+        Some(&format!("stun.{rule_name}.on_change_cloudflare_redirect.api_token")),
         &cf.api_token,
     )?;
     if token.is_empty() {
@@ -447,6 +501,11 @@ pub async fn push_cloudflare_redirect_with_base(
     );
     let body_str = build_cloudflare_redirect_payload(&cf.source_host, &cf.target_template, mapped, cf.status_code);
     let mut req = HttpRequest::new("PATCH", &url);
+    req.ssrf_policy = if cfg!(test) && api_base != CF_API_BASE_DEFAULT {
+        SsrfPolicy::AllowLoopback
+    } else {
+        SsrfPolicy::PublicOnly
+    };
     req.headers.insert("authorization".into(), format!("Bearer {}", token));
     req.headers.insert("content-type".into(), "application/json".into());
     req.body = body_str.into_bytes();
@@ -468,11 +527,19 @@ async fn run_change_hooks(
     previous_addr: &str,
     cf_api_base: &str,
 ) -> Result<(), String> {
+    if !is_valid_mapped_addr(mapped) {
+        return Err("拒绝针对非公网 STUN 映射地址执行联动钩子".into());
+    }
     let public_addr = format_public_endpoint(mapped);
     let mut errors = Vec::new();
 
     if !entry.webhook_url.is_empty() {
-        match vault.reveal_string(&format!("stun.{}.webhook_url", entry.name), &entry.webhook_url) {
+        let ename = crate::config::encode_secret_segment(&entry.name);
+        match vault.reveal_string_with_legacy(
+            &format!("stun.{ename}.webhook_url"),
+            Some(&format!("stun.{}.webhook_url", entry.name)),
+            &entry.webhook_url,
+        ) {
             Ok(url) if !url.is_empty() => {
                 let payload = json!({
                     "event": "stun_change",

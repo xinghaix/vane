@@ -86,7 +86,7 @@ async fn persistent_udp_session_retains_local_port_and_re_probes() {
             cnt_rec.fetch_add(1, Ordering::SeqCst);
             let mut tx = [0u8; 12];
             tx.copy_from_slice(&buf[8..20]);
-            let resp = encode_xor_response(&tx, SocketAddr::new("203.0.113.88".parse().unwrap(), peer.port()));
+            let resp = encode_xor_response(&tx, SocketAddr::new("1.1.1.1".parse().unwrap(), peer.port()));
             let _ = server.send_to(&resp, peer).await;
         }
     });
@@ -116,7 +116,7 @@ async fn ipv6_tcp_stun_and_webhook_plus_cloudflare_redirect_hooks_execute_for_re
             s.read_exact(&mut req).await.unwrap();
             let mut tx = [0u8; 12];
             tx.copy_from_slice(&req[8..20]);
-            let mapped: SocketAddr = "[2001:db8:8888::1]:45678".parse().unwrap();
+            let mapped: SocketAddr = "[2606:4700:4700::1111]:45678".parse().unwrap();
             let resp = encode_xor_response(&tx, mapped);
             s.write_all(&resp[..10]).await.unwrap();
             tokio::time::sleep(Duration::from_millis(15)).await;
@@ -135,7 +135,7 @@ async fn ipv6_tcp_stun_and_webhook_plus_cloudflare_redirect_hooks_execute_for_re
             post(move |Json(body): Json<Value>| {
                 let wh_c = wh_c.clone();
                 async move {
-                    assert_eq!(body["public_addr"], "[2001:db8:8888::1]:45678");
+                    assert_eq!(body["public_addr"], "[2606:4700:4700::1111]:45678");
                     wh_c.fetch_add(1, Ordering::SeqCst);
                     Json(json!({ "ok": true }))
                 }
@@ -156,7 +156,7 @@ async fn ipv6_tcp_stun_and_webhook_plus_cloudflare_redirect_hooks_execute_for_re
                     let body: Value = serde_json::from_slice(&bytes).unwrap();
                     assert_eq!(
                         body["action_parameters"]["from_value"]["target_url"]["value"],
-                        "https://[2001:db8:8888::1]:45678"
+                        "https://[2606:4700:4700::1111]:45678"
                     );
                     cf_c.fetch_add(1, Ordering::SeqCst);
                     Json(json!({ "success": true, "result": {} }))
@@ -206,7 +206,65 @@ async fn ipv6_tcp_stun_and_webhook_plus_cloudflare_redirect_hooks_execute_for_re
     .unwrap();
 
     assert_eq!(status.status, "active");
-    assert_eq!(status.public_addr, "[2001:db8:8888::1]:45678");
+    assert_eq!(status.public_addr, "[2606:4700:4700::1111]:45678");
     assert_eq!(webhook_hits.load(Ordering::SeqCst), 1);
     assert_eq!(cf_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn stun_rejects_non_public_mapped_ips_on_udp_and_tcp_including_persistent_reuse() {
+    // 1. resolve_server_addrs_with_policy(..., false) 拦截回环、未指定与链路本地服务器地址
+    for bad_srv in [
+        "127.0.0.1:3478",
+        "[::1]:3478",
+        "0.0.0.0:3478",
+        "169.254.169.254:3478",
+        "[fe80::1]:3478",
+    ] {
+        assert!(
+            resolve_server_addrs_with_policy(bad_srv, false).await.is_err(),
+            "expected server rejected: {bad_srv}"
+        );
+    }
+
+    // 2. UDP STUN 返回私网/回环/元数据/文档 IP 时拒绝写入
+    let udp_srv = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let udp_addr = udp_srv.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 256];
+        if let Ok((n, peer)) = udp_srv.recv_from(&mut buf).await {
+            if n >= 20 {
+                let mut tx = [0u8; 12];
+                tx.copy_from_slice(&buf[8..20]);
+                let poisoned = encode_xor_response(&tx, "169.254.169.254:80".parse().unwrap());
+                let _ = udp_srv.send_to(&poisoned, peer).await;
+            }
+        }
+    });
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    assert!(probe_udp_on_socket(&sock, udp_addr).await.is_err());
+
+    // 3. TCP STUN 首轮返回合法公网 IP，次轮持久复用返回内网 IP -> 次轮必须拒绝并重置连接
+    let tcp_srv = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_addr = tcp_srv.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((mut s, _)) = tcp_srv.accept().await {
+            for mapped_str in ["1.1.1.1:44444", "192.168.1.1:23456"] {
+                let mut req = [0u8; 20];
+                if s.read_exact(&mut req).await.is_err() {
+                    break;
+                }
+                let mut tx = [0u8; 12];
+                tx.copy_from_slice(&req[8..20]);
+                let resp = encode_xor_response(&tx, mapped_str.parse().unwrap());
+                let _ = s.write_all(&resp).await;
+            }
+        }
+    });
+    let mut persistent = None;
+    let (ok_mapped, _) = probe_tcp_target(tcp_addr, 0, &mut persistent).await.unwrap();
+    assert_eq!(ok_mapped, "1.1.1.1:44444".parse().unwrap());
+    assert!(persistent.is_some());
+    assert!(probe_tcp_target(tcp_addr, 0, &mut persistent).await.is_err());
+    assert!(persistent.is_none());
 }

@@ -55,8 +55,8 @@ async fn tls_requires_trusted_certificate_and_verifies_ip_san() {
         assert!(server.accept(socket).await.is_err());
         let (socket, _) = listener.accept().await.unwrap();
         let mut stream = server.accept(socket).await.unwrap();
-        let mut buffer = [0;1024];
-        stream.read(&mut buffer).await.unwrap();
+        let mut buffer = [0; 1024];
+        assert!(stream.read(&mut buffer).await.unwrap() > 0);
         stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
     });
     let error = shared().execute(HttpRequest::new("GET", &url)).await.err().unwrap();
@@ -96,4 +96,61 @@ async fn ssrf_policy_blocks_loopback_and_link_local_metadata() {
     meta.ssrf_policy = SsrfPolicy::BlockLoopbackAndLinkLocal;
     let err2 = shared().execute(meta).await.err().unwrap();
     assert!(err2.contains("SSRF"));
+}
+
+#[test]
+fn ssrf_ip_filter_blocks_special_reserved_and_nat64_ranges() {
+    let parse = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+
+    // 始终拦截的特殊/保留地址段（包含 0.0.0.0/8, 广播, 240/4, 192.0.0/24, 198.18/15, fec0::/10, 100::/64, ::/96, ::ffff:0:0:0/96）
+    for blocked in [
+        "0.0.0.0",
+        "0.1.2.3",
+        "169.254.169.254",
+        "192.0.0.1",
+        "198.18.0.1",
+        "198.19.255.254",
+        "224.0.0.1",
+        "240.0.0.1",
+        "255.255.255.255",
+        "::",
+        "::127.0.0.1",
+        "::169.254.169.254",
+        "::ffff:0:127.0.0.1",
+        "::ffff:0:1.1.1.1",
+        "fe80::1",
+        "fec0::1",
+        "100::1",
+        "ff02::1",
+        "64:ff9b::169.254.169.254",
+        "64:ff9b::0.1.2.3",
+        "64:ff9b::240.0.0.1",
+        "64:ff9b:1::127.0.0.1",
+        "64:ff9b:1::169.254.169.254",
+        "64:ff9b:1::1.1.1.1",
+    ] {
+        let ip = parse(blocked);
+        assert!(!is_ip_allowed(ip, SsrfPolicy::BlockLoopbackAndLinkLocal), "expected blocked (default): {blocked}");
+        assert!(!is_ip_allowed(ip, SsrfPolicy::PublicOnly), "expected blocked (public): {blocked}");
+        assert!(!is_ip_allowed(ip, SsrfPolicy::AllowLoopback), "expected blocked (allow_loopback): {blocked}");
+    }
+
+    // NAT64 Well-Known Prefix (64:ff9b::/96) 递归校验内嵌 IPv4
+    assert!(!is_ip_allowed(parse("64:ff9b::127.0.0.1"), SsrfPolicy::BlockLoopbackAndLinkLocal));
+    assert!(!is_ip_allowed(parse("64:ff9b::127.0.0.1"), SsrfPolicy::PublicOnly));
+    assert!(!is_ip_allowed(parse("64:ff9b::10.0.0.1"), SsrfPolicy::PublicOnly));
+    assert!(!is_ip_allowed(parse("64:ff9b::192.168.1.1"), SsrfPolicy::PublicOnly));
+    assert!(!is_ip_allowed(parse("64:ff9b::100.64.0.1"), SsrfPolicy::PublicOnly));
+    assert!(is_ip_allowed(parse("64:ff9b::1.1.1.1"), SsrfPolicy::PublicOnly));
+    assert!(is_ip_allowed(parse("64:ff9b::1.1.1.1"), SsrfPolicy::BlockLoopbackAndLinkLocal));
+
+    // PublicOnly 与 netlink_ip 保持一致（拒绝私网/ULA/CGNAT/文档地址，放行真实公网 IP）
+    for non_public in ["127.0.0.1", "::1", "10.0.0.1", "192.168.1.1", "100.64.1.1", "203.0.113.1", "fc00::1", "2001:db8::1"] {
+        assert!(!is_ip_allowed(parse(non_public), SsrfPolicy::PublicOnly), "expected blocked (public): {non_public}");
+    }
+    assert!(is_ip_allowed(parse("1.1.1.1"), SsrfPolicy::PublicOnly));
+    assert!(is_ip_allowed(parse("2606:4700:4700::1111"), SsrfPolicy::PublicOnly));
+    // AllowLoopback 允许本地测试回环地址
+    assert!(is_ip_allowed(parse("127.0.0.1"), SsrfPolicy::AllowLoopback));
+    assert!(is_ip_allowed(parse("::1"), SsrfPolicy::AllowLoopback));
 }

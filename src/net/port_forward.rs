@@ -5,15 +5,18 @@ use crate::config::{cidr_contains, parse_cidr, parse_time_window, time_window_co
 use crate::firewall::{FirewallManager, FirewallRule};
 use crate::logger::{self, Level};
 use crate::net::dual_stack::{
-    bind_dual_stack_tcp_on, bind_dual_stack_udp_on, connect_tcp_with_options, connect_udp_with_options, StackMode,
+    bind_dual_stack_tcp_with_reuse_port, bind_dual_stack_udp_with_reuse_port, connect_tcp_with_options,
+    connect_udp_with_options, BanKey, StackMode,
 };
-use crate::net::listener::ConnectionQuota;
+use crate::net::listener::{ConnectionQuota, PeerQuota, PeerQuotaGuard};
 use crate::net::{update_rule_status, RuleRuntimeStatus, RuleStatusMap};
-use tokio::sync::OwnedSemaphorePermit;
+use crate::security::fail2ban::Fail2Ban;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 struct DualPermit {
     _global: OwnedSemaphorePermit,
     _local: OwnedSemaphorePermit,
+    _peer: PeerQuotaGuard,
 }
 use crate::net::proxy_io::TimedIo;
 use std::collections::HashMap;
@@ -276,6 +279,33 @@ async fn cleanup_rule_firewall(firewall: &FirewallManager, name: &str) -> Result
     r1.and(r2)
 }
 
+#[derive(Clone, Default)]
+pub struct PortForwardRuntimeOptions {
+    pub status_map: Option<RuleStatusMap>,
+    pub fail2ban: Option<Arc<Fail2Ban>>,
+    pub reuse_port: bool,
+    pub max_conns_per_peer: Option<usize>,
+}
+
+impl PortForwardRuntimeOptions {
+    pub fn with_status_map(mut self, status_map: Option<RuleStatusMap>) -> Self {
+        self.status_map = status_map;
+        self
+    }
+    pub fn with_fail2ban(mut self, fail2ban: Option<Arc<Fail2Ban>>) -> Self {
+        self.fail2ban = fail2ban;
+        self
+    }
+    pub fn with_reuse_port(mut self, reuse_port: bool) -> Self {
+        self.reuse_port = reuse_port;
+        self
+    }
+    pub fn with_max_conns_per_peer(mut self, max_per_peer: usize) -> Self {
+        self.max_conns_per_peer = Some(max_per_peer.max(1));
+        self
+    }
+}
+
 /// 运行单条端口转发规则的完整生命周期（含时间窗/租约实时切换、子任务收敛与防火墙幂等撤销）
 pub async fn run_port_forward_rule(
     cfg: PortForwardConfig,
@@ -292,9 +322,32 @@ pub async fn run_port_forward_rule_with_status(
     tz_offset_secs: i64,
     global_quota: ConnectionQuota,
     firewall: Arc<FirewallManager>,
-    mut shutdown_rx: watch::Receiver<bool>,
+    shutdown_rx: watch::Receiver<bool>,
     status_map: Option<RuleStatusMap>,
 ) -> Result<(), String> {
+    run_port_forward_rule_with_options(
+        cfg,
+        tz_offset_secs,
+        global_quota,
+        firewall,
+        shutdown_rx,
+        PortForwardRuntimeOptions {
+            status_map,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+pub async fn run_port_forward_rule_with_options(
+    cfg: PortForwardConfig,
+    tz_offset_secs: i64,
+    global_quota: ConnectionQuota,
+    firewall: Arc<FirewallManager>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    options: PortForwardRuntimeOptions,
+) -> Result<(), String> {
+    let status_map = options.status_map.clone();
     let mut rt = RuleRuntimeStatus {
         name: cfg.name.clone(),
         enabled: cfg.enabled,
@@ -359,7 +412,7 @@ pub async fn run_port_forward_rule_with_status(
             global_quota.clone(),
             firewall.clone(),
             &mut shutdown_rx,
-            &status_map,
+            &options,
         )
         .await;
         let cleanup = cleanup_rule_firewall(&firewall, &cfg.name).await;
@@ -392,8 +445,11 @@ async fn run_active_window(
     global_quota: ConnectionQuota,
     firewall: Arc<FirewallManager>,
     shutdown_rx: &mut watch::Receiver<bool>,
-    status_map: &Option<RuleStatusMap>,
+    options: &PortForwardRuntimeOptions,
 ) -> Result<(), String> {
+    let status_map = &options.status_map;
+    let fail2ban = &options.fail2ban;
+    let reuse_port = options.reuse_port;
     let mut rt = RuleRuntimeStatus {
         name: cfg.name.clone(),
         enabled: cfg.enabled,
@@ -425,6 +481,10 @@ async fn run_active_window(
 
     let mode = StackMode::parse(&cfg.stack);
     let rule_quota = ConnectionQuota::new(cfg.max_concurrent_conns);
+    let peer_quota = match options.max_conns_per_peer {
+        Some(limit) => PeerQuota::new(limit),
+        None => PeerQuota::for_rule_capacity(cfg.max_concurrent_conns),
+    };
     let pool = TargetPool::new(cfg, targets.to_vec())?;
     let cancel = CancellationToken::new();
     let _cancel_guard = CancelOnDrop(cancel.clone());
@@ -464,7 +524,7 @@ async fn run_active_window(
     let mut bound_v4 = false;
     let mut bound_v6 = false;
     if cfg.proto == "tcp" || cfg.proto == "tcp_udp" {
-        let bound = bind_dual_stack_tcp_on(cfg.listen_port, mode, &cfg.bind_interface)
+        let bound = bind_dual_stack_tcp_with_reuse_port(cfg.listen_port, mode, &cfg.bind_interface, reuse_port)
             .map_err(|e| format!("转发规则 {} 绑定 TCP {} 失败: {}", cfg.name, cfg.listen_port, e))?;
         bound_v4 |= bound.has_v4();
         bound_v6 |= bound.has_v6();
@@ -488,13 +548,15 @@ async fn run_active_window(
                 tz_offset_secs,
                 global_quota.clone(),
                 rule_quota.clone(),
+                peer_quota.clone(),
+                fail2ban.clone(),
                 cancel.child_token(),
             ));
         }
     }
 
     if cfg.proto == "udp" || cfg.proto == "tcp_udp" {
-        let bound = bind_dual_stack_udp_on(cfg.listen_port, mode, &cfg.bind_interface, true)
+        let bound = bind_dual_stack_udp_with_reuse_port(cfg.listen_port, mode, &cfg.bind_interface, true, reuse_port)
             .map_err(|e| format!("转发规则 {} 绑定 UDP {} 失败: {}", cfg.name, cfg.listen_port, e))?;
         bound_v4 |= bound.v4.is_some();
         bound_v6 |= bound.v6.is_some();
@@ -518,6 +580,8 @@ async fn run_active_window(
                 tz_offset_secs,
                 global_quota.clone(),
                 rule_quota.clone(),
+                peer_quota.clone(),
+                fail2ban.clone(),
                 cancel.child_token(),
             ));
         }
@@ -581,6 +645,7 @@ async fn wait_until_inactive_or_shutdown(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tcp_listener(
     listener: TcpListener,
     cfg: Arc<PortForwardConfig>,
@@ -588,6 +653,8 @@ async fn run_tcp_listener(
     tz_offset_secs: i64,
     global_quota: ConnectionQuota,
     rule_quota: ConnectionQuota,
+    peer_quota: PeerQuota,
+    fail2ban: Option<Arc<Fail2Ban>>,
     cancel: CancellationToken,
 ) -> Result<(), String> {
     let mut conns = tokio::task::JoinSet::new();
@@ -602,14 +669,17 @@ async fn run_tcp_listener(
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 };
-                if !is_rule_active_now(&cfg, logger::unix_now(), tz_offset_secs)
+                let peer_key = BanKey::from_peer(peer.ip());
+                if fail2ban.as_ref().is_some_and(|f| f.is_key_banned(peer_key))
+                    || !is_rule_active_now(&cfg, logger::unix_now(), tz_offset_secs)
                     || !check_forward_cidr(&cfg, peer.ip())
                 {
                     continue;
                 }
+                let Some(pp_guard) = peer_quota.try_acquire(peer_key) else { continue };
                 let Some(gp) = global_quota.try_acquire() else { continue };
                 let Some(rp) = rule_quota.try_acquire() else { continue };
-                let permit = DualPermit { _global: gp, _local: rp };
+                let permit = DualPermit { _global: gp, _local: rp, _peer: pp_guard };
                 let pool_c = pool.clone();
                 let pp = cfg.send_proxy_protocol.clone();
                 let conn_cancel = cancel.child_token();
@@ -797,12 +867,83 @@ async fn splice_bidirectional(a: &TcpStream, b: &TcpStream, idle: Duration) -> i
 struct UdpSessionEntry {
     sock: Arc<UdpSocket>,
     last_active_secs: Arc<std::sync::atomic::AtomicU64>,
+    cancel: CancellationToken,
+}
+
+/// 有界 UDP 64 KiB 读缓冲池：空闲会话不持有堆内存，仅在 socket 就绪读包时短时借用并归还
+struct UdpBufferPool {
+    sem: Arc<Semaphore>,
+    buffers: Arc<StdMutex<Vec<Vec<u8>>>>,
+    cap: usize,
+}
+
+struct PooledUdpBuf {
+    buf: Option<Vec<u8>>,
+    buffers: Arc<StdMutex<Vec<Vec<u8>>>>,
+    cap: usize,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl std::ops::Deref for PooledUdpBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.buf.as_deref().unwrap_or(&[])
+    }
+}
+
+impl std::ops::DerefMut for PooledUdpBuf {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        self.buf.as_deref_mut().unwrap_or(&mut [])
+    }
+}
+
+impl Drop for PooledUdpBuf {
+    fn drop(&mut self) {
+        if let Some(buf) = self.buf.take() {
+            if let Ok(mut g) = self.buffers.lock() {
+                if g.len() < self.cap {
+                    g.push(buf);
+                }
+            }
+        }
+    }
+}
+
+impl UdpBufferPool {
+    fn new(max_buffers: usize) -> Arc<Self> {
+        let cap = max_buffers.clamp(2, 8);
+        Arc::new(Self {
+            sem: Arc::new(Semaphore::new(cap)),
+            buffers: Arc::new(StdMutex::new(Vec::with_capacity(cap))),
+            cap,
+        })
+    }
+
+    async fn acquire(&self) -> Option<PooledUdpBuf> {
+        let permit = self.sem.clone().acquire_owned().await.ok()?;
+        let buf = self
+            .buffers
+            .lock()
+            .ok()
+            .and_then(|mut g| g.pop())
+            .unwrap_or_else(|| vec![0u8; MAX_UDP_PACKET]);
+        Some(PooledUdpBuf {
+            buf: Some(buf),
+            buffers: self.buffers.clone(),
+            cap: self.cap,
+            _permit: permit,
+        })
+    }
 }
 
 #[cfg(target_os = "linux")]
 #[repr(C, align(8))]
 struct AlignedCmsgBuf([u8; 128]);
 
+type UdpSessionKey = (SocketAddr, Option<(IpAddr, u32)>);
+type UdpSessionMap = Arc<Mutex<HashMap<UdpSessionKey, UdpSessionEntry>>>;
+
+#[allow(clippy::too_many_arguments)]
 async fn run_udp_proxy(
     inbound: Arc<UdpSocket>,
     cfg: Arc<PortForwardConfig>,
@@ -810,10 +951,11 @@ async fn run_udp_proxy(
     tz_offset_secs: i64,
     global_quota: ConnectionQuota,
     rule_quota: ConnectionQuota,
+    peer_quota: PeerQuota,
+    fail2ban: Option<Arc<Fail2Ban>>,
     cancel: CancellationToken,
 ) -> Result<(), String> {
-    let sessions: Arc<Mutex<HashMap<(SocketAddr, Option<(IpAddr, u32)>), UdpSessionEntry>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let sessions: UdpSessionMap = Arc::new(Mutex::new(HashMap::new()));
     let mut session_tasks = tokio::task::JoinSet::new();
     let mut buf = vec![0u8; MAX_UDP_PACKET];
     let idle_secs = cfg.udp_session_timeout_secs.clamp(10, 600);
@@ -822,6 +964,7 @@ async fn run_udp_proxy(
     let max_udp_sessions = cfg
         .max_concurrent_conns
         .min((global_quota.capacity() / 2).max(16));
+    let buf_pool = UdpBufferPool::new(max_udp_sessions.min(8));
     let mut last_sweep = Instant::now();
 
     loop {
@@ -833,7 +976,9 @@ async fn run_udp_proxy(
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 };
-                if !is_rule_active_now(&cfg, logger::unix_now(), tz_offset_secs)
+                let peer_key = BanKey::from_peer(peer.ip());
+                if fail2ban.as_ref().is_some_and(|f| f.is_key_banned(peer_key))
+                    || !is_rule_active_now(&cfg, logger::unix_now(), tz_offset_secs)
                     || !check_forward_cidr(&cfg, peer.ip())
                 {
                     continue;
@@ -845,7 +990,11 @@ async fn run_udp_proxy(
                     let mut map = sessions.lock().await;
                     if last_sweep.elapsed() >= Duration::from_secs(5) {
                         map.retain(|_, entry| {
-                            now_unix.saturating_sub(entry.last_active_secs.load(std::sync::atomic::Ordering::Relaxed)) < idle_secs
+                            let alive = now_unix.saturating_sub(entry.last_active_secs.load(std::sync::atomic::Ordering::Relaxed)) < idle_secs;
+                            if !alive {
+                                entry.cancel.cancel();
+                            }
+                            alive
                         });
                         last_sweep = Instant::now();
                     }
@@ -866,37 +1015,58 @@ async fn run_udp_proxy(
                             continue;
                         }
                     }
+                    let Some(pp_guard) = peer_quota.try_acquire(peer_key) else { continue };
                     let Some(gp) = global_quota.try_acquire() else { continue };
                     let Some(rp) = rule_quota.try_acquire() else { continue };
-                    let permit = DualPermit { _global: gp, _local: rp };
+                    let permit = DualPermit { _global: gp, _local: rp, _peer: pp_guard };
                     let Some(s) = pool.connect_udp().await else { continue };
                     let s = Arc::new(s);
                     let last_active_secs = Arc::new(std::sync::atomic::AtomicU64::new(now_unix));
+                    let sess_cancel = cancel.child_token();
                     {
                         let mut map = sessions.lock().await;
                         if map.len() >= max_udp_sessions {
                             continue;
                         }
-                        map.insert(key, UdpSessionEntry { sock: s.clone(), last_active_secs: last_active_secs.clone() });
+                        if let Some(prev) = map.insert(
+                            key,
+                            UdpSessionEntry {
+                                sock: s.clone(),
+                                last_active_secs: last_active_secs.clone(),
+                                cancel: sess_cancel.clone(),
+                            },
+                        ) {
+                            prev.cancel.cancel();
+                        }
                     }
 
                     let s_clone = s.clone();
                     let in_clone = inbound.clone();
                     let sessions_clone = sessions.clone();
-                    let sess_cancel = cancel.child_token();
+                    let buf_pool_clone = buf_pool.clone();
                     session_tasks.spawn(async move {
                         let _permit = permit;
-                        let mut rbuf = vec![0u8; MAX_UDP_PACKET];
                         loop {
-                            let recv_fut = tokio::time::timeout(idle, s_clone.recv(&mut rbuf));
-                            let res = tokio::select! {
+                            let ready_fut = tokio::time::timeout(idle, s_clone.readable());
+                            let ready = tokio::select! {
                                 _ = sess_cancel.cancelled() => break,
-                                r = recv_fut => r,
+                                r = ready_fut => r,
                             };
-                            match res {
-                                Ok(Ok(rn)) => {
-                                    last_active_secs.store(logger::unix_now(), std::sync::atomic::Ordering::Relaxed);
-                                    let _ = send_udp_pkt(&in_clone, &rbuf[..rn], peer, local_dst).await;
+                            match ready {
+                                Ok(Ok(())) => {
+                                    let rbuf = tokio::select! {
+                                        _ = sess_cancel.cancelled() => break,
+                                        b = buf_pool_clone.acquire() => b,
+                                    };
+                                    let Some(mut rbuf) = rbuf else { break };
+                                    match s_clone.try_recv(&mut rbuf) {
+                                        Ok(rn) => {
+                                            last_active_secs.store(logger::unix_now(), std::sync::atomic::Ordering::Relaxed);
+                                            let _ = send_udp_pkt(&in_clone, &rbuf[..rn], peer, local_dst).await;
+                                        }
+                                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                                        Err(_) => break,
+                                    }
                                 }
                                 Ok(Err(_)) => break,
                                 Err(_) => {
@@ -921,6 +1091,12 @@ async fn run_udp_proxy(
         }
     }
 
+    {
+        let mut map = sessions.lock().await;
+        for (_, entry) in map.drain() {
+            entry.cancel.cancel();
+        }
+    }
     while session_tasks.join_next().await.is_some() {}
     Ok(())
 }

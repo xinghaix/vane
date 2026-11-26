@@ -69,44 +69,73 @@ pub fn bind_socket_to_interface(socket: &Socket, domain: Domain, iface: &str) ->
     }
 }
 
-/// 绑定双栈 TCP 监听器：IPv4 与 IPV6_V6ONLY=1 的 IPv6 彼此独立，单一协议栈失败不短路另一协议栈
+/// 绑定双栈 TCP 监听器：IPv4 与 IPV6_V6ONLY=1 的 IPv6 彼此独立，单一协议栈失败不短路另一协议栈（默认关闭 SO_REUSEPORT）
 pub fn bind_dual_stack_tcp(port: u16, mode: StackMode) -> io::Result<BoundTcpListeners> {
     bind_dual_stack_tcp_on(port, mode, "")
 }
 
 pub fn bind_dual_stack_tcp_on(port: u16, mode: StackMode, iface: &str) -> io::Result<BoundTcpListeners> {
+    bind_dual_stack_tcp_with_reuse_port(port, mode, iface, false)
+}
+
+pub fn bind_dual_stack_tcp_with_reuse_port(
+    port: u16,
+    mode: StackMode,
+    iface: &str,
+    reuse_port: bool,
+) -> io::Result<BoundTcpListeners> {
     let mut v4_listener = None;
     let mut v6_listener = None;
     let mut last_err = None;
 
     if matches!(mode, StackMode::Dual | StackMode::Ipv4Only) {
-        match bind_single_tcp(Domain::IPV4, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port), false, iface) {
+        match bind_single_tcp(
+            Domain::IPV4,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+            false,
+            iface,
+            reuse_port,
+        ) {
             Ok(l) => v4_listener = Some(l),
             Err(e) => last_err = Some(e),
         }
     }
 
     if matches!(mode, StackMode::Dual | StackMode::Ipv6Only) {
-        match bind_single_tcp(Domain::IPV6, SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port), true, iface) {
+        match bind_single_tcp(
+            Domain::IPV6,
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port),
+            true,
+            iface,
+            reuse_port,
+        ) {
             Ok(l) => v6_listener = Some(l),
             Err(e) => last_err = Some(e),
         }
     }
 
     if v4_listener.is_none() && v6_listener.is_none() {
-        return Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "未绑定任何协议栈")));
+        return Err(last_err.unwrap_or_else(|| io::Error::other("未绑定任何协议栈")));
     }
 
     Ok(BoundTcpListeners { v4: v4_listener, v6: v6_listener })
 }
 
-fn bind_single_tcp(domain: Domain, addr: SocketAddr, v6_only: bool, iface: &str) -> io::Result<TcpListener> {
+fn bind_single_tcp(
+    domain: Domain,
+    addr: SocketAddr,
+    v6_only: bool,
+    iface: &str,
+    reuse_port: bool,
+) -> io::Result<TcpListener> {
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
     socket.set_reuse_address(true)?;
     #[cfg(unix)]
-    if addr.port() != 0 {
+    if reuse_port && addr.port() != 0 {
         let _ = socket.set_reuse_port(true);
     }
+    #[cfg(not(unix))]
+    let _ = reuse_port;
     if v6_only {
         socket.set_only_v6(true)?;
     }
@@ -132,9 +161,20 @@ pub fn bind_dual_stack_udp_on(
     iface: &str,
     enable_pktinfo: bool,
 ) -> io::Result<BoundUdpSockets> {
+    bind_dual_stack_udp_with_reuse_port(port, mode, iface, enable_pktinfo, false)
+}
+
+pub fn bind_dual_stack_udp_with_reuse_port(
+    port: u16,
+    mode: StackMode,
+    iface: &str,
+    enable_pktinfo: bool,
+    reuse_port: bool,
+) -> io::Result<BoundUdpSockets> {
     let mut v4_sock = None;
     let mut v6_sock = None;
     let mut last_err = None;
+    let effective_reuse_port = reuse_port && port != 0;
 
     if matches!(mode, StackMode::Dual | StackMode::Ipv4Only) {
         match bind_single_udp(
@@ -143,7 +183,7 @@ pub fn bind_dual_stack_udp_on(
             false,
             iface,
             enable_pktinfo,
-            port != 0,
+            effective_reuse_port,
         ) {
             Ok(s) => v4_sock = Some(s),
             Err(e) => last_err = Some(e),
@@ -157,7 +197,7 @@ pub fn bind_dual_stack_udp_on(
             true,
             iface,
             enable_pktinfo,
-            port != 0,
+            effective_reuse_port,
         ) {
             Ok(s) => v6_sock = Some(s),
             Err(e) => last_err = Some(e),
@@ -165,7 +205,7 @@ pub fn bind_dual_stack_udp_on(
     }
 
     if v4_sock.is_none() && v6_sock.is_none() {
-        return Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "未绑定任何 UDP 协议栈")));
+        return Err(last_err.unwrap_or_else(|| io::Error::other("未绑定任何 UDP 协议栈")));
     }
 
     Ok(BoundUdpSockets { v4: v4_sock, v6: v6_sock })

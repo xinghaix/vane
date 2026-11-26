@@ -38,6 +38,7 @@
       <button
         type="button"
         class="btn btn-xs {clear ? '' : 'btn-ghost'}"
+        data-dirty="1"
         style="min-height:24px;font-size:11.5px;color:{clear ? 'var(--info)' : 'var(--danger)'};"
         onclick={() => {
           clear = !clear;

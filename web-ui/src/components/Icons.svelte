@@ -16,7 +16,13 @@
   {:else if name === 'stun'}
     <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
   {:else if name === 'docker'}
-    <rect x="2" y="10" width="20" height="8" rx="2" /><path d="M6 6h4v4H6zM10 6h4v4h-4zM14 6h4v4h-4z" />
+    <path d="M2.2 12.4c.15 4.35 3.15 7.35 8.1 7.35 5.1 0 8.4-2.55 9.65-6.55 1.15.1 2.25-.28 2.85-1.15-.82-.62-1.95-.65-2.8-.22-.18-1.12-.88-2.02-1.8-2.53-.75.85-.88 2.12-.35 3.1-.72.38-1.6.5-2.45.5H2.7c-.28 0-.5.22-.5.5Z" stroke-width="1.75" />
+    <rect x="5" y="9.2" width="2.8" height="2.6" rx="0.5" stroke-width="1.5" />
+    <rect x="8.8" y="9.2" width="2.8" height="2.6" rx="0.5" stroke-width="1.5" />
+    <rect x="12.6" y="9.2" width="2.8" height="2.6" rx="0.5" stroke-width="1.5" />
+    <rect x="8.8" y="5.6" width="2.8" height="2.6" rx="0.5" stroke-width="1.5" />
+    <rect x="12.6" y="5.6" width="2.8" height="2.6" rx="0.5" stroke-width="1.5" />
+    <circle cx="6.3" cy="15.4" r="0.85" fill="currentColor" stroke="none" />
   {:else if name === 'web_terminal' || name === 'terminal'}
     <polyline points="4 17 10 11 4 5" /><line x1="12" y1="19" x2="20" y2="19" />
   {:else if name === 'cron'}
@@ -43,6 +49,16 @@
     <polyline points="20 6 9 17 4 12" />
   {:else if name === 'x'}
     <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+  {:else if name === 'arrow_left'}
+    <line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" />
+  {:else if name === 'arrow_right'}
+    <line x1="5" y1="12" x2="19" y2="12" /><polyline points="12 5 19 12 12 19" />
+  {:else if name === 'external_link'}
+    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" /><polyline points="15 3 21 3 21 9" /><line x1="10" y1="14" x2="21" y2="3" />
+  {:else if name === 'panel_left'}
+    <rect x="3" y="3" width="18" height="18" rx="2" /><line x1="9" y1="3" x2="9" y2="21" />
+  {:else if name === 'logout'}
+    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" />
   {:else if name === 'alert'}
     <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" />
   {:else if name === 'info'}
@@ -65,18 +81,42 @@
     <circle cx="12" cy="12" r="5" /><line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" /><line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" /><line x1="1" y1="12" x2="3" y2="12" /><line x1="21" y1="12" x2="23" y2="12" /><line x1="4.22" y1="19.78" x2="5.64" y2="18.36" /><line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
   {:else if name === 'moon'}
     <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+  {:else if name === 'contrast'}
+    <circle cx="12" cy="12" r="9" /><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor" stroke="none" />
+  {:else if name === 'palette'}
+    <circle cx="13.5" cy="6.5" r=".5" fill="currentColor" /><circle cx="17.5" cy="10.5" r=".5" fill="currentColor" /><circle cx="8.5" cy="7.5" r=".5" fill="currentColor" /><circle cx="6.5" cy="12.5" r=".5" fill="currentColor" /><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.93 0 1.5-.68 1.5-1.5 0-.39-.15-.74-.39-1.01-.23-.26-.38-.61-.38-.99 0-.83.67-1.5 1.5-1.5H16c2.76 0 5-2.24 5-5 0-4.42-4.03-8-9-8z" />
   {:else if name === 'monitor'}
     <rect x="2" y="3" width="20" height="14" rx="2" /><line x1="8" y1="21" x2="16" y2="21" /><line x1="12" y1="17" x2="12" y2="21" />
   {:else if name === 'duplicate'}
     <rect x="8" y="8" width="12" height="12" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
   {:else if name === 'key'}
     <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
+  {:else if name === 'passkey'}
+    <path d="M2 18v3c0 .6.4 1 1 1h4v-3h3v-3h2l1.4-1.4a6.5 6.5 0 1 0-4-4Z" /><circle cx="16.5" cy="7.5" r=".5" fill="currentColor" />
   {:else if name === 'bell'}
     <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" /><path d="M13.73 21a2 2 0 0 1-3.46 0" />
   {:else if name === 'activity'}
     <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
   {:else if name === 'play'}
     <polygon points="5 3 19 12 5 21 5 3" />
+  {:else if name === 'chevron_right'}
+    <polyline points="9 18 15 12 9 6" />
+  {:else if name === 'filter'}
+    <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
+  {:else if name === 'grid'}
+    <rect x="3" y="3" width="7" height="7" rx="1.8" /><rect x="14" y="3" width="7" height="7" rx="1.8" /><rect x="14" y="14" width="7" height="7" rx="1.8" /><rect x="3" y="14" width="7" height="7" rx="1.8" />
+  {:else if name === 'user'}
+    <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" />
+  {:else if name === 'pin'}
+    <line x1="12" y1="17" x2="12" y2="22" /><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z" />
+  {:else if name === 'expand'}
+    <polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" />
+  {:else if name === 'sliders'}
+    <line x1="4" y1="21" x2="4" y2="14" /><line x1="4" y1="10" x2="4" y2="3" /><line x1="12" y1="21" x2="12" y2="12" /><line x1="12" y1="8" x2="12" y2="3" /><line x1="20" y1="21" x2="20" y2="16" /><line x1="20" y1="12" x2="20" y2="3" /><line x1="1" y1="14" x2="7" y2="14" /><line x1="9" y1="8" x2="15" y2="8" /><line x1="17" y1="16" x2="23" y2="16" />
+  {:else if name === 'database'}
+    <ellipse cx="12" cy="5" rx="9" ry="3" /><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" /><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
+  {:else if name === 'save'}
+    <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z" /><polyline points="17 21 17 13 7 13 7 21" /><polyline points="7 3 7 8 15 8" />
   {:else}
     <circle cx="12" cy="12" r="8" />
   {/if}

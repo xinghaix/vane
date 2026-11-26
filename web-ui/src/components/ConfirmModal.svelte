@@ -1,5 +1,6 @@
 <script>
   import Icons from './Icons.svelte';
+  import { registerOverlay } from '../lib/overlay.js';
 
   let {
     open = false,
@@ -13,15 +14,15 @@
     onCancel,
   } = $props();
 
-  function handleKeydown(e) {
-    if (open && e.key === 'Escape' && !busy) {
-      e.preventDefault();
-      onCancel?.();
-    }
-  }
+  $effect(() => {
+    if (!open) return;
+    return registerOverlay({
+      onDismiss: () => {
+        if (!busy) onCancel?.();
+      },
+    });
+  });
 </script>
-
-<svelte:window onkeydown={handleKeydown} />
 
 {#if open}
   <div
@@ -42,7 +43,7 @@
         </div>
         <div style="min-width:0;flex:1;">
           <h3 id="confirm-modal-title" style="font-size:16px;font-weight:700;line-height:1.35;">{title}</h3>
-          <p id="confirm-modal-desc" style="font-size:13px;color:var(--text-secondary);margin-top:6px;line-height:1.55;">{message}</p>
+          <p id="confirm-modal-desc" style="font-size:13px;color:var(--text-secondary);margin-top:6px;line-height:1.55;white-space:pre-line;">{message}</p>
         </div>
       </div>
 

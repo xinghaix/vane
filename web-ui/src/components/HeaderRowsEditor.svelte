@@ -42,14 +42,14 @@
 <div class="field">
   <div class="row-between" style="gap:8px;margin-bottom:4px;">
     <span style="font-size:12.5px;font-weight:600;color:var(--text-secondary);">{label}</span>
-    <button type="button" class="btn btn-xs" onclick={addRow}>
+    <button type="button" class="btn btn-xs" data-dirty="1" onclick={addRow}>
       <Icons name="plus" size={12} />
       <span>{t?.common?.addHeader || '+'}</span>
     </button>
   </div>
 
   {#if rows.length === 0}
-    <div class="field-hint">{t?.common?.noHeaders || '—'}</div>
+    <div class="header-empty-box">{t?.common?.noHeaders || '—'}</div>
   {:else}
     <div style="display:grid;gap:8px;">
       {#each rows as row, i (i)}
@@ -68,7 +68,7 @@
               <input
                 type={secret && !revealed[i] ? 'password' : 'text'}
                 class="mono control-compact"
-                style={secret ? 'padding-right:34px;' : ''}
+                style={secret ? 'padding-right:38px;' : ''}
                 autocomplete={secret ? 'new-password' : 'off'}
                 spellcheck="false"
                 placeholder={keepMasked ? secretMaskedHint(row.original, '****') : (t?.common?.headerValPh || 'Value')}
@@ -90,6 +90,7 @@
             <button
               type="button"
               class="btn btn-xs btn-danger"
+              data-dirty="1"
               aria-label={t?.delete || 'Delete'}
               onclick={() => removeRow(i)}
             >

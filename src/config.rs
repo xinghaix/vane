@@ -2,13 +2,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
-use std::net::{IpAddr, SocketAddr};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub const SECRET_PATH_PLACEHOLDER: &str = "/_vane_init_change_me";
 pub const UNCHANGED_SENTINEL: &str = "__UNCHANGED__";
+const MAX_CONFIG_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // 顶层配置
@@ -19,16 +20,19 @@ pub const UNCHANGED_SENTINEL: &str = "__UNCHANGED__";
 pub struct Config {
     pub system: SystemConfig,
     pub modules: ModulesConfig,
+    pub module_reauth: ModuleReauthConfig,
     pub admin: AdminConfig,
     pub web_terminal: WebTerminalConfig,
     pub security: SecurityConfig,
     pub firewall: FirewallConfig,
     pub monitor: MonitorConfig,
     pub docker: DockerConfig,
+    pub update: UpdateConfig,
     pub dns_providers: BTreeMap<String, DnsProviderConfig>,
     pub ddns: Vec<DdnsConfig>,
     pub acme: Vec<AcmeConfig>,
     pub reverse_proxy: Vec<ReverseProxyConfig>,
+    pub proxy_auth_users: Vec<ProxyAuthUser>,
     pub port_forwards: Vec<PortForwardConfig>,
     pub stun: Vec<StunConfig>,
     pub cron: Vec<CronConfig>,
@@ -40,16 +44,19 @@ impl Default for Config {
         Self {
             system: SystemConfig::default(),
             modules: ModulesConfig::default(),
+            module_reauth: ModuleReauthConfig::default(),
             admin: AdminConfig::default(),
             web_terminal: WebTerminalConfig::default(),
             security: SecurityConfig::default(),
             firewall: FirewallConfig::default(),
             monitor: MonitorConfig::default(),
             docker: DockerConfig::default(),
+            update: UpdateConfig::default(),
             dns_providers: BTreeMap::new(),
             ddns: Vec::new(),
             acme: Vec::new(),
             reverse_proxy: Vec::new(),
+            proxy_auth_users: Vec::new(),
             port_forwards: Vec::new(),
             stun: Vec::new(),
             cron: Vec::new(),
@@ -143,10 +150,65 @@ impl ModulesConfig {
     }
 }
 
+/// 按子模块独立控制的二次验证开关（覆盖全部 8 个可插拔子模块；仪表盘/日志/设置不在此列）
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ModuleReauthConfig {
+    pub reverse_proxy: bool,
+    pub port_forward: bool,
+    pub ddns: bool,
+    pub acme: bool,
+    pub stun: bool,
+    pub web_terminal: bool,
+    pub cron: bool,
+    pub docker: bool,
+}
+
+impl ModuleReauthConfig {
+    pub fn get(&self, name: &str) -> Option<bool> {
+        Some(match name {
+            "reverse_proxy" => self.reverse_proxy,
+            "port_forward" => self.port_forward,
+            "ddns" => self.ddns,
+            "acme" => self.acme,
+            "stun" => self.stun,
+            "web_terminal" => self.web_terminal,
+            "cron" => self.cron,
+            "docker" => self.docker,
+            _ => return None,
+        })
+    }
+
+    pub fn set(&mut self, name: &str, v: bool) -> bool {
+        let slot = match name {
+            "reverse_proxy" => &mut self.reverse_proxy,
+            "port_forward" => &mut self.port_forward,
+            "ddns" => &mut self.ddns,
+            "acme" => &mut self.acme,
+            "stun" => &mut self.stun,
+            "web_terminal" => &mut self.web_terminal,
+            "cron" => &mut self.cron,
+            "docker" => &mut self.docker,
+            _ => return false,
+        };
+        *slot = v;
+        true
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Ed25519KeyEntry {
+pub struct PasskeyEntry {
     pub id: String,
-    pub pubkey: String,
+    pub name: String,
+    pub rp_id: String,
+    pub alg: i32,
+    pub pubkey_b64: String,
+    #[serde(default)]
+    pub sign_count: u32,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub last_used_at: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -164,7 +226,9 @@ pub struct AdminConfig {
     /// TOTP 已接受的最大时间步长（单调水位线，持久化防重启后重放）
     pub totp_last_step: u64,
     pub totp_recovery_hashes: Vec<String>,
-    pub authorized_ed25519_keys: Vec<Ed25519KeyEntry>,
+    /// 是否启用 WebAuthn / Passkey 通行密钥登录与二次验证
+    pub passkey_enabled: bool,
+    pub passkeys: Vec<PasskeyEntry>,
     pub session_ttl_secs: u64,
     pub docker_socket: String,
     /// 额外受信 Origin（例如本地开发时前端 dev server），默认空
@@ -172,6 +236,22 @@ pub struct AdminConfig {
     /// 可选：自定义管理面板证书路径（留空则自动生成本地自签 ECDSA 证书或复用 ACME 证书）
     pub tls_cert_path: String,
     pub tls_key_path: String,
+    /// 是否允许通过 Web 上传二进制更新包（默认关闭，仅由配置文件显式开启）
+    #[serde(default)]
+    pub allow_manual_update_upload: bool,
+    /// 手动更新包 Ed25519 验签公钥（32 字节 hex 或 base64；空表示未配置）
+    #[serde(default)]
+    pub update_signing_public_key: String,
+    /// 是否允许计划任务执行宿主机命令 CronAction::Exec（默认关闭，仅由配置文件显式开启）
+    #[serde(default)]
+    pub allow_cron_exec: bool,
+}
+
+impl AdminConfig {
+    /// 是否为合法的纯通行密钥（禁用密码登录且已绑定至少一个 Passkey）配置
+    pub fn is_passkey_only(&self) -> bool {
+        !self.password_login_enabled && self.passkey_enabled && !self.passkeys.is_empty()
+    }
 }
 
 impl Default for AdminConfig {
@@ -188,12 +268,16 @@ impl Default for AdminConfig {
             totp_secret: String::new(),
             totp_last_step: 0,
             totp_recovery_hashes: Vec::new(),
-            authorized_ed25519_keys: Vec::new(),
+            passkey_enabled: false,
+            passkeys: Vec::new(),
             session_ttl_secs: 3600,
             docker_socket: "/var/run/docker.sock".into(),
             extra_allowed_origins: Vec::new(),
             tls_cert_path: String::new(),
             tls_key_path: String::new(),
+            allow_manual_update_upload: false,
+            update_signing_public_key: String::new(),
+            allow_cron_exec: false,
         }
     }
 }
@@ -214,7 +298,7 @@ impl Default for WebTerminalConfig {
             shell: "auto".into(),
             default_cwd: "/root".into(),
             idle_timeout_secs: 900,
-            max_sessions: 2,
+            max_sessions: 10,
             require_reauth: false,
         }
     }
@@ -470,6 +554,29 @@ impl Default for AcmeConfig {
     }
 }
 
+/// 反向代理独立前置门禁访问账号（与 Vane 管理员账号与会话池完全隔离）
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ProxyAuthUser {
+    pub username: String,
+    pub password_hash: String,
+    pub enabled: bool,
+    pub session_ttl_secs: u64,
+    pub note: String,
+}
+
+impl Default for ProxyAuthUser {
+    fn default() -> Self {
+        Self {
+            username: String::new(),
+            password_hash: String::new(),
+            enabled: true,
+            session_ttl_secs: 43_200,
+            note: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ReverseProxyRule {
@@ -492,6 +599,7 @@ pub struct ReverseProxyRule {
     pub response_headers_set: BTreeMap<String, String>,
     pub response_headers_remove: Vec<String>,
     pub auth_gate: bool,
+    pub auth_gate_users: Vec<String>,
     pub allowed_cidrs: Vec<String>,
     pub denied_cidrs: Vec<String>,
     pub max_body_mb: u64,
@@ -523,6 +631,7 @@ impl Default for ReverseProxyRule {
             response_headers_set: BTreeMap::new(),
             response_headers_remove: Vec::new(),
             auth_gate: false,
+            auth_gate_users: Vec::new(),
             allowed_cidrs: Vec::new(),
             denied_cidrs: Vec::new(),
             max_body_mb: 0,
@@ -814,68 +923,223 @@ impl Default for NotificationConfig {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// 是否定期自动检查 GitHub Release 新版本（默认关闭；仅提醒，永不自动更新）
+    pub auto_check: bool,
+    /// 自动检查间隔小时数 (1..=168)
+    pub check_interval_hours: u64,
+    /// GitHub 仓库标识 `<owner>/<repo>`
+    pub repo: String,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            auto_check: false,
+            check_interval_hours: 24,
+            repo: "xinghaix/vane".into(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 敏感字段枚举（Vault 自动加封 / 脱敏 / 保留未修改密文）
 // ---------------------------------------------------------------------------
 
+/// 对 Vault 字段路径中的动态段（规则名/域名/Header 名）做无歧义转义，杜绝 '.' 拼接碰撞
+pub fn encode_secret_segment(seg: &str) -> String {
+    let mut out = String::with_capacity(seg.len());
+    for ch in seg.chars() {
+        match ch {
+            '%' => out.push_str("%25"),
+            '.' => out.push_str("%2E"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// 解析 32 字节 Ed25519 公钥（支持 64 位 hex 或标准/URL-safe base64）
+pub fn decode_ed25519_public_key(raw: &str) -> Option<[u8; 32]> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+    use base64::Engine;
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let bytes = if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        (0..32)
+            .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+            .collect::<Option<Vec<u8>>>()?
+    } else {
+        STANDARD
+            .decode(s)
+            .or_else(|_| STANDARD_NO_PAD.decode(s))
+            .or_else(|_| URL_SAFE_NO_PAD.decode(s))
+            .ok()?
+    };
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Some(out)
+}
+
 impl Config {
-    /// 遍历全部 L2 运行时可逆机密字段，回调参数为 (字段路径 AAD, 字段值)
-    pub fn for_each_secret_mut(&mut self, mut f: impl FnMut(&str, &mut String)) {
-        f("admin.totp_secret", &mut self.admin.totp_secret);
+    /// 遍历全部 L2 运行时可逆机密字段，回调参数为 (无歧义规范路径 AAD, 历史 v1 路径 AAD, 字段值)
+    pub fn for_each_secret_with_legacy_mut(&mut self, mut f: impl FnMut(&str, &str, &mut String)) {
+        f("admin.totp_secret", "admin.totp_secret", &mut self.admin.totp_secret);
         for (id, p) in self.dns_providers.iter_mut() {
-            f(&format!("dns_providers.{}.api_token", id), &mut p.api_token);
-            f(&format!("dns_providers.{}.secret_key", id), &mut p.secret_key);
+            let eid = encode_secret_segment(id);
+            f(
+                &format!("dns_providers.{}.api_token", eid),
+                &format!("dns_providers.{}.api_token", id),
+                &mut p.api_token,
+            );
+            f(
+                &format!("dns_providers.{}.secret_key", eid),
+                &format!("dns_providers.{}.secret_key", id),
+                &mut p.secret_key,
+            );
         }
         for d in self.ddns.iter_mut() {
-            f(&format!("ddns.{}.token", d.name), &mut d.token);
-            f(&format!("ddns.{}.custom_http.url", d.name), &mut d.custom_http.url);
-            f(&format!("ddns.{}.custom_http.body", d.name), &mut d.custom_http.body);
-            for (header,value) in &mut d.custom_http.headers { f(&format!("ddns.{}.custom_http.headers.{}",d.name,header),value); }
+            let ename = encode_secret_segment(&d.name);
+            f(&format!("ddns.{}.token", ename), &format!("ddns.{}.token", d.name), &mut d.token);
+            f(
+                &format!("ddns.{}.custom_http.url", ename),
+                &format!("ddns.{}.custom_http.url", d.name),
+                &mut d.custom_http.url,
+            );
+            f(
+                &format!("ddns.{}.custom_http.body", ename),
+                &format!("ddns.{}.custom_http.body", d.name),
+                &mut d.custom_http.body,
+            );
+            for (header, value) in &mut d.custom_http.headers {
+                let ehdr = encode_secret_segment(header);
+                f(
+                    &format!("ddns.{}.custom_http.headers.{}", ename, ehdr),
+                    &format!("ddns.{}.custom_http.headers.{}", d.name, header),
+                    value,
+                );
+            }
             match &mut d.source {
-                DdnsSource::ExternalUrl{url_v4,url_v6}=>{
-                    f(&format!("ddns.{}.source.url_v4",d.name),url_v4);
-                    f(&format!("ddns.{}.source.url_v6",d.name),url_v6);
-                },
-                DdnsSource::CustomHttpExtract{url}=>f(&format!("ddns.{}.source.url",d.name),url),
-                _=>{},
+                DdnsSource::ExternalUrl { url_v4, url_v6 } => {
+                    f(
+                        &format!("ddns.{}.source.url_v4", ename),
+                        &format!("ddns.{}.source.url_v4", d.name),
+                        url_v4,
+                    );
+                    f(
+                        &format!("ddns.{}.source.url_v6", ename),
+                        &format!("ddns.{}.source.url_v6", d.name),
+                        url_v6,
+                    );
+                }
+                DdnsSource::CustomHttpExtract { url } => f(
+                    &format!("ddns.{}.source.url", ename),
+                    &format!("ddns.{}.source.url", d.name),
+                    url,
+                ),
+                _ => {}
             }
         }
         for a in self.acme.iter_mut() {
-            f(&format!("acme.{}.eab_hmac_key", a.domain), &mut a.eab_hmac_key);
+            let edom = encode_secret_segment(&a.domain);
+            f(
+                &format!("acme.{}.eab_hmac_key", edom),
+                &format!("acme.{}.eab_hmac_key", a.domain),
+                &mut a.eab_hmac_key,
+            );
             for (i, h) in a.deploy_hooks.iter_mut().enumerate() {
                 if let DeployHook::Webhook { url, .. } = h {
-                    f(&format!("acme.{}.deploy_hooks.{}.url", a.domain, i), url);
+                    f(
+                        &format!("acme.{}.deploy_hooks.{}.url", edom, i),
+                        &format!("acme.{}.deploy_hooks.{}.url", a.domain, i),
+                        url,
+                    );
                 }
             }
         }
         for s in self.stun.iter_mut() {
-            f(&format!("stun.{}.webhook_url", s.name), &mut s.webhook_url);
+            let ename = encode_secret_segment(&s.name);
+            f(
+                &format!("stun.{}.webhook_url", ename),
+                &format!("stun.{}.webhook_url", s.name),
+                &mut s.webhook_url,
+            );
             if let Some(cf) = s.on_change_cloudflare_redirect.as_mut() {
-                f(&format!("stun.{}.on_change_cloudflare_redirect.api_token", s.name), &mut cf.api_token);
+                f(
+                    &format!("stun.{}.on_change_cloudflare_redirect.api_token", ename),
+                    &format!("stun.{}.on_change_cloudflare_redirect.api_token", s.name),
+                    &mut cf.api_token,
+                );
             }
         }
         for c in self.cron.iter_mut() {
+            let ename = encode_secret_segment(&c.name);
             if let CronAction::HttpRequest { url, headers, body, .. } = &mut c.action {
-                f(&format!("cron.{}.action.url", c.name), url);
-                f(&format!("cron.{}.action.body", c.name), body);
+                f(
+                    &format!("cron.{}.action.url", ename),
+                    &format!("cron.{}.action.url", c.name),
+                    url,
+                );
+                f(
+                    &format!("cron.{}.action.body", ename),
+                    &format!("cron.{}.action.body", c.name),
+                    body,
+                );
                 for (h, v) in headers.iter_mut() {
-                    f(&format!("cron.{}.action.headers.{}", c.name, h), v);
+                    let ehdr = encode_secret_segment(h);
+                    f(
+                        &format!("cron.{}.action.headers.{}", ename, ehdr),
+                        &format!("cron.{}.action.headers.{}", c.name, h),
+                        v,
+                    );
                 }
             }
         }
         for n in self.notifications.iter_mut() {
-            f(&format!("notifications.{}.url", n.name), &mut n.url);
-            f(&format!("notifications.{}.token", n.name), &mut n.token);
-            f(&format!("notifications.{}.secret", n.name), &mut n.secret);
-            f(&format!("notifications.{}.body_template", n.name), &mut n.body_template);
+            let ename = encode_secret_segment(&n.name);
+            f(
+                &format!("notifications.{}.url", ename),
+                &format!("notifications.{}.url", n.name),
+                &mut n.url,
+            );
+            f(
+                &format!("notifications.{}.token", ename),
+                &format!("notifications.{}.token", n.name),
+                &mut n.token,
+            );
+            f(
+                &format!("notifications.{}.secret", ename),
+                &format!("notifications.{}.secret", n.name),
+                &mut n.secret,
+            );
+            f(
+                &format!("notifications.{}.body_template", ename),
+                &format!("notifications.{}.body_template", n.name),
+                &mut n.body_template,
+            );
             for (header, value) in &mut n.headers {
-                f(&format!("notifications.{}.headers.{}", n.name, header), value);
+                let ehdr = encode_secret_segment(header);
+                f(
+                    &format!("notifications.{}.headers.{}", ename, ehdr),
+                    &format!("notifications.{}.headers.{}", n.name, header),
+                    value,
+                );
             }
         }
         for rp in self.reverse_proxy.iter_mut() {
+            let erp = encode_secret_segment(&rp.name);
             for (i, rule) in rp.rules.iter_mut().enumerate() {
                 for (header, value) in &mut rule.request_headers_set {
+                    let ehdr = encode_secret_segment(header);
                     f(
+                        &format!("reverse_proxy.{}.rules.{}.request_headers_set.{}", erp, i, ehdr),
                         &format!("reverse_proxy.{}.rules.{}.request_headers_set.{}", rp.name, i, header),
                         value,
                     );
@@ -884,11 +1148,25 @@ impl Config {
         }
     }
 
+    /// 遍历全部 L2 运行时可逆机密字段，回调参数为 (无歧义规范路径 AAD, 字段值)
+    pub fn for_each_secret_mut(&mut self, mut f: impl FnMut(&str, &mut String)) {
+        self.for_each_secret_with_legacy_mut(|canonical, _legacy, v| f(canonical, v));
+    }
+
     pub fn secret_map(&self) -> BTreeMap<String, String> {
         let mut c = self.clone();
         let mut m = BTreeMap::new();
         c.for_each_secret_mut(|p, v| {
             m.insert(p.to_string(), v.clone());
+        });
+        m
+    }
+
+    pub fn secret_map_with_legacy(&self) -> BTreeMap<String, (String, String)> {
+        let mut c = self.clone();
+        let mut m = BTreeMap::new();
+        c.for_each_secret_with_legacy_mut(|p, legacy, v| {
+            m.insert(p.to_string(), (legacy.to_string(), v.clone()));
         });
         m
     }
@@ -913,6 +1191,12 @@ impl Config {
         ports
     }
 
+    /// 检查指定子模块是否要求二次身份验证（兼容历史 web_terminal.require_reauth 配置）
+    pub fn module_requires_reauth(&self, name: &str) -> bool {
+        self.module_reauth.get(name).unwrap_or(false)
+            || (name == "web_terminal" && self.web_terminal.require_reauth)
+    }
+
     // -----------------------------------------------------------------------
     // 校验
     // -----------------------------------------------------------------------
@@ -922,6 +1206,14 @@ impl Config {
     }
 
     pub fn validate_with_vault(&self, vault: Option<&crate::security::vault::Vault>) -> Result<(), String> {
+        self.validate_with_vault_and_listeners(vault, &[])
+    }
+
+    pub fn validate_with_vault_and_listeners(
+        &self,
+        vault: Option<&crate::security::vault::Vault>,
+        live_admin_listeners: &[SocketAddr],
+    ) -> Result<(), String> {
         let s = &self.system;
         if !matches!(s.language.as_str(), "zh" | "en") {
             return Err(format!("system.language 仅支持 zh 或 en，当前值: {}", s.language));
@@ -937,6 +1229,7 @@ impl Config {
         if a.listen_lan.is_empty() {
             return Err("admin.listen_lan 不能为空".into());
         }
+        let mut all_admin_listeners: Vec<SocketAddr> = Vec::new();
         for l in &a.listen_lan {
             let addr: SocketAddr = l.parse().map_err(|_| format!("admin.listen_lan 非法地址: {}", l))?;
             if addr.ip().is_unspecified() {
@@ -944,6 +1237,14 @@ impl Config {
             }
             if addr.port() == 0 {
                 return Err("admin.listen_lan 禁止使用 0 端口".into());
+            }
+            if !all_admin_listeners.contains(&addr) {
+                all_admin_listeners.push(addr);
+            }
+        }
+        for &addr in live_admin_listeners {
+            if !all_admin_listeners.contains(&addr) {
+                all_admin_listeners.push(addr);
             }
         }
         if crate::web::boundary::origin_authority(&a.canonical_origin).is_none() {
@@ -963,26 +1264,29 @@ impl Config {
             if a.must_change_password {
                 return Err("完成首次改密前不允许关闭密码登录".into());
             }
-            if a.authorized_ed25519_keys.is_empty() {
-                return Err("至少绑定 1 把 Ed25519 公钥后才允许关闭密码登录".into());
+            let has_passkey = a.passkey_enabled && !a.passkeys.is_empty();
+            if !has_passkey {
+                return Err("至少启用并绑定 1 个通行密钥后才允许关闭密码登录".into());
             }
         }
-        let mut key_ids = Vec::new();
-        for k in &a.authorized_ed25519_keys {
-            validate_name("authorized_ed25519_keys.id", &k.id)?;
-            if key_ids.contains(&&k.id) {
-                return Err(format!("Ed25519 公钥 id 重复: {}", k.id));
+        if a.passkeys.len() > 16 {
+            return Err("通行密钥数量超过 16 个上限".into());
+        }
+        let mut pk_ids = Vec::new();
+        for p in &a.passkeys {
+            crate::security::webauthn::validate_passkey_entry(p)?;
+            if pk_ids.contains(&&p.id) {
+                return Err(format!("通行密钥 Credential ID 重复: {}", p.id));
             }
-            key_ids.push(&k.id);
-            if crate::security::auth::parse_openssh_ed25519(&k.pubkey).is_none() {
-                return Err(format!("Ed25519 公钥 {} 格式非法（需 ssh-ed25519 AAAA...）", k.id));
-            }
+            pk_ids.push(&p.id);
         }
         if a.totp_enabled {
             if a.totp_secret.is_empty() {
                 return Err("启用 TOTP 时必须先配置有效密钥".into());
             }
-            if let Some(plain_secret) = reveal_for_validation(vault, "admin.totp_secret", &a.totp_secret)? {
+            if let Some(plain_secret) =
+                reveal_for_validation(vault, "admin.totp_secret", "admin.totp_secret", &a.totp_secret)?
+            {
                 let decoded = crate::security::auth::base32_decode(&plain_secret)
                     .ok_or_else(|| "admin.totp_secret Base32 格式非法".to_string())?;
                 if decoded.len() < 16 {
@@ -990,12 +1294,26 @@ impl Config {
                 }
             }
         }
+        if !a.docker_socket.is_empty() {
+            validate_safe_abs_path("admin.docker_socket", &a.docker_socket)?;
+            if a.docker_socket.ends_with('/') {
+                return Err("admin.docker_socket 不能以 / 结尾".into());
+            }
+        }
+        if !a.update_signing_public_key.trim().is_empty()
+            && decode_ed25519_public_key(&a.update_signing_public_key).is_none()
+        {
+            return Err("admin.update_signing_public_key 必须为 32 字节的 hex 或 base64 编码 Ed25519 公钥".into());
+        }
         if !a.tls_cert_path.is_empty() || !a.tls_key_path.is_empty() {
             if a.tls_cert_path.is_empty() || a.tls_key_path.is_empty() {
                 return Err("admin.tls_cert_path 与 admin.tls_key_path 必须成对配置".into());
             }
             validate_safe_abs_path("admin.tls_cert_path", &a.tls_cert_path)?;
             validate_safe_abs_path("admin.tls_key_path", &a.tls_key_path)?;
+            if a.tls_cert_path.ends_with('/') || a.tls_key_path.ends_with('/') {
+                return Err("admin.tls_cert_path / admin.tls_key_path 必须指向具体文件".into());
+            }
         }
         for orig in &a.extra_allowed_origins {
             if crate::web::boundary::origin_authority(orig).is_none() {
@@ -1005,9 +1323,15 @@ impl Config {
 
         let w = &self.web_terminal;
         range("web_terminal.idle_timeout_secs", w.idle_timeout_secs, 60, 3600)?;
-        range("web_terminal.max_sessions", w.max_sessions as u64, 1, 4)?;
-        if w.shell != "auto" && !w.shell.starts_with('/') {
-            return Err("web_terminal.shell 必须为 auto 或绝对路径".into());
+        range("web_terminal.max_sessions", w.max_sessions as u64, 1, 10)?;
+        if !matches!(w.shell.as_str(), "auto" | "bash" | "sh") {
+            if !w.shell.starts_with('/') {
+                return Err("web_terminal.shell 必须为 auto、bash、sh 或绝对路径".into());
+            }
+            validate_safe_abs_path("web_terminal.shell", &w.shell)?;
+            if w.shell.ends_with('/') {
+                return Err("web_terminal.shell 必须指向具体可执行文件".into());
+            }
         }
         if !w.default_cwd.is_empty() {
             validate_safe_abs_path("web_terminal.default_cwd", &w.default_cwd)?;
@@ -1060,6 +1384,7 @@ impl Config {
             validate_domain(&d.domain)?;
             range("ddns.reconcile_interval_secs", d.reconcile_interval_secs, 30, 86400)?;
             range("ddns.ttl", d.ttl as u64, 1, 86400)?;
+            let ename = encode_secret_segment(&d.name);
             if d.provider != "custom_http" && !self.dns_providers.contains_key(&d.provider) {
                 return Err(format!("ddns.{} 引用了不存在的 DNS 服务商账号 {}", d.name, d.provider));
             }
@@ -1067,14 +1392,25 @@ impl Config {
                 return Err("custom_http 不支持隐式删除记录，请使用 keep_existing".into());
             }
             if d.provider == "custom_http" {
-                if let Some(u) = reveal_for_validation(vault, &format!("ddns.{}.custom_http.url", d.name), &d.custom_http.url)? {
+                if let Some(u) = reveal_for_validation(
+                    vault,
+                    &format!("ddns.{}.custom_http.url", ename),
+                    &format!("ddns.{}.custom_http.url", d.name),
+                    &d.custom_http.url,
+                )? {
                     if !is_http_or_https_url(&u) {
                         return Err(format!("ddns.{} custom_http.url 非法", d.name));
                     }
                 }
                 for (hk, hv) in &d.custom_http.headers {
                     http::HeaderName::from_bytes(hk.as_bytes()).map_err(|_| format!("ddns.{} custom_http Header 名非法", d.name))?;
-                    if let Some(pv) = reveal_for_validation(vault, &format!("ddns.{}.custom_http.headers.{}", d.name, hk), hv)? {
+                    let ehk = encode_secret_segment(hk);
+                    if let Some(pv) = reveal_for_validation(
+                        vault,
+                        &format!("ddns.{}.custom_http.headers.{}", ename, ehk),
+                        &format!("ddns.{}.custom_http.headers.{}", d.name, hk),
+                        hv,
+                    )? {
                         http::HeaderValue::from_str(&pv).map_err(|_| format!("ddns.{} custom_http Header 值非法", d.name))?;
                     }
                 }
@@ -1108,14 +1444,24 @@ impl Config {
                         return Err(format!("ddns.{} external_url 至少配置一个地址", d.name));
                     }
                     if !url_v4.is_empty() {
-                        if let Some(u) = reveal_for_validation(vault, &format!("ddns.{}.source.url_v4", d.name), url_v4)? {
+                        if let Some(u) = reveal_for_validation(
+                            vault,
+                            &format!("ddns.{}.source.url_v4", ename),
+                            &format!("ddns.{}.source.url_v4", d.name),
+                            url_v4,
+                        )? {
                             if !is_http_or_https_url(&u) {
                                 return Err(format!("ddns.{} external_url.url_v4 非法", d.name));
                             }
                         }
                     }
                     if !url_v6.is_empty() {
-                        if let Some(u) = reveal_for_validation(vault, &format!("ddns.{}.source.url_v6", d.name), url_v6)? {
+                        if let Some(u) = reveal_for_validation(
+                            vault,
+                            &format!("ddns.{}.source.url_v6", ename),
+                            &format!("ddns.{}.source.url_v6", d.name),
+                            url_v6,
+                        )? {
                             if !is_http_or_https_url(&u) {
                                 return Err(format!("ddns.{} external_url.url_v6 非法", d.name));
                             }
@@ -1123,7 +1469,12 @@ impl Config {
                     }
                 }
                 DdnsSource::CustomHttpExtract { url } => {
-                    if let Some(u) = reveal_for_validation(vault, &format!("ddns.{}.source.url", d.name), url)? {
+                    if let Some(u) = reveal_for_validation(
+                        vault,
+                        &format!("ddns.{}.source.url", ename),
+                        &format!("ddns.{}.source.url", d.name),
+                        url,
+                    )? {
                         if !is_http_or_https_url(&u) {
                             return Err(format!("ddns.{} custom_http_extract.url 非法", d.name));
                         }
@@ -1145,14 +1496,14 @@ impl Config {
         if self.acme.len()>32 {return Err("ACME 规则数超过 32 条上限".into());}
         if self.acme.iter().filter(|entry|entry.enabled && entry.use_for_admin).count()>1 {return Err("最多允许一条 ACME 规则更新管理证书".into());}
         for a in &self.acme {
-            validate_domain(&a.domain)?;
+            validate_acme_domain(&a.domain)?;
             let dom_low = a.domain.to_ascii_lowercase();
             if acme_domains.contains(&dom_low) {
                 return Err(format!("acme 名称重复: {}", a.domain));
             }
             acme_domains.push(dom_low);
             for e in &a.extra_domains {
-                validate_domain(e)?;
+                validate_acme_domain(e)?;
             }
             if !self.dns_providers.contains_key(&a.dns_provider) {
                 return Err(format!("acme.{} 引用了不存在的 DNS 服务商账号 {}", a.domain, a.dns_provider));
@@ -1169,14 +1520,20 @@ impl Config {
                 if a.challenge_alias_domain.contains('*') {
                     return Err(format!("acme.{}.challenge_alias_domain 不允许通配符", a.domain));
                 }
-                validate_domain(a.challenge_alias_domain.strip_prefix("_acme-challenge.").unwrap_or(&a.challenge_alias_domain))?;
+                validate_acme_domain(a.challenge_alias_domain.strip_prefix("_acme-challenge.").unwrap_or(&a.challenge_alias_domain))?;
             }
             validate_safe_abs_dir("acme.cert_dir", &a.cert_dir)?;
+            let edom = encode_secret_segment(&a.domain);
             for (hi, h) in a.deploy_hooks.iter().enumerate() {
                 match h {
                     DeployHook::CopyToDir { dir } => validate_safe_abs_dir("acme.deploy_hooks.copy_to_dir", dir)?,
                     DeployHook::Webhook { url, include_private_key } => {
-                        if let Some(plain_url) = reveal_for_validation(vault, &format!("acme.{}.deploy_hooks.{}.url", a.domain, hi), url)? {
+                        if let Some(plain_url) = reveal_for_validation(
+                            vault,
+                            &format!("acme.{}.deploy_hooks.{}.url", edom, hi),
+                            &format!("acme.{}.deploy_hooks.{}.url", a.domain, hi),
+                            url,
+                        )? {
                             if *include_private_key {
                                 if !plain_url.starts_with("https://") {
                                     return Err(format!("acme.{}: 携带私钥的 Webhook 必须使用 HTTPS", a.domain));
@@ -1190,7 +1547,29 @@ impl Config {
             }
         }
 
-        let admin_ports = self.admin_ports();
+        if self.proxy_auth_users.len() > 64 {
+            return Err("反向代理独立门禁账号数超过 64 个上限".into());
+        }
+        let mut gate_usernames: Vec<&str> = Vec::new();
+        for u in &self.proxy_auth_users {
+            validate_username(&u.username)
+                .map_err(|e| format!("proxy_auth_users.{}: {}", u.username, e))?;
+            unique(&mut gate_usernames, "proxy_auth_users", &u.username)?;
+            range("proxy_auth_users.session_ttl_secs", u.session_ttl_secs, 300, 604_800)?;
+            if u.note.chars().count() > 128 {
+                return Err(format!("proxy_auth_users.{}.note 长度不能超过 128 字符", u.username));
+            }
+            if crate::security::auth::PasswordHash::parse(&u.password_hash).is_none() {
+                return Err(format!("proxy_auth_users.{}.password_hash 格式非法或未设置密码", u.username));
+            }
+        }
+
+        let mut admin_ports = self.admin_ports();
+        for addr in &all_admin_listeners {
+            if !admin_ports.contains(&addr.port()) {
+                admin_ports.push(addr.port());
+            }
+        }
         let mut names = Vec::new();
         let mut used_ports: Vec<(u16, &'static str)> = Vec::new();
         for r in &self.reverse_proxy {
@@ -1214,7 +1593,7 @@ impl Config {
                 used_ports.push((r.listen_port, "tcp"));
             }
             for (ri, rule) in r.rules.iter().enumerate() {
-                validate_rule(&r.name, ri, rule, vault, &admin_ports, &self.admin.listen_lan)
+                validate_rule(&r.name, ri, rule, vault, &all_admin_listeners)
                     .map_err(|e| format!("reverse_proxy.{} 规则 {}: {}", r.name, rule.host, e))?;
             }
         }
@@ -1246,18 +1625,36 @@ impl Config {
             if targets.is_empty() {
                 return Err(format!("port_forwards.{} 至少需要一个目标地址", p.name));
             }
+            // VANE-H01: 仅当 userspace_splice 且未放行 WAN 且明确绑定到 firewall.lan_interfaces 中的网卡时才视为仅 LAN 绑定
+            let lan_bound_only = p.engine == "userspace_splice"
+                && !p.open_wan_firewall
+                && !p.bind_interface.is_empty()
+                && self.firewall.lan_interfaces.iter().any(|iface| iface == &p.bind_interface);
+            let wan_exposed = p.open_wan_firewall || p.engine == "kernel_dnat" || !lan_bound_only;
             let mut parsed = Vec::new();
             for t in &targets {
                 let a: SocketAddr = t.parse().map_err(|_| format!("port_forwards.{} 目标地址非法 {}", p.name, t))?;
                 if a.port() == 0 {
                     return Err(format!("port_forwards.{} 目标端口不能为 0", p.name));
                 }
-                crate::firewall::validate_forward_target_safety_multi(
-                    a,
-                    &p.engine,
-                    p.open_wan_firewall,
-                    &admin_ports,
-                    &self.admin.listen_lan,
+                if p.engine == "kernel_dnat" {
+                    let norm = match a.ip() {
+                        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+                        other => other,
+                    };
+                    if norm.is_loopback() || norm.is_unspecified() {
+                        return Err(format!(
+                            "port_forwards.{}: 安全与协议拦截：kernel_dnat 目标不能为环回或未指定地址 ({})",
+                            p.name, a
+                        ));
+                    }
+                }
+                crate::firewall::validate_forward_target_safety_strict(
+                    a.ip(),
+                    a.port(),
+                    wan_exposed,
+                    lan_bound_only,
+                    &all_admin_listeners,
                 )
                 .map_err(|e| format!("port_forwards.{}: {}", p.name, e))?;
                 parsed.push(a);
@@ -1319,7 +1716,13 @@ impl Config {
             }
             range("stun.keepalive_secs", s.keepalive_secs, 5, 3600)?;
             if !s.webhook_url.is_empty() {
-                if let Some(u) = reveal_for_validation(vault, &format!("stun.{}.webhook_url", s.name), &s.webhook_url)? {
+                let ename = encode_secret_segment(&s.name);
+                if let Some(u) = reveal_for_validation(
+                    vault,
+                    &format!("stun.{}.webhook_url", ename),
+                    &format!("stun.{}.webhook_url", s.name),
+                    &s.webhook_url,
+                )? {
                     if !u.is_empty() && !is_http_or_https_url(&u) {
                         return Err(format!("stun.{}.webhook_url 非法", s.name));
                     }
@@ -1348,9 +1751,19 @@ impl Config {
             unique(&mut names, "cron", &c.name)?;
             crate::daemon::cron::CronSchedule::parse(&c.schedule).map_err(|e| format!("cron.{}: {}", c.name, e))?;
             range("cron.timeout_secs", c.timeout_secs, 1, 86_400)?;
+            let ename = encode_secret_segment(&c.name);
             match &c.action {
                 CronAction::Exec { program, cwd, .. } => {
+                    if !self.admin.allow_cron_exec && c.enabled {
+                        return Err(format!(
+                            "cron.{}: 未启用 admin.allow_cron_exec 时禁止启用 exec 计划任务",
+                            c.name
+                        ));
+                    }
                     validate_safe_abs_path(&format!("cron.{}.exec.program", c.name), program)?;
+                    if program.ends_with('/') {
+                        return Err(format!("cron.{}.exec.program 必须指向可执行文件", c.name));
+                    }
                     if !cwd.is_empty() {
                         validate_safe_abs_path(&format!("cron.{}.exec.cwd", c.name), cwd)?;
                     }
@@ -1365,14 +1778,25 @@ impl Config {
                     if !m.is_empty() && !matches!(m.to_ascii_uppercase().as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD") {
                         return Err(format!("cron.{}: http_request.method 非法", c.name));
                     }
-                    if let Some(u) = reveal_for_validation(vault, &format!("cron.{}.action.url", c.name), url)? {
+                    if let Some(u) = reveal_for_validation(
+                        vault,
+                        &format!("cron.{}.action.url", ename),
+                        &format!("cron.{}.action.url", c.name),
+                        url,
+                    )? {
                         if !is_http_or_https_url(&u) {
                             return Err(format!("cron.{}: http_request.url 非法", c.name));
                         }
                     }
                     for (hk, hv) in headers {
                         http::HeaderName::from_bytes(hk.as_bytes()).map_err(|_| format!("cron.{}: Header 名非法", c.name))?;
-                        if let Some(pv) = reveal_for_validation(vault, &format!("cron.{}.action.headers.{}", c.name, hk), hv)? {
+                        let ehk = encode_secret_segment(hk);
+                        if let Some(pv) = reveal_for_validation(
+                            vault,
+                            &format!("cron.{}.action.headers.{}", ename, ehk),
+                            &format!("cron.{}.action.headers.{}", c.name, hk),
+                            hv,
+                        )? {
                             http::HeaderValue::from_str(&pv).map_err(|_| format!("cron.{}: Header 值非法", c.name))?;
                         }
                     }
@@ -1385,6 +1809,7 @@ impl Config {
         for n in &self.notifications {
             validate_name("notifications.name", &n.name)?;
             unique(&mut names, "notifications", &n.name)?;
+            let ename = encode_secret_segment(&n.name);
             if !matches!(
                 n.provider.as_str(),
                 "webhook" | "bark" | "telegram" | "wecom" | "feishu" | "dingtalk" | "ntfy" | "gotify"
@@ -1398,7 +1823,12 @@ impl Config {
                 return Err(format!("notifications.{}.method 非法: {}", n.name, n.method));
             }
             if !n.url.is_empty() {
-                if let Some(u) = reveal_for_validation(vault, &format!("notifications.{}.url", n.name), &n.url)? {
+                if let Some(u) = reveal_for_validation(
+                    vault,
+                    &format!("notifications.{}.url", ename),
+                    &format!("notifications.{}.url", n.name),
+                    &n.url,
+                )? {
                     if !u.is_empty() && !is_http_or_https_url(&u) {
                         return Err(format!("notifications.{}.url 非法", n.name));
                     }
@@ -1406,18 +1836,32 @@ impl Config {
             }
             for (hk, hv) in &n.headers {
                 http::HeaderName::from_bytes(hk.as_bytes()).map_err(|_| format!("notifications.{}.headers 名非法", n.name))?;
-                if let Some(pv) = reveal_for_validation(vault, &format!("notifications.{}.headers.{}", n.name, hk), hv)? {
+                let ehk = encode_secret_segment(hk);
+                if let Some(pv) = reveal_for_validation(
+                    vault,
+                    &format!("notifications.{}.headers.{}", ename, ehk),
+                    &format!("notifications.{}.headers.{}", n.name, hk),
+                    hv,
+                )? {
                     http::HeaderValue::from_str(&pv).map_err(|_| format!("notifications.{}.headers 值非法", n.name))?;
                 }
             }
             if !n.body_template.is_empty() && n.body_template != UNCHANGED_SENTINEL {
-                if let Some(plain_tpl) = reveal_for_validation(vault, &format!("notifications.{}.body_template", n.name), &n.body_template)? {
+                if let Some(plain_tpl) = reveal_for_validation(
+                    vault,
+                    &format!("notifications.{}.body_template", ename),
+                    &format!("notifications.{}.body_template", n.name),
+                    &n.body_template,
+                )? {
                     if !plain_tpl.is_empty() && serde_json::from_str::<serde_json::Value>(&plain_tpl).is_err() {
                         return Err(format!("notifications.{}.body_template 必须是合法 JSON", n.name));
                     }
                 }
             }
         }
+
+        range("update.check_interval_hours", self.update.check_interval_hours, 1, 168)?;
+        crate::daemon::updater::validate_github_repo(&self.update.repo)?;
         Ok(())
     }
 }
@@ -1433,13 +1877,16 @@ fn proto_kinds(p: &str) -> Vec<&'static str> {
 fn reveal_for_validation(
     vault: Option<&crate::security::vault::Vault>,
     field_path: &str,
+    legacy_field_path: &str,
     raw: &str,
 ) -> Result<Option<String>, String> {
-    if !raw.starts_with(crate::security::vault::ENC_PREFIX) {
+    if !crate::security::vault::is_sealed_value(raw) {
         return Ok(Some(raw.to_string()));
     }
     match vault {
-        Some(v) => v.open(field_path, raw).map(|sb| Some(sb.expose_str().to_string())),
+        Some(v) => v
+            .open_with_legacy(field_path, Some(legacy_field_path), raw)
+            .map(|sb| Some(sb.expose_str().to_string())),
         None => Ok(None),
     }
 }
@@ -1449,8 +1896,14 @@ fn is_http_or_https_url(url: &str) -> bool {
 }
 
 fn validate_safe_abs_path(field: &str, p: &str) -> Result<(), String> {
-    if !p.starts_with('/') || p.contains('\0') || p.split('/').any(|seg| seg == "..") {
-        return Err(format!("{} 必须为不含 .. 的绝对路径", field));
+    if !p.starts_with('/')
+        || p.contains('\0')
+        || p.contains('\r')
+        || p.contains('\n')
+        || p.contains("//")
+        || p.split('/').any(|seg| seg == ".." || seg == ".")
+    {
+        return Err(format!("{} 必须为不含 .、.. 或 // 的规范绝对路径", field));
     }
     Ok(())
 }
@@ -1458,10 +1911,19 @@ fn validate_safe_abs_path(field: &str, p: &str) -> Result<(), String> {
 fn validate_safe_abs_dir(field: &str, p: &str) -> Result<(), String> {
     validate_safe_abs_path(field, p)?;
     let trimmed = p.trim_end_matches('/');
-    if trimmed.is_empty()
-        || matches!(trimmed, "/etc" | "/usr" | "/bin" | "/sbin" | "/proc" | "/sys" | "/dev" | "/lib")
-    {
-        return Err(format!("{} 不能指向系统关键根目录: {}", field, p));
+    if trimmed.is_empty() {
+        return Err(format!("{} 不能指向系统根目录: {}", field, p));
+    }
+    const FORBIDDEN_PREFIXES: &[&str] = &[
+        "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64",
+        "/proc", "/sys", "/dev", "/boot", "/run", "/root", "/var/run",
+    ];
+    for prefix in FORBIDDEN_PREFIXES {
+        if trimmed == *prefix
+            || (trimmed.starts_with(prefix) && trimmed.as_bytes().get(prefix.len()) == Some(&b'/'))
+        {
+            return Err(format!("{} 不能指向系统关键目录或其子目录: {}", field, p));
+        }
     }
     Ok(())
 }
@@ -1504,13 +1966,33 @@ fn validate_stun_server(s: &str) -> Result<(), String> {
     validate_domain(clean_host)
 }
 
+fn is_non_canonical_numeric_ipv4(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return false;
+    }
+    let is_num_part = |p: &str| -> bool {
+        if p.is_empty() {
+            return false;
+        }
+        if let Some(hex) = p.strip_prefix("0x").or_else(|| p.strip_prefix("0X")) {
+            !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
+        } else {
+            p.bytes().all(|b| b.is_ascii_digit())
+        }
+    };
+    parts.iter().all(|p| is_num_part(p))
+}
+
 fn validate_rule(
     rp_name: &str,
     rule_idx: usize,
     r: &ReverseProxyRule,
     vault: Option<&crate::security::vault::Vault>,
-    admin_ports: &[u16],
-    admin_listeners: &[String],
+    admin_listeners: &[SocketAddr],
 ) -> Result<(), String> {
     validate_domain(&r.host)?;
     if !r.path_prefix.starts_with('/')
@@ -1535,23 +2017,45 @@ fn validate_rule(
             }
             if let Some(auth) = uri.authority() {
                 let default_port = if uri.scheme_str() == Some("https") { 443 } else { 80 };
-                let target_sock = auth.as_str().parse::<SocketAddr>().ok().or_else(|| {
-                    let h = auth.host().trim_matches(['[', ']']);
-                    let port = auth.port_u16().unwrap_or(default_port);
-                    if h.eq_ignore_ascii_case("localhost") {
-                        Some(SocketAddr::from(([127, 0, 0, 1], port)))
-                    } else {
-                        h.parse::<IpAddr>().ok().map(|ip| SocketAddr::new(ip, port))
+                let port = auth.port_u16().unwrap_or(default_port);
+                let raw_host = auth.host().trim_matches(['[', ']']);
+                if raw_host.contains('%') {
+                    return Err("upstream 主机名禁止包含非法字符或 zone id".into());
+                }
+                let trimmed_host = raw_host.trim_end_matches('.');
+                if trimmed_host.is_empty() || trimmed_host.starts_with('.') || trimmed_host.contains("..") {
+                    return Err("upstream 主机名非法".into());
+                }
+                if let Ok(ip) = trimmed_host.parse::<IpAddr>() {
+                    if raw_host != trimmed_host {
+                        return Err("upstream 禁止在字面 IP 后追加尾点".into());
                     }
-                });
-                if let Some(sock) = target_sock {
-                    crate::firewall::validate_forward_target_safety_multi(
-                        sock,
-                        "userspace_splice",
+                    crate::firewall::validate_forward_target_safety_strict(
+                        ip,
+                        port,
                         true,
-                        admin_ports,
+                        false,
                         admin_listeners,
                     )?;
+                } else if trimmed_host.eq_ignore_ascii_case("localhost")
+                    || trimmed_host.to_ascii_lowercase().ends_with(".localhost")
+                {
+                    crate::firewall::validate_forward_target_safety_strict(
+                        IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        port,
+                        true,
+                        false,
+                        admin_listeners,
+                    )?;
+                    crate::firewall::validate_forward_target_safety_strict(
+                        IpAddr::V6(Ipv6Addr::LOCALHOST),
+                        port,
+                        true,
+                        false,
+                        admin_listeners,
+                    )?;
+                } else if is_non_canonical_numeric_ipv4(trimmed_host) {
+                    return Err(format!("upstream 禁止使用非规范数值 IPv4 主机名: {}", raw_host));
                 }
             }
         }
@@ -1586,9 +2090,24 @@ fn validate_rule(
             return Err("upstream_cert_sha256 需要 64 位十六进制 SHA-256 指纹".into());
         }
     }
+    if !r.upstream_sni.is_empty() {
+        if r.upstream_sni.contains('*') {
+            return Err("upstream_sni 不允许通配符".into());
+        }
+        validate_domain(&r.upstream_sni).map_err(|_| format!("upstream_sni 域名非法: {}", r.upstream_sni))?;
+    }
+    if r.auth_gate_users.len() > 64 {
+        return Err("auth_gate_users 授权账号数超过 64 个上限".into());
+    }
+    let mut allowed_users: Vec<&str> = Vec::new();
+    for u in &r.auth_gate_users {
+        validate_username(u).map_err(|e| format!("auth_gate_users.{}: {}", u, e))?;
+        unique(&mut allowed_users, "auth_gate_users", u)?;
+    }
     for c in r.allowed_cidrs.iter().chain(r.denied_cidrs.iter()) {
         parse_cidr(c)?;
     }
+    let erp = encode_secret_segment(rp_name);
     for (k, v) in &r.request_headers_set {
         http::HeaderName::from_bytes(k.as_bytes()).map_err(|_| format!("Header 名非法: {}", k))?;
         if crate::net::reverse_proxy::HOP_BY_HOP_HEADERS.contains(&k.to_ascii_lowercase().as_str())
@@ -1597,8 +2116,10 @@ fn validate_rule(
         {
             return Err("自定义 Header 不能覆盖协议控制字段，Host 请使用 upstream_host_header".into());
         }
-        let field_path = format!("reverse_proxy.{}.rules.{}.request_headers_set.{}", rp_name, rule_idx, k);
-        if let Some(plain) = reveal_for_validation(vault, &field_path, v)? {
+        let ek = encode_secret_segment(k);
+        let field_path = format!("reverse_proxy.{}.rules.{}.request_headers_set.{}", erp, rule_idx, ek);
+        let legacy_path = format!("reverse_proxy.{}.rules.{}.request_headers_set.{}", rp_name, rule_idx, k);
+        if let Some(plain) = reveal_for_validation(vault, &field_path, &legacy_path, v)? {
             http::HeaderValue::from_str(&plain).map_err(|_| format!("Header 值非法: {}", k))?;
         }
     }
@@ -1679,6 +2200,16 @@ pub fn validate_domain(d: &str) -> Result<(), String> {
         {
             return Err(format!("域名非法: {}", d));
         }
+    }
+    Ok(())
+}
+
+/// ACME 域名校验：除满足 validate_domain 外，强制至少包含两级标签（拒绝 ssl / localhost 等单标签名）
+pub fn validate_acme_domain(d: &str) -> Result<(), String> {
+    validate_domain(d)?;
+    let body = d.strip_prefix("*.").unwrap_or(d);
+    if !body.contains('.') {
+        return Err(format!("ACME 域名必须包含至少两级标签: {}", d));
     }
     Ok(())
 }
@@ -1948,21 +2479,56 @@ pub struct LoadOutcome {
     pub created: bool,
 }
 
-/// 加载配置文件；不存在时生成默认配置。会补齐初始密码哈希与随机安全路径。
+/// 加载配置文件；不存在时生成默认配置。会补齐初始密码哈希与随机安全路径（拒绝符号链接与超大文件，保留合法纯 Passkey 配置）。
 pub fn load_or_init(path: &Path) -> Result<LoadOutcome, String> {
-    let (mut cfg, created) = if path.exists() {
-        let meta = fs::metadata(path).map_err(|e| format!("读取配置失败: {}", e))?;
-        if meta.permissions().mode() & 0o077 != 0 {
-            crate::log_warn!("config", "配置文件权限过宽（{:o}），将收紧为 0600", meta.permissions().mode() & 0o777);
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    let (mut cfg, created) = match fs::symlink_metadata(path) {
+        Ok(lmeta) => {
+            if lmeta.file_type().is_symlink() {
+                return Err(format!("拒绝读取符号链接配置文件: {}", path.display()));
+            }
+            if !lmeta.file_type().is_file() {
+                return Err(format!("配置路径不是普通文件: {}", path.display()));
+            }
+            if lmeta.len() > MAX_CONFIG_FILE_BYTES {
+                return Err(format!("配置文件超过 {} 字节大小上限", MAX_CONFIG_FILE_BYTES));
+            }
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+                .map_err(|e| format!("读取配置失败: {}", e))?;
+            let meta = file.metadata().map_err(|e| format!("读取配置失败: {}", e))?;
+            if !meta.is_file() {
+                return Err(format!("配置路径不是普通文件: {}", path.display()));
+            }
+            if meta.len() > MAX_CONFIG_FILE_BYTES {
+                return Err(format!("配置文件超过 {} 字节大小上限", MAX_CONFIG_FILE_BYTES));
+            }
+            if meta.permissions().mode() & 0o077 != 0 {
+                crate::log_warn!(
+                    "config",
+                    "配置文件权限过宽（{:o}），将收紧为 0600",
+                    meta.permissions().mode() & 0o777
+                );
+                let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+            }
+            let mut raw = Vec::new();
+            file.take(MAX_CONFIG_FILE_BYTES + 1)
+                .read_to_end(&mut raw)
+                .map_err(|e| format!("读取配置失败: {}", e))?;
+            if raw.len() as u64 > MAX_CONFIG_FILE_BYTES {
+                return Err(format!("配置文件超过 {} 字节大小上限", MAX_CONFIG_FILE_BYTES));
+            }
+            let text = String::from_utf8(raw).map_err(|_| "配置文件不是合法 UTF-8 文本".to_string())?;
+            (parse_config(&text)?, false)
         }
-        let text = fs::read_to_string(path).map_err(|e| format!("读取配置失败: {}", e))?;
-        (parse_config(&text)?, false)
-    } else {
-        (Config::default(), true)
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Config::default(), true),
+        Err(e) => return Err(format!("读取配置失败: {}", e)),
     };
     let mut dirty = created;
-    if crate::security::auth::PasswordHash::parse(&cfg.admin.password_hash).is_none() {
+    if !cfg.admin.is_passkey_only()
+        && crate::security::auth::PasswordHash::parse(&cfg.admin.password_hash).is_none()
+    {
         cfg.admin.password_hash = crate::security::auth::PasswordHash::create(crate::security::auth::DEFAULT_INITIAL_PASSWORD)
             .map_err(|e| e.to_string())?
             .encode();
@@ -1972,6 +2538,9 @@ pub fn load_or_init(path: &Path) -> Result<LoadOutcome, String> {
     if cfg.admin.secret_path == SECRET_PATH_PLACEHOLDER {
         cfg.admin.secret_path = format!("/_vane_{}", random_alnum(16));
         dirty = true;
+    }
+    if cfg.web_terminal.require_reauth && !cfg.module_reauth.web_terminal {
+        cfg.module_reauth.web_terminal = true;
     }
     Ok(LoadOutcome { config: cfg, dirty, created })
 }
@@ -2152,5 +2721,150 @@ mod tests {
         c.reverse_proxy[0].rules[0].request_headers_set.remove("X-Bad");
         c.reverse_proxy[0].rules[0].upstream = "https://192.168.1.1:23456".into();
         assert!(c.validate_with_vault(Some(&vault)).is_err());
+    }
+
+    #[test]
+    fn security_hardening_validations() {
+        // VANE-H07 / VANE-M06: AdminConfig defaults & validation
+        let mut c = Config::default();
+        assert!(!c.admin.allow_manual_update_upload);
+        assert!(c.admin.update_signing_public_key.is_empty());
+        assert!(!c.admin.allow_cron_exec);
+        c.admin.update_signing_public_key = "not-a-valid-key".into();
+        assert!(c.validate().is_err());
+        c.admin.update_signing_public_key = "ab".repeat(32); // 32-byte hex
+        c.validate().unwrap();
+        c.admin.update_signing_public_key = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            [7u8; 32],
+        );
+        c.validate().unwrap();
+
+        // CronAction::Exec blocked when enabled and !allow_cron_exec
+        let mut c = Config::default();
+        c.cron.push(CronConfig {
+            name: "cmd1".into(),
+            enabled: true,
+            action: CronAction::Exec {
+                program: "/bin/echo".into(),
+                args: vec!["hi".into()],
+                cwd: String::new(),
+            },
+            ..Default::default()
+        });
+        assert!(c.validate().is_err());
+        c.admin.allow_cron_exec = true;
+        c.validate().unwrap();
+
+        // VANE-M07 & VANE-I02: docker_socket, web_terminal.shell, upstream_sni
+        let mut c = Config::default();
+        c.admin.docker_socket = "relative/docker.sock".into();
+        assert!(c.validate().is_err());
+        c.admin.docker_socket = "/var/run/../docker.sock".into();
+        assert!(c.validate().is_err());
+        c.admin.docker_socket = "/var/run/docker.sock".into();
+        c.web_terminal.shell = "/bin/./sh".into();
+        assert!(c.validate().is_err());
+        c.web_terminal.shell = "/bin//sh".into();
+        assert!(c.validate().is_err());
+        c.web_terminal.shell = "/bin/sh".into();
+        c.validate().unwrap();
+
+        // VANE-M12: validate_safe_abs_dir prefix checks & ACME 2-label requirement
+        for bad_dir in ["/", "/etc", "/etc/", "/etc/ssl", "/etc/.", "//etc", "/root/.ssh", "/var/run/vane", "/usr/local/certs"] {
+            assert!(validate_safe_abs_dir("test", bad_dir).is_err(), "expected reject for {}", bad_dir);
+        }
+        for ok_dir in ["/data/vane/certs", "/var/lib/vane/certs", "/tmp/vane-certs", "/etc_custom/certs"] {
+            assert!(validate_safe_abs_dir("test", ok_dir).is_ok(), "expected accept for {}", ok_dir);
+        }
+        assert!(validate_acme_domain("ssl").is_err());
+        assert!(validate_acme_domain("localhost").is_err());
+        assert!(validate_acme_domain("*.localhost").is_err());
+        assert!(validate_acme_domain("example.com").is_ok());
+        assert!(validate_acme_domain("*.example.com").is_ok());
+
+        // VANE-H01: reverse_proxy upstream trailing dot, non-canonical numeric IPv4, upstream_sni, live admin listeners
+        let mut c = Config::default();
+        c.reverse_proxy.push(ReverseProxyConfig {
+            name: "rp".into(),
+            listen_port: 8443,
+            rules: vec![ReverseProxyRule {
+                host: "app.example.com".into(),
+                upstream: "http://192.168.1.50:3000".into(),
+                upstream_sni: "bad sni!".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(c.validate().is_err());
+        c.reverse_proxy[0].rules[0].upstream_sni = "*.example.com".into();
+        assert!(c.validate().is_err());
+        c.reverse_proxy[0].rules[0].upstream_sni = "backend.example.com".into();
+        c.validate().unwrap();
+
+        for bad_up in [
+            "http://localhost.:23456",
+            "http://localhost.:22",
+            "http://127.1:80",
+            "http://2130706433:80",
+            "http://0177.0.0.1:80",
+            "http://0x7f000001:80",
+            "http://127.0.0.1.:80",
+        ] {
+            c.reverse_proxy[0].rules[0].upstream = bad_up.into();
+            assert!(c.validate().is_err(), "expected upstream reject for {}", bad_up);
+        }
+
+        // Live admin listener differs from pending config: must still block exposure!
+        c.reverse_proxy[0].rules[0].upstream = "https://192.168.1.1:24444".into();
+        c.validate().unwrap();
+        let live: SocketAddr = "192.168.1.1:24444".parse().unwrap();
+        assert!(c.validate_with_vault_and_listeners(None, &[live]).is_err());
+
+        // VANE-H01: port_forwards open_wan_firewall=false without LAN bind_interface treated as WAN-exposed
+        let mut c = Config::default();
+        c.port_forwards.push(PortForwardConfig {
+            name: "pf_loop".into(),
+            listen_port: 12222,
+            engine: "userspace_splice".into(),
+            open_wan_firewall: false,
+            bind_interface: String::new(),
+            target: "127.0.0.1:22".into(),
+            ..Default::default()
+        });
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn load_or_init_preserves_passkey_only_and_rejects_symlink() {
+        let d = tmpdir("pkonly");
+        let p = d.join("config.toml");
+        let mut cfg = Config::default();
+        cfg.admin.secret_path = "/_vane_custompath1".into();
+        cfg.admin.password_login_enabled = false;
+        cfg.admin.must_change_password = false;
+        cfg.admin.password_hash.clear();
+        cfg.admin.passkey_enabled = true;
+        cfg.admin.passkeys.push(PasskeyEntry {
+            id: "cred1".into(),
+            name: "Key".into(),
+            rp_id: "example.com".into(),
+            alg: -8,
+            pubkey_b64: base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, [9u8; 32]),
+            sign_count: 0,
+            created_at: 1,
+            last_used_at: 0,
+        });
+        save_config(&p, &cfg).unwrap();
+        let loaded = load_or_init(&p).unwrap();
+        assert!(!loaded.dirty);
+        assert!(loaded.config.admin.password_hash.is_empty());
+        assert!(!loaded.config.admin.must_change_password);
+
+        // Symlink config.toml must be rejected
+        let sym = d.join("symlink.toml");
+        std::os::unix::fs::symlink(&p, &sym).unwrap();
+        assert!(load_or_init(&sym).is_err());
+        fs::remove_dir_all(&d).unwrap();
     }
 }

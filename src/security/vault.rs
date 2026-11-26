@@ -1,5 +1,5 @@
 //! 敏感字段信封加密（ChaCha20-Poly1305 + HKDF，字段路径作为 AAD）、自动加封、API 脱敏与跨机加密备份。
-use crate::config::{Config, UNCHANGED_SENTINEL};
+use crate::config::{encode_secret_segment, Config, UNCHANGED_SENTINEL};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
@@ -8,19 +8,45 @@ use ring::{hkdf, pbkdf2};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::io::{Read, Write};
 use std::num::NonZeroU32;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 pub const ENC_PREFIX: &str = "enc:v1:";
+pub const ENC_PREFIX_V2: &str = "enc:v2:";
 const MASTER_KEY_FILE: &str = ".master.key";
+const MAX_MASTER_KEY_FILE_BYTES: u64 = 4096;
 const BACKUP_MAGIC: &[u8; 8] = b"VANEBAK1";
-const BACKUP_PBKDF2_ITERS: u32 = 200_000;
-const BACKUP_MAX_ITERS: u32 = 600_000;
+const BACKUP_MAGIC_V2: &[u8; 8] = b"VANEBAK2";
+const BACKUP_PBKDF2_ITERS: u32 = 600_000;
+const BACKUP_MAX_ITERS: u32 = 1_000_000;
 const MAX_BACKUP_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BACKUP_FILES: usize = 256;
 const MASK_MARKER: &str = "\u{0}__VANE_SECRET__:";
+
+pub fn is_sealed_value(value: &str) -> bool {
+    value.starts_with(ENC_PREFIX_V2) || value.starts_with(ENC_PREFIX)
+}
+
+fn v2_aad(field_path: &str) -> String {
+    format!("v2:{}", field_path)
+}
+
+pub fn validate_backup_passphrase(password: &[u8]) -> Result<(), String> {
+    if password.len() < 8 || password.len() > 128 {
+        return Err("备份密码长度必须在 8 ~ 128 位之间".into());
+    }
+    let has_letter = password.iter().any(|b| b.is_ascii_alphabetic());
+    let has_digit_or_symbol = password
+        .iter()
+        .any(|b| b.is_ascii_digit() || b.is_ascii_punctuation());
+    if !has_letter || !has_digit_or_symbol {
+        return Err("备份密码需包含英文字母，且至少包含数字或特殊字符中的一种".into());
+    }
+    Ok(())
+}
 
 fn zeroize_bytes(buf: &mut [u8]) {
     for b in buf.iter_mut() {
@@ -56,11 +82,7 @@ impl SecretBytes {
 
 impl Drop for SecretBytes {
     fn drop(&mut self) {
-        for b in self.0.iter_mut() {
-            // SAFETY: b 是指向本 Vec 内有效、对齐的 u8 引用
-            unsafe { std::ptr::write_volatile(b, 0) };
-        }
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        zeroize_bytes(&mut self.0);
     }
 }
 
@@ -79,12 +101,15 @@ pub fn seal_field(dek: &[u8; 32], field_path: &str, plaintext: &[u8], rng: &dyn 
     let mut out = Vec::with_capacity(12 + plaintext.len() + 16);
     out.extend_from_slice(&nonce_bytes);
     let mut body = plaintext.to_vec();
-    key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce_bytes), Aad::from(field_path.as_bytes()), &mut body)
-        .map_err(|_| "AEAD 加密失败")?;
-    out.extend_from_slice(&body);
-    for b in body.iter_mut() {
-        *b = 0;
+    if key
+        .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce_bytes), Aad::from(field_path.as_bytes()), &mut body)
+        .is_err()
+    {
+        zeroize_bytes(&mut body);
+        return Err("AEAD 加密失败");
     }
+    out.extend_from_slice(&body);
+    zeroize_bytes(&mut body);
     Ok(out)
 }
 
@@ -97,10 +122,18 @@ pub fn open_field(dek: &[u8; 32], field_path: &str, sealed_nonce_and_cipher: &[u
     let mut buf = sealed_nonce_and_cipher[12..].to_vec();
     let unbound = UnboundKey::new(&aead::CHACHA20_POLY1305, dek).map_err(|_| "无效密钥")?;
     let key = LessSafeKey::new(unbound);
-    let plain = key
-        .open_in_place(Nonce::assume_unique_for_key(nonce_bytes), Aad::from(field_path.as_bytes()), &mut buf)
-        .map_err(|_| "AEAD 解密或 AAD 字段路径校验失败")?;
-    let plain_len = plain.len();
+    let plain_len = match key.open_in_place(
+        Nonce::assume_unique_for_key(nonce_bytes),
+        Aad::from(field_path.as_bytes()),
+        &mut buf,
+    ) {
+        Ok(plain) => plain.len(),
+        Err(_) => {
+            zeroize_bytes(&mut buf);
+            return Err("AEAD 解密或 AAD 字段路径校验失败");
+        }
+    };
+    zeroize_bytes(&mut buf[plain_len..]);
     buf.truncate(plain_len);
     Ok(buf)
 }
@@ -132,11 +165,70 @@ pub struct Vault {
 
 impl Drop for Vault {
     fn drop(&mut self) {
-        for b in self.dek.iter_mut().chain(self.mac_key.iter_mut()) {
-            // SAFETY: 指向自身数组元素
-            unsafe { std::ptr::write_volatile(b, 0) };
+        zeroize_bytes(&mut self.dek);
+        zeroize_bytes(&mut self.mac_key);
+    }
+}
+
+fn read_master_key_file(path: &Path, tighten_to_0400: bool) -> Result<Vec<u8>, String> {
+    let lmeta = fs::symlink_metadata(path).map_err(|e| format!("读取主密钥元数据失败: {}", e))?;
+    if lmeta.file_type().is_symlink() {
+        return Err(format!("拒绝读取符号链接主密钥文件: {}", path.display()));
+    }
+    if !lmeta.file_type().is_file() {
+        return Err(format!("主密钥路径不是普通文件: {}", path.display()));
+    }
+    if lmeta.len() > MAX_MASTER_KEY_FILE_BYTES {
+        return Err(format!("主密钥文件超过 {} 字节大小上限", MAX_MASTER_KEY_FILE_BYTES));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("打开主密钥文件失败: {}", e))?;
+    let fmeta = file.metadata().map_err(|e| format!("读取主密钥文件状态失败: {}", e))?;
+    if !fmeta.is_file() {
+        return Err(format!("主密钥路径不是普通文件: {}", path.display()));
+    }
+    if fmeta.len() > MAX_MASTER_KEY_FILE_BYTES {
+        return Err(format!("主密钥文件超过 {} 字节大小上限", MAX_MASTER_KEY_FILE_BYTES));
+    }
+    let mode = fmeta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        if tighten_to_0400 {
+            crate::log_warn!(
+                "vault",
+                "主密钥文件 {} 权限过宽（{:o}），将收紧为 0400",
+                path.display(),
+                mode
+            );
+            file.set_permissions(fs::Permissions::from_mode(0o400))
+                .map_err(|e| format!("收紧主密钥文件权限失败: {}", e))?;
+        } else {
+            crate::log_warn!(
+                "vault",
+                "VANE_MASTER_KEY_FILE {} 权限过宽（{:o}），尝试收紧组与其他用户权限",
+                path.display(),
+                mode
+            );
+            let target_mode = (mode & 0o700).max(0o400);
+            if file.set_permissions(fs::Permissions::from_mode(target_mode)).is_err() && (mode & 0o007 != 0) {
+                return Err(format!(
+                    "VANE_MASTER_KEY_FILE 权限对其他用户可见（{:o}）且无法收紧",
+                    mode
+                ));
+            }
         }
     }
+    let mut raw = Vec::new();
+    file.take(MAX_MASTER_KEY_FILE_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("读取主密钥失败: {}", e))?;
+    if raw.len() as u64 > MAX_MASTER_KEY_FILE_BYTES {
+        zeroize_bytes(&mut raw);
+        return Err(format!("主密钥文件超过 {} 字节大小上限", MAX_MASTER_KEY_FILE_BYTES));
+    }
+    Ok(raw)
 }
 
 impl Vault {
@@ -150,38 +242,106 @@ impl Vault {
 
     /// 加载或生成主密钥：优先环境变量 VANE_MASTER_KEY（base64/hex 32B），否则 <data_dir>/.master.key（0400）
     pub fn load_or_create(data_dir: &Path) -> Result<Self, String> {
-        if let Ok(v) = std::env::var("VANE_MASTER_KEY") {
-            let key = decode_key_text(v.trim()).ok_or("VANE_MASTER_KEY 必须为 32 字节的 base64 或 hex 编码")?;
-            return Ok(Self::from_master(&key));
+        if let Ok(mut v) = std::env::var("VANE_MASTER_KEY") {
+            let key_res = decode_key_text(v.trim()).ok_or_else(|| "VANE_MASTER_KEY 必须为 32 字节的 base64 或 hex 编码".to_string());
+            zeroize_string(&mut v);
+            let mut key = key_res?;
+            let vault = Self::from_master(&key);
+            zeroize_bytes(&mut key);
+            return Ok(vault);
         }
         if let Ok(file) = std::env::var("VANE_MASTER_KEY_FILE") {
-            let text = fs::read_to_string(&file).map_err(|e| format!("读取 VANE_MASTER_KEY_FILE 失败: {}", e))?;
-            let key = decode_key_text(text.trim()).ok_or("VANE_MASTER_KEY_FILE 内容非法")?;
-            return Ok(Self::from_master(&key));
-        }
-        let path = data_dir.join(MASTER_KEY_FILE);
-        if path.exists() {
-            let raw = fs::read(&path).map_err(|e| format!("读取主密钥失败: {}", e))?;
-            let key = if raw.len() == 32 {
+            let mut raw = read_master_key_file(Path::new(&file), false)?;
+            let key_res = if raw.len() == 32 {
                 let mut k = [0u8; 32];
                 k.copy_from_slice(&raw);
-                k
+                Ok(k)
             } else {
-                decode_key_text(String::from_utf8_lossy(&raw).trim()).ok_or("主密钥文件内容非法")?
+                let mut text = String::from_utf8(raw.clone()).map_err(|_| "VANE_MASTER_KEY_FILE 内容非法".to_string());
+                let decoded = text
+                    .as_deref()
+                    .ok()
+                    .and_then(|t| decode_key_text(t.trim()))
+                    .ok_or_else(|| "VANE_MASTER_KEY_FILE 内容非法".to_string());
+                if let Ok(ref mut t) = text {
+                    zeroize_string(t);
+                }
+                decoded
             };
-            return Ok(Self::from_master(&key));
+            zeroize_bytes(&mut raw);
+            let mut key = key_res?;
+            let vault = Self::from_master(&key);
+            zeroize_bytes(&mut key);
+            return Ok(vault);
+        }
+        let path = data_dir.join(MASTER_KEY_FILE);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let mut raw = read_master_key_file(&path, true)?;
+                let key_res = if raw.len() == 32 {
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(&raw);
+                    Ok(k)
+                } else {
+                    let mut text = String::from_utf8(raw.clone()).map_err(|_| "主密钥文件内容非法".to_string());
+                    let decoded = text
+                        .as_deref()
+                        .ok()
+                        .and_then(|t| decode_key_text(t.trim()))
+                        .ok_or_else(|| "主密钥文件内容非法".to_string());
+                    if let Ok(ref mut t) = text {
+                        zeroize_string(t);
+                    }
+                    decoded
+                };
+                zeroize_bytes(&mut raw);
+                let mut key = key_res?;
+                let vault = Self::from_master(&key);
+                zeroize_bytes(&mut key);
+                return Ok(vault);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("读取主密钥元数据失败: {}", e)),
         }
         let mut key = [0u8; 32];
         SystemRandom::new().fill(&mut key).map_err(|_| "硬件随机源生成主密钥失败")?;
         if !data_dir.exists() {
-            fs::create_dir_all(data_dir).map_err(|e| format!("创建数据目录失败: {}", e))?;
+            DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(data_dir)
+                .map_err(|e| {
+                    zeroize_bytes(&mut key);
+                    format!("创建数据目录失败: {}", e)
+                })?;
             let _ = fs::set_permissions(data_dir, fs::Permissions::from_mode(0o700));
         }
-        crate::config::crash_safe_atomic_write(&path, B64.encode(key).as_bytes(), crate::config::random_nonce())
-            .map_err(|e| format!("写入主密钥失败: {}", e))?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).map_err(|e| format!("设置主密钥权限失败: {}", e))?;
+        let mut encoded = B64.encode(key);
+        let write_res = (|| -> std::io::Result<()> {
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o400)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)?;
+            f.write_all(encoded.as_bytes())?;
+            f.set_permissions(fs::Permissions::from_mode(0o400))?;
+            f.sync_all()?;
+            if let Ok(dir_fd) = fs::File::open(data_dir) {
+                let _ = dir_fd.sync_all();
+            }
+            Ok(())
+        })();
+        zeroize_string(&mut encoded);
+        if let Err(e) = write_res {
+            let _ = fs::remove_file(&path);
+            zeroize_bytes(&mut key);
+            return Err(format!("写入主密钥失败: {}", e));
+        }
         crate::log_info!("vault", "已生成新的主密钥 {}", path.display());
-        Ok(Self::from_master(&key))
+        let vault = Self::from_master(&key);
+        zeroize_bytes(&mut key);
+        Ok(vault)
     }
 
     pub fn rng(&self) -> &SystemRandom {
@@ -192,21 +352,60 @@ impl Vault {
         &self.mac_key
     }
 
+    /// 使用无歧义 AAD（v2 域分离）加密为 enc:v2: 密文
     pub fn seal(&self, field_path: &str, plaintext: &[u8]) -> Result<String, String> {
-        let sealed = seal_field(&self.dek, field_path, plaintext, &self.rng).map_err(|e| e.to_string())?;
-        Ok(format!("{}{}", ENC_PREFIX, B64.encode(sealed)))
+        let aad = v2_aad(field_path);
+        let sealed = seal_field(&self.dek, &aad, plaintext, &self.rng).map_err(|e| e.to_string())?;
+        Ok(format!("{}{}", ENC_PREFIX_V2, B64.encode(sealed)))
     }
 
+    /// 解密 enc:v2: 或历史 enc:v1: 密文
     pub fn open(&self, field_path: &str, value: &str) -> Result<SecretBytes, String> {
-        let b64 = value.strip_prefix(ENC_PREFIX).ok_or("不是 enc:v1: 密文")?;
-        let raw = B64.decode(b64.trim()).map_err(|_| "密文 base64 非法".to_string())?;
-        open_field(&self.dek, field_path, &raw).map(SecretBytes::new).map_err(|e| e.to_string())
+        self.open_with_legacy(field_path, None, value)
     }
 
-    /// 取得字段明文：enc:v1: 则解密，否则视为尚未加封的明文
+    /// 解密密文：enc:v2: 仅验证规范路径 AAD；历史 enc:v1: 允许回退校验旧版未转义路径 AAD
+    pub fn open_with_legacy(
+        &self,
+        field_path: &str,
+        legacy_field_path: Option<&str>,
+        value: &str,
+    ) -> Result<SecretBytes, String> {
+        if let Some(b64) = value.strip_prefix(ENC_PREFIX_V2) {
+            let raw = B64.decode(b64.trim()).map_err(|_| "密文 base64 非法".to_string())?;
+            let aad = v2_aad(field_path);
+            return open_field(&self.dek, &aad, &raw)
+                .map(SecretBytes::new)
+                .map_err(|e| e.to_string());
+        }
+        if let Some(b64) = value.strip_prefix(ENC_PREFIX) {
+            let raw = B64.decode(b64.trim()).map_err(|_| "密文 base64 非法".to_string())?;
+            if let Ok(plain) = open_field(&self.dek, field_path, &raw) {
+                return Ok(SecretBytes::new(plain));
+            }
+            if let Some(legacy) = legacy_field_path.filter(|l| *l != field_path) {
+                return open_field(&self.dek, legacy, &raw)
+                    .map(SecretBytes::new)
+                    .map_err(|e| e.to_string());
+            }
+            return Err("AEAD 解密或 AAD 字段路径校验失败".into());
+        }
+        Err("不是有效的 enc:v2: 或 enc:v1: 密文".into())
+    }
+
+    /// 取得字段明文：enc:v2:/enc:v1: 则解密，否则视为尚未加封的明文
     pub fn reveal(&self, field_path: &str, value: &str) -> Result<SecretBytes, String> {
-        if value.starts_with(ENC_PREFIX) {
-            self.open(field_path, value)
+        self.reveal_with_legacy(field_path, None, value)
+    }
+
+    pub fn reveal_with_legacy(
+        &self,
+        field_path: &str,
+        legacy_field_path: Option<&str>,
+        value: &str,
+    ) -> Result<SecretBytes, String> {
+        if is_sealed_value(value) {
+            self.open_with_legacy(field_path, legacy_field_path, value)
         } else {
             Ok(SecretBytes::new(value.as_bytes().to_vec()))
         }
@@ -216,16 +415,40 @@ impl Vault {
         self.reveal(field_path, value).map(|s| s.expose_str().to_string())
     }
 
-    /// 自动加封：将所有明文机密字段加密为 enc:v1:，返回是否发生变化
+    pub fn reveal_string_with_legacy(
+        &self,
+        field_path: &str,
+        legacy_field_path: Option<&str>,
+        value: &str,
+    ) -> Result<String, String> {
+        self.reveal_with_legacy(field_path, legacy_field_path, value)
+            .map(|s| s.expose_str().to_string())
+    }
+
+    /// 自动加封：将所有明文机密字段加密为 enc:v2:，并将旧版 enc:v1: 透明升级为 enc:v2:，返回是否发生变化
     pub fn auto_seal(&self, cfg: &mut Config) -> Result<bool, String> {
         let mut changed = false;
         let mut err = None;
-        cfg.for_each_secret_mut(|path, v| {
-            if v.is_empty() || v.starts_with(ENC_PREFIX) || err.is_some() {
+        cfg.for_each_secret_with_legacy_mut(|path, legacy_path, v| {
+            if v.is_empty() || v.starts_with(ENC_PREFIX_V2) || err.is_some() {
+                return;
+            }
+            if v.starts_with(ENC_PREFIX) {
+                match self
+                    .open_with_legacy(path, Some(legacy_path), v)
+                    .and_then(|plain| self.seal(path, plain.expose()))
+                {
+                    Ok(s) => {
+                        *v = s;
+                        changed = true;
+                    }
+                    Err(e) => err = Some(e),
+                }
                 return;
             }
             match self.seal(path, v.as_bytes()) {
                 Ok(s) => {
+                    zeroize_string(v);
                     *v = s;
                     changed = true;
                 }
@@ -241,11 +464,12 @@ impl Vault {
     /// 校验所有密文可被当前主密钥解开（启动时检测主密钥不匹配）
     pub fn verify_all(&self, cfg: &Config) -> Vec<String> {
         let mut bad = Vec::new();
-        for (path, v) in cfg.secret_map() {
-            if v.starts_with(ENC_PREFIX) && self.open(&path, &v).is_err() {
-                bad.push(path);
+        let mut clone = cfg.clone();
+        clone.for_each_secret_with_legacy_mut(|path, legacy_path, v| {
+            if is_sealed_value(v) && self.open_with_legacy(path, Some(legacy_path), v).is_err() {
+                bad.push(path.to_string());
             }
-        }
+        });
         bad
     }
 
@@ -270,15 +494,15 @@ impl Vault {
         for (from, to) in renames {
             let from_base = from.trim().trim_end_matches('.');
             let to_base = to.trim().trim_end_matches('.');
-            validate_rename_pair(from_base, to_base)?;
-            validated.push((from_base.to_string(), to_base.to_string()));
+            let (canon_from, canon_to) = validate_and_canonicalize_rename_pair(from_base, to_base)?;
+            validated.push((canon_from, canon_to));
         }
         // 最长（最具体）前缀优先，防止外层规则改名吞掉内层 deploy_hooks/rules 索引移动
         validated.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
-        let old = old_cfg.secret_map();
+        let old = old_cfg.secret_map_with_legacy();
         let mut err: Option<String> = None;
-        new_cfg.for_each_secret_mut(|path, v| {
+        new_cfg.for_each_secret_with_legacy_mut(|path, legacy_path, v| {
             if err.is_some() {
                 return;
             }
@@ -288,14 +512,16 @@ impl Vault {
                         if let Some(rest) = path.strip_prefix(to_base.as_str()) {
                             if rest.is_empty() || rest.starts_with('.') {
                                 let old_path = format!("{}{}", from_base, rest);
-                                if let Some(o) = old.get(&old_path) {
-                                    match self.reveal(&old_path, o).and_then(|p| {
-                                        if p.is_empty() {
-                                            Ok(String::new())
-                                        } else {
-                                            self.seal(path, p.expose())
-                                        }
-                                    }) {
+                                if let Some((old_legacy, o)) = old.get(&old_path) {
+                                    match self
+                                        .reveal_with_legacy(&old_path, Some(old_legacy.as_str()), o)
+                                        .and_then(|p| {
+                                            if p.is_empty() {
+                                                Ok(String::new())
+                                            } else {
+                                                self.seal(path, p.expose())
+                                            }
+                                        }) {
                                         Ok(s) => *v = s,
                                         Err(e) => err = Some(e),
                                     }
@@ -307,21 +533,44 @@ impl Vault {
                         }
                     }
                 }
-                if let Some(o) = old.get(path) {
-                    *v = o.clone();
+                if let Some((old_legacy, o)) = old.get(path) {
+                    if o.starts_with(ENC_PREFIX) {
+                        match self
+                            .open_with_legacy(path, Some(old_legacy.as_str()), o)
+                            .and_then(|p| self.seal(path, p.expose()))
+                        {
+                            Ok(s) => *v = s,
+                            Err(e) => err = Some(e),
+                        }
+                    } else {
+                        *v = o.clone();
+                    }
                     return;
                 }
                 *v = String::new();
                 return;
             }
-            if !v.is_empty() && !v.starts_with(ENC_PREFIX) {
+            if !v.is_empty() && !is_sealed_value(v) {
                 match self.seal(path, v.as_bytes()) {
-                    Ok(s) => *v = s,
+                    Ok(s) => {
+                        zeroize_string(v);
+                        *v = s;
+                    }
                     Err(e) => err = Some(e),
                 }
-            } else if v.starts_with(ENC_PREFIX) && self.open(path, v).is_err() {
-                // 拒绝客户端注入无法以本字段路径解开的外来密文（防跨字段剪贴）
-                err = Some(format!("字段 {} 的密文无法通过校验", path));
+            } else if v.starts_with(ENC_PREFIX_V2) {
+                if self.open(path, v).is_err() {
+                    // 拒绝客户端注入无法以本字段路径解开的外来密文（防跨字段剪贴）
+                    err = Some(format!("字段 {} 的密文无法通过校验", path));
+                }
+            } else if v.starts_with(ENC_PREFIX) {
+                match self
+                    .open_with_legacy(path, Some(legacy_path), v)
+                    .and_then(|p| self.seal(path, p.expose()))
+                {
+                    Ok(s) => *v = s,
+                    Err(_) => err = Some(format!("字段 {} 的密文无法通过校验", path)),
+                }
             }
         });
         match err {
@@ -330,11 +579,14 @@ impl Vault {
         }
     }
 
-    fn mask_value(&self, path: &str, v: &str) -> serde_json::Value {
+    fn mask_value(&self, path: &str, legacy_path: &str, v: &str) -> serde_json::Value {
         if v.is_empty() {
             return serde_json::json!({ "configured": false, "masked": "" });
         }
-        let masked = match self.reveal(path, v) {
+        if path == "admin.totp_secret" {
+            return serde_json::json!({ "configured": true, "masked": "****" });
+        }
+        let masked = match self.reveal_with_legacy(path, Some(legacy_path), v) {
             Ok(p) => mask_plain(p.expose_str()),
             Err(_) => "****(主密钥不匹配)".to_string(),
         };
@@ -344,20 +596,38 @@ impl Vault {
     /// API 读取脱敏：所有机密字段转换为 { configured, masked }，并移除密码哈希等 L1 认证材料
     pub fn masked_config_json(&self, cfg: &Config) -> serde_json::Value {
         let mut clone = cfg.clone();
-        let mut originals: BTreeMap<String, (String, String)> = BTreeMap::new();
+        let mut originals: BTreeMap<String, (String, String, String)> = BTreeMap::new();
         let mut idx = 0usize;
-        clone.for_each_secret_mut(|path, v| {
+        clone.for_each_secret_with_legacy_mut(|path, legacy_path, v| {
             let id = format!("{}{}", MASK_MARKER, idx);
             idx += 1;
-            originals.insert(id.clone(), (path.to_string(), std::mem::replace(v, id)));
+            originals.insert(
+                id.clone(),
+                (path.to_string(), legacy_path.to_string(), std::mem::replace(v, id)),
+            );
         });
         let mut json = serde_json::to_value(&clone).unwrap_or(serde_json::Value::Null);
-        replace_markers(&mut json, &mut |s| originals.get(s).map(|(p, v)| self.mask_value(p, v)));
+        replace_markers(&mut json, &mut |s| {
+            originals
+                .get(s)
+                .map(|(p, lp, v)| self.mask_value(p, lp, v))
+        });
         if let Some(admin) = json.get_mut("admin").and_then(|a| a.as_object_mut()) {
             admin.remove("password_hash");
             admin.remove("totp_last_step");
             let n = cfg.admin.totp_recovery_hashes.len();
             admin.insert("totp_recovery_hashes".into(), serde_json::json!({ "remaining": n }));
+        }
+        if let Some(users) = json.get_mut("proxy_auth_users").and_then(|v| v.as_array_mut()) {
+            for (u_val, u_cfg) in users.iter_mut().zip(cfg.proxy_auth_users.iter()) {
+                if let Some(obj) = u_val.as_object_mut() {
+                    obj.remove("password_hash");
+                    obj.insert(
+                        "password_configured".into(),
+                        serde_json::json!(!u_cfg.password_hash.is_empty()),
+                    );
+                }
+            }
         }
         json
     }
@@ -366,44 +636,74 @@ impl Vault {
     // 跨设备加密备份 (.vane.bak)
     // -----------------------------------------------------------------------
 
-    /// 模式 A：全量加密备份。机密字段以明文形式进入归档，再以备份密码派生密钥整包 AEAD 加密
-    pub fn export_backup(&self, cfg: &Config, password: &[u8], files: BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>, String> {
-        if password.len() < 8 {
-            return Err("备份密码至少 8 位".into());
-        }
+    /// 模式 A：全量加密备份。机密字段以明文形式进入归档，再以备份密码派生密钥整包 AEAD 加密（VANEBAK2 + 完整 40B 头 AAD）
+    pub fn export_backup(&self, cfg: &Config, password: &[u8], mut files: BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>, String> {
+        validate_backup_passphrase(password)?;
         let mut plain_cfg = cfg.clone();
         let mut err = None;
-        plain_cfg.for_each_secret_mut(|path, v| {
-            if v.starts_with(ENC_PREFIX) {
-                match self.open(path, v) {
+        plain_cfg.for_each_secret_with_legacy_mut(|path, legacy_path, v| {
+            if err.is_some() {
+                return;
+            }
+            if is_sealed_value(v) {
+                match self.open_with_legacy(path, Some(legacy_path), v) {
                     Ok(p) => *v = p.expose_str().to_string(),
                     Err(e) => err = Some(format!("{}: {}", path, e)),
                 }
             }
         });
         if let Some(e) = err {
+            plain_cfg.for_each_secret_mut(|_, v| zeroize_string(v));
+            for raw in files.values_mut() {
+                zeroize_bytes(raw);
+            }
             return Err(format!("解密机密字段失败: {}", e));
         }
-        let mut config_toml = toml::to_string_pretty(&plain_cfg).map_err(|e| e.to_string())?;
+        let mut config_toml = match toml::to_string_pretty(&plain_cfg) {
+            Ok(t) => t,
+            Err(e) => {
+                plain_cfg.for_each_secret_mut(|_, v| zeroize_string(v));
+                for raw in files.values_mut() {
+                    zeroize_bytes(raw);
+                }
+                return Err(e.to_string());
+            }
+        };
         // 清理临时明文副本
         plain_cfg.for_each_secret_mut(|_, v| zeroize_string(v));
+        let encoded_files: BTreeMap<String, String> = files
+            .iter_mut()
+            .map(|(k, v)| {
+                let b64 = B64.encode(&*v);
+                zeroize_bytes(v);
+                (k.clone(), b64)
+            })
+            .collect();
+        files.clear();
         let payload = BackupPayload {
             version: 1,
             created_at: crate::logger::unix_now(),
             config_toml: std::mem::take(&mut config_toml),
-            files: files.into_iter().map(|(k, v)| (k, B64.encode(v))).collect(),
+            files: encoded_files,
         };
         let mut body = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
         drop(payload);
         let mut salt = [0u8; 16];
         let mut nonce = [0u8; 12];
-        self.rng.fill(&mut salt).map_err(|_| "随机源失败")?;
-        self.rng.fill(&mut nonce).map_err(|_| "随机源失败")?;
+        if self.rng.fill(&mut salt).is_err() || self.rng.fill(&mut nonce).is_err() {
+            zeroize_bytes(&mut body);
+            return Err("随机源失败".into());
+        }
+        let mut header = [0u8; 40];
+        header[..8].copy_from_slice(BACKUP_MAGIC_V2);
+        header[8..24].copy_from_slice(&salt);
+        header[24..28].copy_from_slice(&BACKUP_PBKDF2_ITERS.to_be_bytes());
+        header[28..40].copy_from_slice(&nonce);
         let mut key = derive_backup_key(password, &salt, BACKUP_PBKDF2_ITERS);
         let seal_res = (|| -> Result<(), String> {
             let unbound = UnboundKey::new(&aead::CHACHA20_POLY1305, &key).map_err(|_| "无效密钥")?;
             LessSafeKey::new(unbound)
-                .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(BACKUP_MAGIC), &mut body)
+                .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(&header[..]), &mut body)
                 .map_err(|_| "备份加密失败".into())
         })();
         zeroize_bytes(&mut key);
@@ -411,11 +711,8 @@ impl Vault {
             zeroize_bytes(&mut body);
             return Err(e);
         }
-        let mut out = Vec::with_capacity(8 + 16 + 4 + 12 + body.len());
-        out.extend_from_slice(BACKUP_MAGIC);
-        out.extend_from_slice(&salt);
-        out.extend_from_slice(&BACKUP_PBKDF2_ITERS.to_be_bytes());
-        out.extend_from_slice(&nonce);
+        let mut out = Vec::with_capacity(header.len() + body.len());
+        out.extend_from_slice(&header);
         out.extend_from_slice(&body);
         zeroize_bytes(&mut body);
         Ok(out)
@@ -426,21 +723,44 @@ impl Vault {
         let mut payload = decrypt_backup(data, password)?;
         let mut cfg = crate::config::parse_config(&payload.config_toml)?;
         zeroize_string(&mut payload.config_toml);
-        self.auto_seal(&mut cfg)?;
+        if let Err(e) = self.auto_seal(&mut cfg) {
+            cfg.for_each_secret_mut(|_, v| zeroize_string(v));
+            return Err(e);
+        }
         if payload.files.len() > MAX_BACKUP_FILES {
             return Err("备份内文件数量超过上限".into());
         }
-        let mut files = BTreeMap::new();
+        let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut total_decoded = 0usize;
-        for (k, v) in payload.files {
+        while let Some((k, mut v)) = payload.files.pop_first() {
             if !validate_backup_file_key(&k) {
+                zeroize_string(&mut v);
+                for buf in files.values_mut() {
+                    zeroize_bytes(buf);
+                }
                 return Err(format!("备份内文件名非法: {}", k));
             }
-            let raw = B64.decode(v).map_err(|_| "备份内文件编码非法")?;
-            total_decoded = total_decoded
-                .checked_add(raw.len())
-                .filter(|&n| n <= MAX_BACKUP_BYTES)
-                .ok_or_else(|| "备份内附加文件总大小超过 16 MiB 上限".to_string())?;
+            let decode_res = B64.decode(&v).map_err(|_| "备份内文件编码非法".to_string());
+            zeroize_string(&mut v);
+            let mut raw = match decode_res {
+                Ok(r) => r,
+                Err(e) => {
+                    for buf in files.values_mut() {
+                        zeroize_bytes(buf);
+                    }
+                    return Err(e);
+                }
+            };
+            match total_decoded.checked_add(raw.len()).filter(|&n| n <= MAX_BACKUP_BYTES) {
+                Some(n) => total_decoded = n,
+                None => {
+                    zeroize_bytes(&mut raw);
+                    for buf in files.values_mut() {
+                        zeroize_bytes(buf);
+                    }
+                    return Err("备份内附加文件总大小超过 16 MiB 上限".to_string());
+                }
+            }
             files.insert(k, raw);
         }
         Ok((cfg, files))
@@ -464,13 +784,42 @@ pub fn sanitized_export(cfg: &Config) -> Result<String, String> {
     c.admin.totp_recovery_hashes.clear();
     c.admin.totp_last_step = 0;
     c.admin.secret_path = "/<redacted>".into();
-    for k in c.admin.authorized_ed25519_keys.iter_mut() {
-        k.pubkey = "<redacted>".into();
+    for u in c.proxy_auth_users.iter_mut() {
+        if !u.password_hash.is_empty() {
+            u.password_hash = "<redacted>".into();
+        }
     }
     toml::to_string_pretty(&c).map_err(|e| e.to_string())
 }
 
-fn validate_rename_pair(from_base: &str, to_base: &str) -> Result<(), String> {
+fn is_already_canonical_segment(seg: &str) -> bool {
+    if seg.contains('.') {
+        return false;
+    }
+    let bytes = seg.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if matches!(bytes.get(i + 1..i + 3), Some(b"25" | b"2E")) {
+                i += 3;
+                continue;
+            }
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+fn canonicalize_dynamic_segment_for_rename(seg: &str) -> String {
+    if is_already_canonical_segment(seg) {
+        seg.to_string()
+    } else {
+        encode_secret_segment(seg)
+    }
+}
+
+fn validate_and_canonicalize_rename_pair(from_base: &str, to_base: &str) -> Result<(String, String), String> {
     const ALLOWED_ROOTS: &[&str] = &[
         "dns_providers",
         "ddns",
@@ -505,37 +854,48 @@ fn validate_rename_pair(from_base: &str, to_base: &str) -> Result<(), String> {
 
     // 1) ACME deploy_hooks 索引移动/重命名：acme.<domain>.deploy_hooks.<idx>.url
     if root == "acme" && (from_rest.contains(".deploy_hooks.") || to_rest.contains(".deploy_hooks.")) {
-        let valid_hook = |rest: &str| {
-            rest.rsplit_once(".deploy_hooks.").is_some_and(|(dom, tail)| {
-                !dom.is_empty()
-                    && tail.strip_suffix(".url").is_some_and(is_digits)
-            })
+        let parse_hook = |rest: &str| -> Option<String> {
+            let (dom, tail) = rest.rsplit_once(".deploy_hooks.")?;
+            let idx = tail.strip_suffix(".url")?;
+            if dom.is_empty() || !is_digits(idx) {
+                return None;
+            }
+            Some(format!(
+                "acme.{}.deploy_hooks.{}.url",
+                canonicalize_dynamic_segment_for_rename(dom),
+                idx
+            ))
         };
-        if valid_hook(from_rest) && valid_hook(to_rest) {
-            return Ok(());
+        if let (Some(cf), Some(ct)) = (parse_hook(from_rest), parse_hook(to_rest)) {
+            return Ok((cf, ct));
         }
         return Err(format!("不支持的密钥重映射层级: {} -> {}", from_base, to_base));
     }
 
     // 2) 反向代理规则级/请求头级：reverse_proxy.<rp>.rules.<idx>[.request_headers_set.<header>]
     if root == "reverse_proxy" && (from_rest.contains(".rules.") || to_rest.contains(".rules.")) {
-        let rule_shape = |rest: &str| -> Option<u8> {
+        let parse_rule = |rest: &str| -> Option<(u8, String)> {
             let (rp, tail) = rest.rsplit_once(".rules.")?;
             if rp.is_empty() {
                 return None;
             }
+            let enc_rp = canonicalize_dynamic_segment_for_rename(rp);
             if is_digits(tail) {
-                return Some(1);
+                return Some((1, format!("reverse_proxy.{}.rules.{}", enc_rp, tail)));
             }
             let (idx, hdr) = tail.split_once(".request_headers_set.")?;
-            if is_digits(idx) && !hdr.is_empty() && !hdr.contains('.') {
-                return Some(2);
+            if is_digits(idx) && !hdr.is_empty() {
+                let enc_hdr = canonicalize_dynamic_segment_for_rename(hdr);
+                return Some((
+                    2,
+                    format!("reverse_proxy.{}.rules.{}.request_headers_set.{}", enc_rp, idx, enc_hdr),
+                ));
             }
             None
         };
-        if let (Some(a), Some(b)) = (rule_shape(from_rest), rule_shape(to_rest)) {
+        if let (Some((a, cf)), Some((b, ct))) = (parse_rule(from_rest), parse_rule(to_rest)) {
             if a == b {
-                return Ok(());
+                return Ok((cf, ct));
             }
         }
         return Err(format!("不支持的密钥重映射层级: {} -> {}", from_base, to_base));
@@ -567,7 +927,10 @@ fn validate_rename_pair(from_base: &str, to_base: &str) -> Result<(), String> {
     if has_subfield(from_rest) || has_subfield(to_rest) {
         return Err(format!("不支持的密钥重映射层级: {} -> {}", from_base, to_base));
     }
-    Ok(())
+    Ok((
+        format!("{}.{}", root, canonicalize_dynamic_segment_for_rename(from_rest)),
+        format!("{}.{}", to_root, canonicalize_dynamic_segment_for_rename(to_rest)),
+    ))
 }
 
 pub fn validate_backup_file_key(k: &str) -> bool {
@@ -604,6 +967,15 @@ struct BackupPayload {
     files: BTreeMap<String, String>,
 }
 
+impl Drop for BackupPayload {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.config_toml);
+        for v in self.files.values_mut() {
+            zeroize_string(v);
+        }
+    }
+}
+
 fn derive_backup_key(password: &[u8], salt: &[u8], iters: u32) -> [u8; 32] {
     let mut key = [0u8; 32];
     let n = NonZeroU32::new(iters.max(1)).unwrap_or(NonZeroU32::MIN);
@@ -615,9 +987,17 @@ fn decrypt_backup(data: &[u8], password: &[u8]) -> Result<BackupPayload, String>
     if data.len() > MAX_BACKUP_BYTES {
         return Err("备份文件超过 16 MiB 大小上限".into());
     }
-    if data.len() < 8 + 16 + 4 + 12 + 16 || &data[..8] != BACKUP_MAGIC {
+    if data.len() < 8 + 16 + 4 + 12 + 16 {
         return Err("不是有效的 .vane.bak 备份文件".into());
     }
+    let magic = &data[..8];
+    let aad: &[u8] = if magic == BACKUP_MAGIC_V2 {
+        &data[..40]
+    } else if magic == BACKUP_MAGIC {
+        BACKUP_MAGIC
+    } else {
+        return Err("不是有效的 .vane.bak 备份文件".into());
+    };
     let salt = &data[8..24];
     let iters = u32::from_be_bytes([data[24], data[25], data[26], data[27]]);
     if !(100_000..=BACKUP_MAX_ITERS).contains(&iters) {
@@ -630,9 +1010,14 @@ fn decrypt_backup(data: &[u8], password: &[u8]) -> Result<BackupPayload, String>
     let parsed = (|| -> Result<BackupPayload, String> {
         let unbound = UnboundKey::new(&aead::CHACHA20_POLY1305, &key).map_err(|_| "无效密钥")?;
         let plain = LessSafeKey::new(unbound)
-            .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(BACKUP_MAGIC), &mut body)
+            .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::from(aad), &mut body)
             .map_err(|_| "备份密码错误或文件已损坏")?;
-        serde_json::from_slice(plain).map_err(|e| format!("备份内容解析失败: {}", e))
+        let payload: BackupPayload =
+            serde_json::from_slice(plain).map_err(|e| format!("备份内容解析失败: {}", e))?;
+        if payload.version != 1 {
+            return Err(format!("不支持的备份格式版本: {}", payload.version));
+        }
+        Ok(payload)
     })();
     zeroize_bytes(&mut key);
     zeroize_bytes(&mut body);
@@ -677,16 +1062,18 @@ pub fn mask_plain(p: &str) -> String {
 }
 
 fn decode_key_text(t: &str) -> Option<[u8; 32]> {
-    let bytes = if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+    let mut bytes = if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
         (0..32).map(|i| u8::from_str_radix(&t[i * 2..i * 2 + 2], 16).ok()).collect::<Option<Vec<u8>>>()?
     } else {
         B64.decode(t).ok()?
     };
     if bytes.len() != 32 {
+        zeroize_bytes(&mut bytes);
         return None;
     }
     let mut k = [0u8; 32];
     k.copy_from_slice(&bytes);
+    zeroize_bytes(&mut bytes);
     Some(k)
 }
 
@@ -699,11 +1086,16 @@ mod tests {
         Vault::from_master(&[7u8; 32])
     }
 
+    fn seal_legacy_v1(v: &Vault, field_path: &str, plaintext: &[u8]) -> String {
+        let sealed = seal_field(&v.dek, field_path, plaintext, &v.rng).unwrap();
+        format!("{}{}", ENC_PREFIX, B64.encode(sealed))
+    }
+
     #[test]
     fn seal_open_roundtrip() {
         let v = vault();
         let s = v.seal("dns_providers.cf.api_token", b"cf_live_secret_value").unwrap();
-        assert!(s.starts_with(ENC_PREFIX));
+        assert!(s.starts_with(ENC_PREFIX_V2));
         let p = v.open("dns_providers.cf.api_token", &s).unwrap();
         assert_eq!(p.expose(), b"cf_live_secret_value");
         // 同明文两次加密 nonce 不同
@@ -723,10 +1115,10 @@ mod tests {
     fn tamper_and_wrong_key_rejected() {
         let v = vault();
         let s = v.seal("a.b", b"hello world").unwrap();
-        let mut raw = B64.decode(s.strip_prefix(ENC_PREFIX).unwrap()).unwrap();
+        let mut raw = B64.decode(s.strip_prefix(ENC_PREFIX_V2).unwrap()).unwrap();
         let last = raw.len() - 1;
         raw[last] ^= 1;
-        let tampered = format!("{}{}", ENC_PREFIX, B64.encode(&raw));
+        let tampered = format!("{}{}", ENC_PREFIX_V2, B64.encode(&raw));
         assert!(v.open("a.b", &tampered).is_err());
         let other = Vault::from_master(&[8u8; 32]);
         assert!(other.open("a.b", &s).is_err());
@@ -753,19 +1145,25 @@ mod tests {
     fn auto_seal_mask_and_merge_unchanged() {
         let v = vault();
         let mut c = sample_cfg();
+        c.admin.totp_secret = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".into();
         assert!(v.auto_seal(&mut c).unwrap());
         assert!(!v.auto_seal(&mut c).unwrap());
         let tok = c.dns_providers["cf_home"].api_token.clone();
-        assert!(tok.starts_with(ENC_PREFIX));
+        assert!(tok.starts_with(ENC_PREFIX_V2));
 
         let masked = v.masked_config_json(&c);
         let m = &masked["dns_providers"]["cf_home"]["api_token"];
         assert_eq!(m["configured"], true);
         assert_eq!(m["masked"], "cf_****...1234");
+        // VANE-L07: admin.totp_secret must unconditionally mask to "****"
+        assert_eq!(masked["admin"]["totp_secret"]["configured"], true);
+        assert_eq!(masked["admin"]["totp_secret"]["masked"], "****");
         assert!(masked["admin"].get("password_hash").is_none());
         let text = masked.to_string();
         assert!(!text.contains("enc:v1:"));
+        assert!(!text.contains("enc:v2:"));
         assert!(!text.contains("abcdefghijk"));
+        assert!(!text.contains("JBSWY3DPE"));
 
         // 前端回传脱敏对象 -> 归一化为 __UNCHANGED__ -> 保留原密文
         let mut back = masked.clone();
@@ -781,7 +1179,7 @@ mod tests {
         v.merge_secrets(&mut new_cfg.clone(), &c, None).unwrap();
         let mut n2 = new_cfg.clone();
         v.merge_secrets(&mut n2, &c, None).unwrap();
-        assert!(n2.notifications[0].token.starts_with(ENC_PREFIX));
+        assert!(n2.notifications[0].token.starts_with(ENC_PREFIX_V2));
         assert_eq!(v.reveal_string("notifications.tg.token", &n2.notifications[0].token).unwrap(), "999:NEWTOKENVALUE");
 
         // 外来密文（跨字段剪贴）被拒绝
@@ -809,21 +1207,142 @@ mod tests {
         a.auto_seal(&mut c).unwrap();
         let mut files = BTreeMap::new();
         files.insert("admin.crt".to_string(), b"CERTDATA".to_vec());
+
+        // VANE-L04: weak passphrases rejected
+        assert!(a.export_backup(&c, b"12345678", files.clone()).is_err());
+        assert!(a.export_backup(&c, b"password", files.clone()).is_err());
+        assert!(a.export_backup(&c, b"short1!", files.clone()).is_err());
+
         let bak = a.export_backup(&c, b"backup-pass-1", files).unwrap();
-        assert!(bak.starts_with(BACKUP_MAGIC));
+        assert!(bak.starts_with(BACKUP_MAGIC_V2));
         assert!(!String::from_utf8_lossy(&bak).contains("cf_live"));
 
+        // Tampering with header bytes (iters or salt) must fail V2 full-header AAD check
+        let mut tampered_header = bak.clone();
+        tampered_header[27] ^= 1;
         let b = Vault::from_master(&[9u8; 32]);
-        assert!(b.import_backup(&bak, b"wrong-pass").is_err());
+        assert!(b.import_backup(&tampered_header, b"backup-pass-1").is_err());
+
+        assert!(b.import_backup(&bak, b"wrong-pass-1").is_err());
         let (restored, files) = b.import_backup(&bak, b"backup-pass-1").unwrap();
         let t = &restored.dns_providers["cf_home"].api_token;
-        assert!(t.starts_with(ENC_PREFIX));
+        assert!(t.starts_with(ENC_PREFIX_V2));
         assert_eq!(b.reveal_string("dns_providers.cf_home.api_token", t).unwrap(), "cf_live_abcdefghijk1234");
         assert!(a.open("dns_providers.cf_home.api_token", t).is_err());
         assert_eq!(files["admin.crt"], b"CERTDATA");
 
         let s = sanitized_export(&c).unwrap();
         assert!(!s.contains("enc:v1:"));
+        assert!(!s.contains("enc:v2:"));
+    }
+
+    #[test]
+    fn backup_reads_legacy_v1_and_rejects_bad_payload_version() {
+        let v = vault();
+        let cfg = sample_cfg();
+        let payload = BackupPayload {
+            version: 1,
+            created_at: 1,
+            config_toml: toml::to_string_pretty(&cfg).unwrap(),
+            files: BTreeMap::new(),
+        };
+        let make_v1 = |pl: &BackupPayload| -> Vec<u8> {
+            let mut body = serde_json::to_vec(pl).unwrap();
+            let salt = [3u8; 16];
+            let nonce = [4u8; 12];
+            let iters: u32 = 100_000;
+            let key = derive_backup_key(b"Legacy-Pass1", &salt, iters);
+            let unbound = UnboundKey::new(&aead::CHACHA20_POLY1305, &key).unwrap();
+            LessSafeKey::new(unbound)
+                .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(BACKUP_MAGIC), &mut body)
+                .unwrap();
+            let mut out = Vec::new();
+            out.extend_from_slice(BACKUP_MAGIC);
+            out.extend_from_slice(&salt);
+            out.extend_from_slice(&iters.to_be_bytes());
+            out.extend_from_slice(&nonce);
+            out.extend_from_slice(&body);
+            out
+        };
+        let legacy_bak = make_v1(&payload);
+        let (restored, _) = v.import_backup(&legacy_bak, b"Legacy-Pass1").unwrap();
+        assert!(restored.dns_providers["cf_home"].api_token.starts_with(ENC_PREFIX_V2));
+
+        let bad_ver_payload = BackupPayload {
+            version: 2,
+            created_at: 1,
+            config_toml: toml::to_string_pretty(&cfg).unwrap(),
+            files: BTreeMap::new(),
+        };
+        let bad_bak = make_v1(&bad_ver_payload);
+        assert!(v.import_backup(&bad_bak, b"Legacy-Pass1").is_err());
+    }
+
+    #[test]
+    fn v2_canonical_aad_blocks_dot_collision_and_upgrades_v1() {
+        let v = vault();
+        let mut old_cfg = Config::default();
+        let mut hdrs = BTreeMap::new();
+        hdrs.insert("token".into(), "TOP_SECRET_HEADER".into());
+        old_cfg.notifications.push(NotificationConfig {
+            name: "ops".into(),
+            provider: "webhook".into(),
+            headers: hdrs,
+            ..Default::default()
+        });
+        v.auto_seal(&mut old_cfg).unwrap();
+
+        // Attacker adds a colliding rule named "ops.headers" with token = __UNCHANGED__
+        let mut next_cfg = old_cfg.clone();
+        next_cfg.notifications.push(NotificationConfig {
+            name: "ops.headers".into(),
+            provider: "telegram".into(),
+            token: UNCHANGED_SENTINEL.into(),
+            ..Default::default()
+        });
+        v.merge_secrets_many(&mut next_cfg, &old_cfg, &[]).unwrap();
+        // Must NOT inherit rule "ops"'s header "token"
+        assert!(next_cfg.notifications[1].token.is_empty());
+
+        // Legacy enc:v1: with dots in ACME domain transparently decrypts and upgrades to enc:v2:
+        let mut legacy_cfg = Config::default();
+        legacy_cfg.acme.push(crate::config::AcmeConfig {
+            domain: "example.com".into(),
+            dns_provider: "cf".into(),
+            eab_hmac_key: seal_legacy_v1(&v, "acme.example.com.eab_hmac_key", b"legacy-eab-secret"),
+            ..Default::default()
+        });
+        assert!(v.verify_all(&legacy_cfg).is_empty());
+        assert!(v.auto_seal(&mut legacy_cfg).unwrap());
+        assert!(legacy_cfg.acme[0].eab_hmac_key.starts_with(ENC_PREFIX_V2));
+        let canon = format!("acme.{}.eab_hmac_key", encode_secret_segment("example.com"));
+        assert_eq!(
+            v.open(&canon, &legacy_cfg.acme[0].eab_hmac_key).unwrap().expose_str(),
+            "legacy-eab-secret"
+        );
+    }
+
+    #[test]
+    fn load_or_create_atomic_0400_and_rejects_symlink() {
+        let dir = std::env::temp_dir().join(format!("vane-vault-test-{}", crate::config::random_alnum(8)));
+        fs::create_dir_all(&dir).unwrap();
+        let v1 = Vault::load_or_create(&dir).unwrap();
+        let key_path = dir.join(MASTER_KEY_FILE);
+        assert_eq!(fs::symlink_metadata(&key_path).unwrap().permissions().mode() & 0o777, 0o400);
+        assert!(!dir.join(".master.key.bak").exists());
+        let ct = v1.seal("a.b", b"hello").unwrap();
+        let v2 = Vault::load_or_create(&dir).unwrap();
+        assert_eq!(v2.open("a.b", &ct).unwrap().expose(), b"hello");
+
+        // Symlink .master.key must be rejected
+        let dir_sym = std::env::temp_dir().join(format!("vane-vault-sym-{}", crate::config::random_alnum(8)));
+        fs::create_dir_all(&dir_sym).unwrap();
+        std::os::unix::fs::symlink(&key_path, dir_sym.join(MASTER_KEY_FILE)).unwrap();
+        assert!(Vault::load_or_create(&dir_sym).is_err());
+
+        let _ = fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir_sym);
     }
 
     #[test]
@@ -885,8 +1404,9 @@ mod tests {
         let DeployHook::Webhook { ref url, .. } = shifted.acme[0].deploy_hooks[0] else {
             panic!("expected webhook");
         };
+        let hook_path = format!("acme.{}.deploy_hooks.0.url", encode_secret_segment("example.com"));
         assert_eq!(
-            v.reveal_string("acme.example.com.deploy_hooks.0.url", url).unwrap(),
+            v.reveal_string(&hook_path, url).unwrap(),
             "https://keep-secret.example/hook1"
         );
     }

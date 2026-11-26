@@ -197,7 +197,8 @@ pub fn truncate_utf8(s: &str, max: usize) -> String {
 const SENSITIVE_KEYS: &[&str] = &[
     "token", "password", "passwd", "secret", "secret_key", "eab_hmac_key", "private_key",
     "api_key", "apikey", "sign", "signature", "authorization", "access_key", "hmac", "cookie",
-    "key", "vane_session", "vane_entry", "vane_ticket",
+    "key", "vane_session", "vane_entry", "vane_ticket", "vane_gate_session", "secret_path",
+    "passphrase", "recovery_code",
 ];
 
 fn sanitize_log_text(input: &str) -> String {
@@ -215,18 +216,133 @@ fn is_unquoted_value_end(b: u8) -> bool {
     b.is_ascii_whitespace() || matches!(b, b'&' | b',' | b')' | b'}' | b']' | b'"' | b'\'' | b'\r' | b'\n' | b';')
 }
 
-/// 敏感凭据脱敏：移除 enc:v1: 密文与 key=value / key: value 形式的凭据值
+fn consume_pem_private_key(input: &str, start: usize) -> Option<usize> {
+    let rest = input.get(start..)?;
+    let after_begin = rest.strip_prefix("-----BEGIN ")?;
+    let label_end = after_begin.find("-----")?;
+    if label_end == 0 || label_end > 64 {
+        return None;
+    }
+    let label = &after_begin[..label_end];
+    if !label.to_ascii_uppercase().contains("PRIVATE KEY") {
+        return None;
+    }
+    let body_offset = start + "-----BEGIN ".len() + label_end + "-----".len();
+    let body = &input[body_offset..];
+    let mut search_pos = 0;
+    while let Some(rel_end) = body[search_pos..].find("-----END ") {
+        let marker_start = search_pos + rel_end;
+        let after_end = &body[marker_start + "-----END ".len()..];
+        if let Some(close_rel) = after_end.find("-----") {
+            if close_rel <= 64 && after_end[..close_rel].to_ascii_uppercase().contains("PRIVATE KEY") {
+                return Some(body_offset + marker_start + "-----END ".len() + close_rel + "-----".len());
+            }
+        }
+        search_pos = marker_start + "-----END ".len();
+    }
+    // 未闭合的截断私钥块：吞至末尾，避免泄露残余私钥材料
+    Some(input.len())
+}
+
+fn consume_telegram_bot_path(input: &str, start: usize) -> Option<usize> {
+    let bytes = input.as_bytes();
+    if !input.get(start..start + 4).is_some_and(|s| s.eq_ignore_ascii_case("/bot")) {
+        return None;
+    }
+    let mut j = start + 4;
+    let digits_start = j;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == digits_start || bytes.get(j) != Some(&b':') {
+        return None;
+    }
+    let tok_start = j + 1;
+    let mut k = tok_start;
+    while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || matches!(bytes[k], b'-' | b'_')) {
+        k += 1;
+    }
+    if k > tok_start { Some(k) } else { None }
+}
+
+fn consume_url_credentials(out_so_far: &str, input: &str, start: usize) -> Option<(&'static str, usize)> {
+    if !input.get(start..start + 3).is_some_and(|s| s == "://") {
+        return None;
+    }
+    let out_bytes = out_so_far.as_bytes();
+    let mut scheme_start = out_bytes.len();
+    while scheme_start > 0 {
+        let b = out_bytes[scheme_start - 1];
+        if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.') {
+            scheme_start -= 1;
+        } else {
+            break;
+        }
+    }
+    if scheme_start == out_bytes.len() || !out_bytes[scheme_start].is_ascii_alphabetic() {
+        return None;
+    }
+    let scheme = &out_so_far[scheme_start..];
+    let bytes = input.as_bytes();
+    let auth_start = start + 3;
+    let mut j = auth_start;
+    let mut last_at: Option<usize> = None;
+    let scan_limit = bytes.len().min(auth_start + 512);
+    while j < scan_limit {
+        let b = bytes[j];
+        if b.is_ascii_whitespace()
+            || b.is_ascii_control()
+            || matches!(b, b'/' | b'?' | b'#' | b'"' | b'\'' | b'<' | b'>' | b')' | b'}' | b',' | b';')
+        {
+            break;
+        }
+        if b == b'@' {
+            last_at = Some(j);
+        }
+        j += 1;
+    }
+    let at_pos = last_at?;
+    if at_pos == auth_start {
+        return None;
+    }
+    let userinfo = &bytes[auth_start..at_pos];
+    if userinfo.contains(&b':') {
+        Some(("://****:****@", at_pos + 1))
+    } else if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+        Some(("://****@", at_pos + 1))
+    } else {
+        None
+    }
+}
+
+/// 敏感凭据脱敏：移除 enc:v1:/enc:v2: 密文、PEM 私钥块、Telegram Bot URL、URL 凭据与 key=value / key: value 形式的凭据值
 pub fn redact(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if input[i..].starts_with("enc:v1:") {
-            out.push_str("enc:v1:****");
+        if input[i..].starts_with("enc:v1:") || input[i..].starts_with("enc:v2:") {
+            out.push_str(&input[i..i + 7]);
+            out.push_str("****");
             i += 7;
             while i < bytes.len() && is_token_byte(bytes[i]) {
                 i += 1;
             }
+            continue;
+        }
+        if let Some(next_i) = consume_pem_private_key(input, i) {
+            out.push_str("[REDACTED PRIVATE KEY]");
+            i = next_i;
+            continue;
+        }
+        if let Some(next_i) = consume_telegram_bot_path(input, i) {
+            out.push_str("/bot****");
+            i = next_i;
+            continue;
+        }
+        if let Some((replacement, next_i)) = consume_url_credentials(&out, input, i) {
+            out.push_str(replacement);
+            i = next_i;
             continue;
         }
         if input.get(i..i + 7).is_some_and(|s| s.eq_ignore_ascii_case("bearer ")) {
@@ -434,6 +550,42 @@ mod tests {
         assert!(!entry.message.contains('\r'));
         assert!(!entry.message.contains('\x1b'));
         assert!(!entry.module.contains('\n'));
+    }
+
+    #[test]
+    fn redacts_extended_patterns_and_utf8_safely() {
+        let input = concat!(
+            "enc:v2:QUJDREVGRw== ",
+            "vane_gate_session=gate123 secret_path=/_vane_hidden1234 ",
+            "passphrase=\"Backup#2026\" recovery_code=ABCD-EFGH-9999 ",
+            "https://api.telegram.org/bot987654321:AAH_Bot-Secret_99/sendMessage ",
+            "https://alice:S3cr3tPass@example.com/path?email=user@example.com ",
+            "https://用户:秘密口令@nas.local/api ",
+            "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEISecretKeyMaterial\n-----END EC PRIVATE KEY----- ",
+            "-----BEGIN CERTIFICATE-----\nPUBLICCERTDATA\n-----END CERTIFICATE-----"
+        );
+        let s = redact(input);
+        assert!(!s.contains("QUJDREVGRw"));
+        assert!(!s.contains("gate123"));
+        assert!(!s.contains("_vane_hidden1234"));
+        assert!(!s.contains("Backup#2026"));
+        assert!(!s.contains("ABCD-EFGH-9999"));
+        assert!(!s.contains("987654321"));
+        assert!(!s.contains("AAH_Bot-Secret_99"));
+        assert!(s.contains("/bot****/sendMessage"));
+        assert!(!s.contains("S3cr3tPass"));
+        assert!(!s.contains("alice:"));
+        assert!(s.contains("https://****:****@example.com/path?email=user@example.com"));
+        assert!(!s.contains("秘密口令"));
+        assert!(s.contains("https://****:****@nas.local/api"));
+        assert!(!s.contains("MHcCAQEEISecretKeyMaterial"));
+        assert!(s.contains("[REDACTED PRIVATE KEY]"));
+        assert!(s.contains("PUBLICCERTDATA"));
+
+        // Truncated PEM private key must also scrub trailing bytes
+        let trunc = redact("err: -----BEGIN RSA PRIVATE KEY----- MIIEowIBAAKCAQEAsecret");
+        assert!(!trunc.contains("MIIEowIBAAKCAQEAsecret"));
+        assert_eq!(trunc, "err: [REDACTED PRIVATE KEY]");
     }
 
     #[test]

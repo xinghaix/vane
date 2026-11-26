@@ -17,6 +17,17 @@ web_terminal = false                   # Web 终端默认关闭，可在设置�
 cron = false                           # 默认按需开启
 docker = true
 
+# 子功能模块二次验证开关（开启后访问或修改对应子模块需完成密码/TOTP/通行密钥二次验证）
+[module_reauth]
+reverse_proxy = false
+port_forward = false
+ddns = false
+acme = false
+stun = false
+web_terminal = false
+cron = false
+docker = false
+
 [admin]
 # 默认仅绑定局域网地址并自动启用 HTTPS（首次启动自动生成本地自签 ECDSA 证书或复用 ACME 证书）
 listen_lan = ["192.168.1.1:23456"]
@@ -32,19 +43,26 @@ password_hash = ""
 totp_enabled = false
 totp_secret = ""
 totp_recovery_hashes = []              # 核销时强制先原子写盘成功再放行会话
-# 3) 可选配置 Ed25519 公钥挑战签名登录（自动解析 OpenSSH ssh-ed25519 Wire Format 提取 32B 公钥）
-authorized_ed25519_keys = [
-  # { id = "admin_key_1", pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI... admin@workstation" }
-]
+# 3) 可选开启通行密钥 (Passkey / WebAuthn) 免密登录与敏感操作二次验证
+passkey_enabled = false
 session_ttl_secs = 3600                # 登录态保活默认 1 小时 (3600s)，允许自定义范围 300 ~ 86400s (最大 24 小时)
 docker_socket = "/var/run/docker.sock"
+# 4) 高危宿主执行与手动更新安全边界（默认全部关闭，严禁通过普通 Web 设置静默放宽）：
+#    - allow_manual_update_upload: 默认 false，禁用 Web 端离线更新包上传，防止在关闭 Web 终端时出现未验证原生代码执行面；
+#      启用后必须同时配置下方 update_signing_public_key，且所有上传包在 chmod/探测执行前强制完成 Ed25519 签名验证。
+allow_manual_update_upload = false
+#    - update_signing_public_key: 32 字节 Ed25519 发布公钥（64 位十六进制或 Base64 编码）；留空时拒绝所有手动上传更新
+update_signing_public_key = ""
+#    - allow_cron_exec: 默认 false，禁止启用 kind = "exec" 本地命令计划任务，防止在 web_terminal = false 基线下
+#      通过计划任务执行任意宿主命令；仅在确需本地命令计划任务时由宿主机配置文件显式开启。
+allow_cron_exec = false
 
 [web_terminal]
 # 仅当 [modules].web_terminal = true 时启用，默认关闭
 shell = "auto"                         # 自动选择 /bin/ash 或 /bin/sh
 default_cwd = "/root"
 idle_timeout_secs = 900                # 空闲 15 分钟自动断开并回收进程组
-max_sessions = 2
+max_sessions = 10
 
 [security]
 tls_handshake_timeout_secs = 5
@@ -61,6 +79,11 @@ mem_low_mb = 32
 alert_cooldown_secs = 1800
 sample_interval_secs = 2
 top_processes = 10
+
+[update]
+auto_check = false                     # 默认关闭自动检查；仅检查 GitHub Release 并发提醒，永不自动更新
+check_interval_hours = 24              # 检查周期（1..168 小时）
+repo = "xinghaix/vane"
 
 [firewall]
 auto_manage = true                     # 启动首轮先预清扫残留链，仅对实际绑定成功的协议栈开门
@@ -157,6 +180,7 @@ schedule = "0 0 4 * * *"
 timeout_secs = 60
 action = { kind = "docker_prune_images", dangling_only = true }
 
+# 注意：启用 kind = "exec" 计划任务前，必须先在 [admin] 段显式开启 allow_cron_exec = true（默认关闭）
 [[cron]]
 name = "custom_health_ping"
 enabled = false

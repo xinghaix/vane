@@ -1,12 +1,12 @@
 #![allow(deprecated)]
 //! 单管理员多模态强认证：PBKDF2 口令（受限 spawn_blocking）、初始密码硬拦截、
-//! 单调水位 TOTP 防回退重放、OpenSSH Ed25519 绑定挑战验签与会话管理。
+//! 单调水位 TOTP 防回退重放、通行密钥 (Passkey) 与按子模块隔离的二次验证会话管理。
 use crate::net::dual_stack::BanKey;
 use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
 use base64::Engine;
 use ring::rand::{SecureRandom, SystemRandom};
-use ring::{constant_time, digest, hmac, pbkdf2, signature};
-use std::collections::{HashMap, VecDeque};
+use ring::{constant_time, digest, hmac, pbkdf2};
+use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -16,11 +16,11 @@ use tokio::sync::Semaphore;
 pub const DEFAULT_INITIAL_PASSWORD: &[u8] = b"admin321";
 pub const DEFAULT_USERNAME: &str = "admin";
 pub const PBKDF2_ITERS: u32 = 100_000;
-const CHALLENGE_POOL_CAP: usize = 64;
-const CHALLENGE_TTL: Duration = Duration::from_secs(60);
 const MAX_SESSIONS: usize = 32;
 /// 会话绝对生命周期上限：24 小时
 const SESSION_ABSOLUTE_MAX: Duration = Duration::from_secs(86_400);
+/// 子模块二次验证解锁有效期：10 分钟（按模块独立隔离，登出或安全配置变更即刻失效）
+pub const MODULE_UNLOCK_TTL: Duration = Duration::from_secs(600);
 const HASH_QUEUE_LIMIT: usize = 4;
 
 /// 登录会话权限作用域：未修改初始密码前强制锁死在 MustChangePassword，禁止进入任何管理页面 API
@@ -28,6 +28,23 @@ const HASH_QUEUE_LIMIT: usize = 4;
 pub enum SessionScope {
     MustChangePassword,
     FullAdmin,
+}
+
+/// 二次认证令牌核销失败原因（区分无效/过期与强因子 MFA 要求）
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ReauthConsumeError {
+    InvalidOrExpired,
+    MfaRequired,
+}
+
+/// 判定是否为合法纯通行密钥免密配置（关闭密码登录且已启用并绑定至少一把通行密钥）
+pub fn is_valid_passkey_only_config(admin: &crate::config::AdminConfig) -> bool {
+    !admin.password_login_enabled && admin.passkey_enabled && !admin.passkeys.is_empty()
+}
+
+/// 判定管理员是否启用了至少一种强多因素认证方式（TOTP 或已绑定的 Passkey）
+pub fn admin_has_mfa_enabled(admin: &crate::config::AdminConfig) -> bool {
+    admin.totp_enabled || (admin.passkey_enabled && !admin.passkeys.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -124,25 +141,17 @@ impl HashGate {
 }
 
 // ---------------------------------------------------------------------------
-// AuthEngine：口令策略 / TOTP / Ed25519 挑战
+// AuthEngine：口令策略 / TOTP
 // ---------------------------------------------------------------------------
 
-pub struct PendingChallenge {
-    pub nonce: [u8; 32],
-    pub key_id: String,
-    pub client_key: BanKey,
-    pub issued_at: Instant,
-}
-
 pub struct AuthEngine {
-    challenges: VecDeque<PendingChallenge>,
     last_totp_step: Option<u64>, // 严格单调递增水位线：拒绝任何 <= last_totp_step 的动态码
     canonical_origin: String,    // 服务端固定受信 Origin，绝不采信客户端自报 Host
 }
 
 impl AuthEngine {
     pub fn new(canonical_origin: String) -> Self {
-        Self { challenges: VecDeque::with_capacity(CHALLENGE_POOL_CAP), last_totp_step: None, canonical_origin }
+        Self { last_totp_step: None, canonical_origin }
     }
 
     pub fn set_canonical_origin(&mut self, origin: String) {
@@ -238,58 +247,6 @@ impl AuthEngine {
         }
         false
     }
-
-    /// 3. 签发绑定上下文的一次性挑战（单管理员模型，按源 IP 限速，不驱逐未过期挑战）
-    pub fn issue_challenge(&mut self, rng: &dyn SecureRandom, key_id: String, client_key: BanKey) -> Result<[u8; 32], &'static str> {
-        while self.challenges.front().is_some_and(|c| c.issued_at.elapsed() > CHALLENGE_TTL) {
-            self.challenges.pop_front();
-        }
-        if self.challenges.len() >= CHALLENGE_POOL_CAP {
-            return Err("当前并发挑战过多，请稍后重试");
-        }
-        if self.challenges.iter().filter(|c| c.client_key == client_key).count() >= 3 {
-            return Err("同一网络请求过于频繁");
-        }
-        let mut nonce = [0u8; 32];
-        rng.fill(&mut nonce).map_err(|_| "硬件随机源生成失败")?;
-        self.challenges.push_back(PendingChallenge { nonce, key_id, client_key, issued_at: Instant::now() });
-        Ok(nonce)
-    }
-
-    /// 构造签名原文：vane-ed25519-auth-v1|<nonce>|<key_id>|<canonical_origin>
-    pub fn challenge_message(&self, nonce: &[u8; 32], key_id: &str) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(128);
-        msg.extend_from_slice(b"vane-ed25519-auth-v1|");
-        msg.extend_from_slice(nonce);
-        msg.push(b'|');
-        msg.extend_from_slice(key_id.as_bytes());
-        msg.push(b'|');
-        msg.extend_from_slice(self.canonical_origin.as_bytes());
-        msg
-    }
-
-    /// 4. 原子消费挑战并校验 Ed25519 签名（强制绑定 KeyID、源网络与服务端 Origin）
-    pub fn verify_ed25519_challenge(
-        &mut self,
-        nonce: &[u8; 32],
-        key_id: &str,
-        client_key: BanKey,
-        sig: &[u8],
-        raw_ed25519_pubkey: &[u8; 32],
-    ) -> bool {
-        let Some(pos) = self.challenges.iter().position(|c| {
-            c.issued_at.elapsed() <= CHALLENGE_TTL
-                && c.client_key == client_key
-                && c.key_id == key_id
-                && constant_time::verify_slices_are_equal(&c.nonce, nonce).is_ok()
-        }) else {
-            return false;
-        };
-        self.challenges.remove(pos);
-        let msg = self.challenge_message(nonce, key_id);
-        let pk = signature::UnparsedPublicKey::new(&signature::ED25519, raw_ed25519_pubkey);
-        pk.verify(&msg, sig).is_ok()
-    }
 }
 
 /// RFC 4226 HOTP 动态截断
@@ -299,56 +256,6 @@ pub fn totp_code(secret: &[u8], step: u64) -> u32 {
     let bytes = tag.as_ref();
     let offset = (bytes[19] & 0x0f) as usize;
     u32::from_be_bytes([bytes[offset] & 0x7f, bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]]) % 1_000_000
-}
-
-/// 从 OpenSSH ssh-ed25519 公钥 Wire Format 解码字节中提取精确的 32B 原始公钥
-pub fn extract_ed25519_from_ssh_wire(wire_bytes: &[u8]) -> Option<[u8; 32]> {
-    const PREFIX: &[u8] = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20";
-    if wire_bytes.len() == 51 && wire_bytes.starts_with(PREFIX) {
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&wire_bytes[19..51]);
-        Some(out)
-    } else {
-        None
-    }
-}
-
-/// 解析 "ssh-ed25519 AAAAC3... comment" 文本
-pub fn parse_openssh_ed25519(text: &str) -> Option<[u8; 32]> {
-    let mut parts = text.split_whitespace();
-    if parts.next()? != "ssh-ed25519" {
-        return None;
-    }
-    let wire = B64.decode(parts.next()?).ok()?;
-    extract_ed25519_from_ssh_wire(&wire)
-}
-
-/// 将 32B 原始公钥编码为 OpenSSH 文本
-pub fn encode_openssh_ed25519(raw: &[u8; 32], comment: &str) -> String {
-    let mut wire = Vec::with_capacity(51);
-    wire.extend_from_slice(b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20");
-    wire.extend_from_slice(raw);
-    let mut s = format!("ssh-ed25519 {}", B64.encode(wire));
-    if !comment.is_empty() {
-        s.push(' ');
-        s.push_str(comment);
-    }
-    s
-}
-
-/// 接受 OpenSSH 文本或 base64 原始 32B 公钥，统一规范化为 OpenSSH 文本
-pub fn normalize_ed25519_pubkey(input: &str, comment: &str) -> Option<(String, [u8; 32])> {
-    let t = input.trim();
-    if let Some(raw) = parse_openssh_ed25519(t) {
-        return Some((t.split_whitespace().take(3).collect::<Vec<_>>().join(" "), raw));
-    }
-    let bytes = B64.decode(t).or_else(|_| B64URL.decode(t)).ok()?;
-    if bytes.len() == 32 {
-        let mut raw = [0u8; 32];
-        raw.copy_from_slice(&bytes);
-        return Some((encode_openssh_ed25519(&raw, comment), raw));
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +352,7 @@ pub struct Session {
     pub created: Instant,
     pub last_seen: Instant,
     pub client_key: BanKey,
+    pub unlocked_modules: HashMap<String, Instant>,
 }
 
 /// 会话表：仅保存令牌的 SHA-256 摘要，滑动过期（session_ttl）+ 24h 绝对上限
@@ -482,8 +390,63 @@ impl SessionStore {
         SystemRandom::new().fill(&mut raw).map_err(|_| "随机源失败")?;
         let token = B64URL.encode(raw);
         let now = Instant::now();
-        self.sessions.insert(Self::token_digest(&token), Session { scope, created: now, last_seen: now, client_key });
+        self.sessions.insert(
+            Self::token_digest(&token),
+            Session {
+                scope,
+                created: now,
+                last_seen: now,
+                client_key,
+                unlocked_modules: HashMap::new(),
+            },
+        );
         Ok(token)
+    }
+
+    pub fn unlock_module(&mut self, token: &str, module: &str) -> bool {
+        let Some(sess) = self.sessions.get_mut(&Self::token_digest(token)) else {
+            return false;
+        };
+        sess.unlocked_modules.retain(|_, ts| ts.elapsed() <= MODULE_UNLOCK_TTL);
+        sess.unlocked_modules.insert(module.to_string(), Instant::now());
+        true
+    }
+
+    pub fn lock_module(&mut self, token: &str, module: &str) {
+        if let Some(sess) = self.sessions.get_mut(&Self::token_digest(token)) {
+            sess.unlocked_modules.remove(module);
+        }
+    }
+
+    pub fn lock_module_all_sessions(&mut self, module: &str) {
+        for sess in self.sessions.values_mut() {
+            sess.unlocked_modules.remove(module);
+        }
+    }
+
+    pub fn is_module_unlocked(&self, token: &str, module: &str) -> bool {
+        self.is_module_unlocked_digest(&Self::token_digest(token), module)
+    }
+
+    pub fn is_module_unlocked_digest(&self, key: &[u8; 32], module: &str) -> bool {
+        self.sessions
+            .get(key)
+            .and_then(|s| s.unlocked_modules.get(module))
+            .is_some_and(|ts| ts.elapsed() <= MODULE_UNLOCK_TTL)
+    }
+
+    pub fn unlocked_modules_remaining(&self, token: &str) -> BTreeMap<String, u64> {
+        let mut out = BTreeMap::new();
+        let Some(sess) = self.sessions.get(&Self::token_digest(token)) else {
+            return out;
+        };
+        for (m, ts) in &sess.unlocked_modules {
+            let elapsed = ts.elapsed();
+            if elapsed < MODULE_UNLOCK_TTL {
+                out.insert(m.clone(), (MODULE_UNLOCK_TTL - elapsed).as_secs().max(1));
+            }
+        }
+        out
     }
 
     /// 校验并续期会话
@@ -547,22 +510,45 @@ pub struct AuthState {
     pub engine: AuthEngine,
     pub sessions: SessionStore,
     pub pending_totp_secret: Option<(Vec<u8>, Instant)>,
+    pub webauthn: crate::security::webauthn::WebAuthnChallengeStore,
     password_gate: Option<(String,SessionScope)>,
 }
 
 impl AuthState {
-    pub fn effective_scope(&mut self,admin:&crate::config::AdminConfig,scope:SessionScope)->SessionScope {
-        if admin.must_change_password{return SessionScope::MustChangePassword;}
-        if self.password_gate.as_ref().is_none_or(|(hash,_)|hash!=&admin.password_hash){
-            let gate=PasswordHash::parse(&admin.password_hash).map(|hash|AuthEngine::resolve_session_scope(false,&hash.salt,&hash.hash,hash.iters)).unwrap_or(SessionScope::MustChangePassword);
-            self.password_gate=Some((admin.password_hash.clone(),gate));
+    pub fn effective_scope(&mut self, admin: &crate::config::AdminConfig, scope: SessionScope) -> SessionScope {
+        if admin.must_change_password {
+            return SessionScope::MustChangePassword;
         }
-        if self.password_gate.as_ref().is_some_and(|(_,gate)|*gate==SessionScope::MustChangePassword){SessionScope::MustChangePassword}else{scope}
+        // 合法的纯通行密钥免密配置（关闭密码登录且已启用并绑定至少一把通行密钥）允许空 password_hash 保持 FullAdmin
+        if is_valid_passkey_only_config(admin) && admin.password_hash.trim().is_empty() {
+            return scope;
+        }
+        if self.password_gate.as_ref().is_none_or(|(hash, _)| hash != &admin.password_hash) {
+            let gate = PasswordHash::parse(&admin.password_hash)
+                .map(|hash| AuthEngine::resolve_session_scope(false, &hash.salt, &hash.hash, hash.iters))
+                .unwrap_or(SessionScope::MustChangePassword);
+            self.password_gate = Some((admin.password_hash.clone(), gate));
+        }
+        if self
+            .password_gate
+            .as_ref()
+            .is_some_and(|(_, gate)| *gate == SessionScope::MustChangePassword)
+        {
+            SessionScope::MustChangePassword
+        } else {
+            scope
+        }
     }
     pub fn new(canonical_origin: String, totp_watermark: u64) -> Self {
         let mut engine = AuthEngine::new(canonical_origin);
         engine.restore_totp_watermark(totp_watermark);
-        Self { engine, sessions: SessionStore::new(), pending_totp_secret: None, password_gate: None }
+        Self {
+            engine,
+            sessions: SessionStore::new(),
+            pending_totp_secret: None,
+            webauthn: crate::security::webauthn::WebAuthnChallengeStore::default(),
+            password_gate: None,
+        }
     }
 }
 
@@ -657,58 +643,18 @@ mod tests {
     }
 
     #[test]
-    fn ssh_wire_format_parsing() {
-        let raw = [0x42u8; 32];
-        let text = encode_openssh_ed25519(&raw, "admin@example");
-        assert_eq!(parse_openssh_ed25519(&text), Some(raw));
-        let wire = B64.decode(text.split_whitespace().nth(1).unwrap()).unwrap();
-        assert_eq!(wire.len(), 51);
-        assert_eq!(extract_ed25519_from_ssh_wire(&wire), Some(raw));
-        let mut bad = wire.clone();
-        bad[4] = b'x';
-        assert!(extract_ed25519_from_ssh_wire(&bad).is_none());
-        assert!(extract_ed25519_from_ssh_wire(&wire[..50]).is_none());
-        assert!(parse_openssh_ed25519("ssh-rsa AAAAB3Nza").is_none());
-        let (norm, r) = normalize_ed25519_pubkey(&B64.encode(raw), "k1").unwrap();
-        assert_eq!(r, raw);
-        assert!(norm.starts_with("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"));
-    }
-
-    #[test]
-    fn ed25519_challenge_binding() {
-        let rng = SystemRandom::new();
-        let pkcs8 = signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-        let kp = signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-        use ring::signature::KeyPair;
-        let mut pubkey = [0u8; 32];
-        pubkey.copy_from_slice(kp.public_key().as_ref());
-
-        let mut e = AuthEngine::new("https://192.168.1.1:23456".into());
-        let client = key("192.168.1.20");
-        let nonce = e.issue_challenge(&rng, "k1".into(), client).unwrap();
-        let sig = kp.sign(&e.challenge_message(&nonce, "k1"));
-
-        // 错误源网络 / 错误 key_id 均拒绝，且不消费挑战
-        assert!(!e.verify_ed25519_challenge(&nonce, "k1", key("192.168.1.21"), sig.as_ref(), &pubkey));
-        assert!(!e.verify_ed25519_challenge(&nonce, "k2", client, sig.as_ref(), &pubkey));
-        // 正确验签成功并一次性消费
-        assert!(e.verify_ed25519_challenge(&nonce, "k1", client, sig.as_ref(), &pubkey));
-        assert!(!e.verify_ed25519_challenge(&nonce, "k1", client, sig.as_ref(), &pubkey));
-
-        // 绑定 canonical_origin：针对其他 Origin 的签名无效
-        let nonce2 = e.issue_challenge(&rng, "k1".into(), client).unwrap();
-        let mut other = AuthEngine::new("https://evil.example".into());
-        let bad_sig = kp.sign(&other.challenge_message(&nonce2, "k1"));
-        let _ = other.issue_challenge(&rng, "k1".into(), client);
-        assert!(!e.verify_ed25519_challenge(&nonce2, "k1", client, bad_sig.as_ref(), &pubkey));
-
-        // 同源限速：每个源网络最多 3 个未完成挑战
-        let mut e2 = AuthEngine::new("o".into());
-        for _ in 0..3 {
-            e2.issue_challenge(&rng, "k".into(), client).unwrap();
-        }
-        assert!(e2.issue_challenge(&rng, "k".into(), client).is_err());
-        assert!(e2.issue_challenge(&rng, "k".into(), key("2001:db8::1")).is_ok());
+    fn session_module_unlock_is_isolated_and_revocable() {
+        let mut s = SessionStore::new();
+        let ck = key("127.0.0.1");
+        let tok = s.issue(SessionScope::FullAdmin, ck, Duration::from_secs(3600)).unwrap();
+        assert!(!s.is_module_unlocked(&tok, "ddns"));
+        assert!(s.unlock_module(&tok, "ddns"));
+        assert!(s.is_module_unlocked(&tok, "ddns"));
+        assert!(!s.is_module_unlocked(&tok, "docker"));
+        let rem = s.unlocked_modules_remaining(&tok);
+        assert!(rem.get("ddns").copied().unwrap_or(0) > 0);
+        s.lock_module(&tok, "ddns");
+        assert!(!s.is_module_unlocked(&tok, "ddns"));
     }
 
     #[test]
@@ -775,5 +721,70 @@ mod tests {
         let c = generate_recovery_codes(8).unwrap();
         assert_eq!(c.len(), 8);
         assert_eq!(normalize_recovery_code(&c[0]).len(), 16);
+    }
+
+    #[test]
+    fn effective_scope_allows_valid_passkey_only_without_password_hash() {
+        let mut state = AuthState::new("https://router.local:23456".into(), 0);
+        let mut admin = crate::config::AdminConfig::default();
+        admin.must_change_password = false;
+        admin.password_login_enabled = false;
+        admin.password_hash = String::new();
+        admin.passkey_enabled = true;
+        admin.passkeys.push(crate::config::PasskeyEntry {
+            id: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+            name: "TouchID".into(),
+            rp_id: "router.local".into(),
+            alg: -8,
+            pubkey_b64: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            sign_count: 0,
+            created_at: 1,
+            last_used_at: 0,
+        });
+
+        assert!(is_valid_passkey_only_config(&admin));
+        assert!(admin_has_mfa_enabled(&admin));
+        assert_eq!(
+            state.effective_scope(&admin, SessionScope::FullAdmin),
+            SessionScope::FullAdmin
+        );
+
+        // must_change_password=true 仍必须锁死
+        admin.must_change_password = true;
+        assert_eq!(
+            state.effective_scope(&admin, SessionScope::FullAdmin),
+            SessionScope::MustChangePassword
+        );
+        admin.must_change_password = false;
+
+        // 若重新开启密码登录但密码哈希仍为空，不能命中旧缓存，必须回落 MustChangePassword
+        admin.password_login_enabled = true;
+        assert_eq!(
+            state.effective_scope(&admin, SessionScope::FullAdmin),
+            SessionScope::MustChangePassword
+        );
+
+        // 若纯 Passkey 配置但无已绑定密钥，仍必须 fail-closed
+        admin.password_login_enabled = false;
+        admin.passkeys.clear();
+        assert!(!is_valid_passkey_only_config(&admin));
+        assert!(!admin_has_mfa_enabled(&admin));
+        assert_eq!(
+            state.effective_scope(&admin, SessionScope::FullAdmin),
+            SessionScope::MustChangePassword
+        );
+    }
+
+    #[test]
+    fn session_module_unlock_digest_matches_token_unlock() {
+        let mut s = SessionStore::new();
+        let ck = key("127.0.0.1");
+        let tok = s.issue(SessionScope::FullAdmin, ck, Duration::from_secs(3600)).unwrap();
+        let digest = SessionStore::token_digest(&tok);
+        assert!(!s.is_module_unlocked_digest(&digest, "docker"));
+        assert!(s.unlock_module(&tok, "docker"));
+        assert!(s.is_module_unlocked_digest(&digest, "docker"));
+        s.lock_module(&tok, "docker");
+        assert!(!s.is_module_unlocked_digest(&digest, "docker"));
     }
 }

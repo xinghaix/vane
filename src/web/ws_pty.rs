@@ -8,12 +8,13 @@ use crate::logger::{self, Level};
 use crate::net::dual_stack::BanKey;
 use crate::security::tickets::SessionTickets;
 use axum::extract::ws::{Message, WebSocket};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -22,6 +23,10 @@ use tokio::sync::Notify;
 
 const PTY_CHUNK_BYTES: usize = 16 * 1024;
 const RESIZE_PREFIX: &str = "\u{0}resize:";
+const SAFE_EXEC_PATH: &str = "/usr/sbin:/sbin:/usr/bin:/bin";
+const WS_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+const WS_CLOSE_NOTICE_TIMEOUT: Duration = Duration::from_secs(1);
+const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct PtyManager {
     tickets: SessionTickets,
@@ -51,15 +56,40 @@ impl PtyManager {
         peer: BanKey,
         max_sessions: usize,
     ) -> Result<String, String> {
-        if self.active_sessions.load(Ordering::SeqCst) >= max_sessions.clamp(1, 4) {
+        self.issue_bound_ticket_with_shell(session_token, target, "auto", peer, max_sessions)
+    }
+
+    pub fn issue_bound_ticket_with_shell(
+        &self,
+        session_token: &str,
+        target: &str,
+        shell: &str,
+        peer: BanKey,
+        max_sessions: usize,
+    ) -> Result<String, String> {
+        if self.active_sessions.load(Ordering::SeqCst) >= max_sessions.clamp(1, 10) {
             return Err("已达到最大并发 Web 终端会话数上限".into());
         }
         validate_pty_target(target)?;
-        self.tickets.issue(session_token, format!("pty:{target}"), peer)
+        let shell_norm = validate_shell_choice(shell)?;
+        self.tickets
+            .issue(session_token, format!("pty:{target}:{shell_norm}"), peer)
     }
 
     pub fn consume_bound_ticket(&self, ticket: &str, target: &str, peer: BanKey) -> Option<[u8; 32]> {
-        self.tickets.consume(ticket, &format!("pty:{target}"), peer)
+        self.consume_bound_ticket_with_shell(ticket, target, "auto", peer)
+    }
+
+    pub fn consume_bound_ticket_with_shell(
+        &self,
+        ticket: &str,
+        target: &str,
+        shell: &str,
+        peer: BanKey,
+    ) -> Option<[u8; 32]> {
+        let shell_norm = validate_shell_choice(shell).ok()?;
+        self.tickets
+            .consume(ticket, &format!("pty:{target}:{shell_norm}"), peer)
     }
 
     pub fn notify_revoke(&self) {
@@ -82,16 +112,249 @@ pub fn validate_pty_target(target: &str) -> Result<(), String> {
     Err("非法的终端目标（仅支持 host 或 container:<name>）".into())
 }
 
-fn resolve_shell(pref: &str) -> String {
-    if pref != "auto" && Path::new(pref).exists() {
-        return pref.to_string();
+/// 严格校验 Docker Socket 路径：必须为无 `.`/`..`/`//` 的绝对路径，且目标本身为非符号链接的 Unix Domain Socket。
+/// 统一错误文案避免文件存在性侧信道探测。
+pub fn validate_docker_socket_path(socket_path: &str) -> Result<(), String> {
+    let trimmed = socket_path.trim();
+    if trimmed.is_empty()
+        || !trimmed.starts_with('/')
+        || trimmed.contains('\0')
+        || trimmed.contains("//")
+        || trimmed.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
+        return Err("Docker Socket 路径无效或不可访问".into());
     }
-    for s in ["/bin/ash", "/bin/bash", "/bin/sh"] {
-        if Path::new(s).exists() {
-            return s.to_string();
+    let path = Path::new(trimmed);
+    if path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err("Docker Socket 路径无效或不可访问".into());
+    }
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|_| "Docker Socket 路径无效或不可访问".to_string())?;
+    let ft = meta.file_type();
+    if ft.is_symlink() || !ft.is_socket() {
+        return Err("Docker Socket 路径无效或不可访问".into());
+    }
+    Ok(())
+}
+
+fn resolve_docker_binary() -> &'static str {
+    for cand in ["/usr/sbin/docker", "/sbin/docker", "/usr/bin/docker", "/bin/docker"] {
+        if is_executable_file(Path::new(cand)) {
+            return cand;
         }
     }
-    "/bin/sh".to_string()
+    "docker"
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DetectedShell {
+    pub id: String,
+    pub path: String,
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+        .unwrap_or(false)
+}
+
+/// 自动探测宿主机可用的 Shell（支持 bash 与 sh；两者皆存在时按序将 bash 置于首位作为默认项）。
+pub fn detect_available_shells() -> Vec<DetectedShell> {
+    let mut out = Vec::new();
+    for cand in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash", "/opt/homebrew/bin/bash"] {
+        if is_executable_file(Path::new(cand)) {
+            out.push(DetectedShell {
+                id: "bash".to_string(),
+                path: cand.to_string(),
+            });
+            break;
+        }
+    }
+    for cand in ["/bin/sh", "/usr/bin/sh"] {
+        if is_executable_file(Path::new(cand)) {
+            out.push(DetectedShell {
+                id: "sh".to_string(),
+                path: cand.to_string(),
+            });
+            break;
+        }
+    }
+    out
+}
+
+pub fn default_shell_id(configured: &str, available: &[DetectedShell]) -> String {
+    let pref = configured.trim();
+    if (pref == "sh" || pref.ends_with("/sh")) && available.iter().any(|s| s.id == "sh") {
+        return "sh".to_string();
+    }
+    if (pref == "bash" || pref.ends_with("/bash")) && available.iter().any(|s| s.id == "bash") {
+        return "bash".to_string();
+    }
+    if available.iter().any(|s| s.id == "bash") {
+        return "bash".to_string();
+    }
+    if available.iter().any(|s| s.id == "sh") {
+        return "sh".to_string();
+    }
+    "sh".to_string()
+}
+
+pub fn validate_shell_choice(shell: &str) -> Result<String, String> {
+    let s = shell.trim();
+    if s.is_empty() || s == "auto" {
+        Ok("auto".to_string())
+    } else if s == "bash" || s == "sh" {
+        Ok(s.to_string())
+    } else {
+        Err("不支持的终端 Shell 类型（仅支持 auto、bash、sh）".into())
+    }
+}
+
+fn resolve_shell(pref: &str, session_shell: &str) -> Result<String, String> {
+    let available = detect_available_shells();
+    let find_id = |id: &str| available.iter().find(|s| s.id == id).map(|s| s.path.clone());
+
+    match session_shell.trim() {
+        "bash" => return find_id("bash").ok_or_else(|| "宿主机未检测到可用的 bash".to_string()),
+        "sh" => return find_id("sh").ok_or_else(|| "宿主机未检测到可用的 sh".to_string()),
+        "" | "auto" => {}
+        other => return Err(format!("不支持的终端 Shell: {other}")),
+    }
+
+    let cfg_pref = pref.trim();
+    if cfg_pref == "bash" {
+        if let Some(p) = find_id("bash") {
+            return Ok(p);
+        }
+    } else if cfg_pref == "sh" {
+        if let Some(p) = find_id("sh") {
+            return Ok(p);
+        }
+    } else if !cfg_pref.is_empty() && cfg_pref != "auto" && is_executable_file(Path::new(cfg_pref)) {
+        return Ok(cfg_pref.to_string());
+    }
+
+    // 默认策略：bash 与 sh 同时可用时优先使用 bash，否则回退至 sh / ash
+    if let Some(p) = find_id("bash") {
+        return Ok(p);
+    }
+    if let Some(p) = find_id("sh") {
+        return Ok(p);
+    }
+    for s in ["/bin/ash", "/bin/sh"] {
+        if is_executable_file(Path::new(s)) {
+            return Ok(s.to_string());
+        }
+    }
+    Err("宿主机未找到可用的 bash 或 sh".into())
+}
+
+fn supports_login_flag(shell_path: &str) -> bool {
+    let base = Path::new(shell_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    matches!(base, "bash" | "sh" | "ash" | "dash" | "zsh" | "ksh" | "fish")
+}
+
+fn current_user_passwd() -> Option<(String, String)> {
+    // SAFETY: getpwuid_r 是 POSIX 线程安全接口，使用栈/堆独立缓冲无共享静态态。
+    unsafe {
+        let uid = libc::geteuid();
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut buf = vec![0u8; 4096];
+        let mut result: *mut libc::passwd = std::ptr::null_mut();
+        let rc = libc::getpwuid_r(
+            uid,
+            &mut pwd,
+            buf.as_mut_ptr() as *mut libc::c_char,
+            buf.len(),
+            &mut result,
+        );
+        if rc != 0 || result.is_null() {
+            return None;
+        }
+        let user = if pwd.pw_name.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(pwd.pw_name).to_string_lossy().into_owned()
+        };
+        let home = if pwd.pw_dir.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(pwd.pw_dir).to_string_lossy().into_owned()
+        };
+        Some((user, home))
+    }
+}
+
+fn build_merged_path(existing: Option<&str>) -> String {
+    const BASELINE: [&str; 6] = [
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    ];
+    let mut parts: Vec<String> = existing
+        .unwrap_or("")
+        .split(':')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    for dir in BASELINE {
+        if !parts.iter().any(|p| p == dir) {
+            parts.push(dir.to_string());
+        }
+    }
+    parts.join(":")
+}
+
+fn apply_host_shell_env(cmd: &mut Command, shell_path: &str) {
+    let passwd = current_user_passwd();
+    let existing_home = std::env::var("HOME").ok().filter(|s| !s.trim().is_empty());
+    let home = existing_home
+        .or_else(|| passwd.as_ref().map(|(_, h)| h.clone()).filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "/root".to_string());
+    let existing_user = std::env::var("USER").ok().filter(|s| !s.trim().is_empty());
+    let user = existing_user
+        .or_else(|| passwd.as_ref().map(|(u, _)| u.clone()).filter(|s| !s.trim().is_empty()));
+    let existing_path = std::env::var("PATH").ok();
+    let merged_path = build_merged_path(existing_path.as_deref());
+
+    cmd.env("SHELL", shell_path)
+        .env("HOME", &home)
+        .env("PATH", merged_path)
+        .env("BASH_SILENCE_DEPRECATION_WARNING", "1");
+
+    if let Some(u) = user {
+        cmd.env("USER", &u);
+        if std::env::var("LOGNAME").ok().filter(|s| !s.trim().is_empty()).is_none() {
+            cmd.env("LOGNAME", &u);
+        }
+    }
+
+    let has_utf8_locale = std::env::var("LC_ALL")
+        .ok()
+        .or_else(|| std::env::var("LANG").ok())
+        .is_some_and(|v| {
+            let up = v.to_ascii_uppercase();
+            up.contains("UTF-8") || up.contains("UTF8")
+        });
+    if !has_utf8_locale {
+        #[cfg(target_os = "macos")]
+        cmd.env("LANG", "en_US.UTF-8");
+        #[cfg(not(target_os = "macos"))]
+        cmd.env("LANG", "C.UTF-8");
+    }
+
+    cmd.env_remove("VANE_MASTER_KEY")
+        .env_remove("VANE_MASTER_KEY_FILE");
 }
 
 pub struct PtyProcess {
@@ -106,6 +369,7 @@ impl Drop for PtyProcess {
         if let Some(mut child) = self.child.take() {
             if self.pgid > 1 {
                 unsafe {
+                    let _ = libc::kill(-self.pgid, libc::SIGHUP);
                     let _ = libc::kill(-self.pgid, libc::SIGKILL);
                 }
             }
@@ -132,17 +396,22 @@ impl PtyProcess {
 
     pub async fn terminate_and_reap(mut self) {
         let pgid = self.pgid;
+        // 先关闭 PTY master FD，触发从端 EOF / SIGHUP（容器 exec 场景可让 docker CLI 转发挂断）
         drop(self.master.take());
         let Some(mut child) = self.child.take() else { return };
         tokio::task::spawn_blocking(move || {
             if pgid > 1 {
                 // SAFETY: 子进程通过 setsid 成为独立会话与进程组长，负号向整组发送信号。
-                // 在调用 child.wait() 回收组长 PID 之前先完成 SIGHUP -> 短等 -> SIGKILL，
+                // 在调用 child.wait() 回收组长 PID 之前先完成 SIGHUP -> 短优雅期 -> SIGTERM -> 短优雅期 -> SIGKILL，
                 // 组长即使已退出也仍保持僵尸占位，确保 pgid 不会被操作系统复用，同时彻底清理后台子孙进程。
                 unsafe {
                     let _ = libc::kill(-pgid, libc::SIGHUP);
                 }
-                std::thread::sleep(Duration::from_millis(60));
+                std::thread::sleep(Duration::from_millis(80));
+                unsafe {
+                    let _ = libc::kill(-pgid, libc::SIGTERM);
+                }
+                std::thread::sleep(Duration::from_millis(80));
                 unsafe {
                     let _ = libc::kill(-pgid, libc::SIGKILL);
                 }
@@ -262,6 +531,66 @@ fn parse_resize_message(text: &str) -> Option<(u16, u16)> {
     Some((parsed.cols, parsed.rows))
 }
 
+async fn wait_until_revoked<F>(pty_mgr: &PtyManager, session_alive: &F)
+where
+    F: Fn() -> bool,
+{
+    loop {
+        let notified = pty_mgr.revoke_notify.notified();
+        tokio::pin!(notified);
+        // 在检查 session_alive 之前先注册等待器，彻底消除漏唤醒竞态。
+        notified.as_mut().enable();
+        if !session_alive() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+async fn send_ws_notice_bounded(ws: &mut WebSocket, text: impl Into<String>) {
+    let _ = tokio::time::timeout(
+        WS_CLOSE_NOTICE_TIMEOUT,
+        ws.send(Message::Text(text.into().into())),
+    )
+    .await;
+}
+
+async fn send_ws_bounded<F>(
+    ws: &mut WebSocket,
+    msg: Message,
+    pty_mgr: &PtyManager,
+    session_alive: &F,
+) -> bool
+where
+    F: Fn() -> bool,
+{
+    tokio::select! {
+        biased;
+        _ = wait_until_revoked(pty_mgr, session_alive) => false,
+        res = tokio::time::timeout(WS_SEND_TIMEOUT, ws.send(msg)) => {
+            matches!(res, Ok(Ok(())))
+        }
+    }
+}
+
+async fn write_pty_bounded<F>(
+    master: &AsyncFd<File>,
+    data: &[u8],
+    pty_mgr: &PtyManager,
+    session_alive: &F,
+) -> bool
+where
+    F: Fn() -> bool,
+{
+    tokio::select! {
+        biased;
+        _ = wait_until_revoked(pty_mgr, session_alive) => false,
+        res = tokio::time::timeout(PTY_WRITE_TIMEOUT, write_pty_all(master, data)) => {
+            matches!(res, Ok(Ok(())))
+        }
+    }
+}
+
 struct SessionSlotGuard<'a>(&'a PtyManager);
 impl Drop for SessionSlotGuard<'_> {
     fn drop(&mut self) {
@@ -276,6 +605,7 @@ pub async fn handle_pty_websocket<F>(
     docker_socket: String,
     docker_cfg: DockerConfig,
     target: String,
+    shell_choice: String,
     cols: u16,
     rows: u16,
     session_alive: F,
@@ -284,44 +614,108 @@ pub async fn handle_pty_websocket<F>(
 {
     let prev = pty_mgr.active_sessions.fetch_add(1, Ordering::SeqCst);
     let _slot_guard = SessionSlotGuard(pty_mgr);
-    if prev >= cfg.max_sessions.clamp(1, 4) {
-        let _ = ws.send(Message::Text("ERROR: 已达到最大终端并发会话数\r\n".into())).await;
+    if prev >= cfg.max_sessions.clamp(1, 10) {
+        send_ws_notice_bounded(&mut ws, "ERROR: 已达到最大终端并发会话数\r\n").await;
+        return;
+    }
+
+    if !session_alive() {
+        send_ws_notice_bounded(&mut ws, "\r\n[登录会话或终端模块已关闭，连接已终止]\r\n").await;
         return;
     }
 
     if let Err(e) = validate_pty_target(&target) {
-        let _ = ws.send(Message::Text(format!("ERROR: {e}\r\n").into())).await;
+        send_ws_notice_bounded(&mut ws, format!("ERROR: {e}\r\n")).await;
         return;
     }
-
-    let cmd = if let Some(container) = target.strip_prefix("container:") {
-        if let Err(e) = ensure_not_protected(&docker_socket, &docker_cfg, container, "exec").await {
-            let _ = ws.send(Message::Text(format!("ERROR: {e}\r\n").into())).await;
+    let shell_norm = match validate_shell_choice(&shell_choice) {
+        Ok(s) => s,
+        Err(e) => {
+            send_ws_notice_bounded(&mut ws, format!("ERROR: {e}\r\n")).await;
             return;
         }
-        let mut c = Command::new("docker");
-        c.env_remove("VANE_MASTER_KEY")
-            .env_remove("VANE_MASTER_KEY_FILE");
-        if !docker_socket.is_empty() && docker_socket != "/var/run/docker.sock" {
-            c.args(["-H", &format!("unix://{}", docker_socket)]);
+    };
+
+    let cmd = if let Some(container) = target.strip_prefix("container:") {
+        let effective_socket = if docker_socket.trim().is_empty() {
+            "/var/run/docker.sock"
+        } else {
+            docker_socket.trim()
+        };
+        if let Err(e) = validate_docker_socket_path(effective_socket) {
+            send_ws_notice_bounded(&mut ws, format!("ERROR: {e}\r\n")).await;
+            return;
         }
-        c.args(["exec", "-it", "--", container, "/bin/sh"]);
+        let check_res = tokio::select! {
+            biased;
+            _ = wait_until_revoked(pty_mgr, &session_alive) => {
+                send_ws_notice_bounded(&mut ws, "\r\n[登录会话或终端模块已关闭，连接已终止]\r\n").await;
+                return;
+            }
+            res = ensure_not_protected(effective_socket, &docker_cfg, container, "exec") => res,
+        };
+        if let Err(e) = check_res {
+            send_ws_notice_bounded(&mut ws, format!("ERROR: {e}\r\n")).await;
+            return;
+        }
+        let mut c = Command::new(resolve_docker_binary());
+        // 清空继承环境并固定最小安全 PATH，杜绝 PATH 劫持、DOCKER_HOST 污染与主密钥泄漏
+        c.env_clear()
+            .env("PATH", SAFE_EXEC_PATH)
+            .env("TERM", "xterm-256color")
+            .args(["-H", &format!("unix://{}", effective_socket)]);
+        match shell_norm.as_str() {
+            "bash" => {
+                c.args(["exec", "-it", "--", container, "bash", "-l"]);
+            }
+            "sh" => {
+                c.args(["exec", "-it", "--", container, "/bin/sh", "-l"]);
+            }
+            _ => {
+                c.args([
+                    "exec",
+                    "-it",
+                    "--",
+                    container,
+                    "/bin/sh",
+                    "-c",
+                    "if command -v bash >/dev/null 2>&1; then exec bash -l; else exec /bin/sh -l; fi",
+                ]);
+            }
+        }
         c
     } else {
-        let shell = resolve_shell(&cfg.shell);
+        let shell = match resolve_shell(&cfg.shell, &shell_norm) {
+            Ok(s) => s,
+            Err(e) => {
+                send_ws_notice_bounded(&mut ws, format!("ERROR: {e}\r\n")).await;
+                return;
+            }
+        };
         let mut c = Command::new(&shell);
-        c.env_remove("VANE_MASTER_KEY")
-            .env_remove("VANE_MASTER_KEY_FILE");
+        if supports_login_flag(&shell) {
+            c.arg("-l");
+        }
+        apply_host_shell_env(&mut c, &shell);
         if !cfg.default_cwd.is_empty() && Path::new(&cfg.default_cwd).exists() {
             c.current_dir(&cfg.default_cwd);
+        } else if let Some((_, home)) = current_user_passwd() {
+            if !home.is_empty() && Path::new(&home).exists() {
+                c.current_dir(home);
+            }
         }
         c
     };
 
+    if !session_alive() {
+        send_ws_notice_bounded(&mut ws, "\r\n[登录会话或终端模块已关闭，连接已终止]\r\n").await;
+        return;
+    }
+
     let pty = match spawn_pty_command(cmd, cols, rows) {
         Ok(p) => p,
         Err(e) => {
-            let _ = ws.send(Message::Text(format!("启动 PTY 终端失败: {e}\r\n").into())).await;
+            send_ws_notice_bounded(&mut ws, format!("启动 PTY 终端失败: {e}\r\n")).await;
             return;
         }
     };
@@ -342,19 +736,18 @@ pub async fn handle_pty_websocket<F>(
 
     loop {
         tokio::select! {
-            _ = &mut idle_sleep => {
-                let _ = ws.send(Message::Text("\r\n[会话空闲超时已自动断开]\r\n".into())).await;
+            biased;
+            _ = wait_until_revoked(pty_mgr, &session_alive) => {
+                send_ws_notice_bounded(&mut ws, "\r\n[登录会话或终端模块已关闭，连接已终止]\r\n").await;
                 break;
             }
-            _ = pty_mgr.revoke_notify.notified() => {
-                if !session_alive() {
-                    let _ = ws.send(Message::Text("\r\n[登录会话或终端模块已关闭，连接已终止]\r\n".into())).await;
-                    break;
-                }
+            _ = &mut idle_sleep => {
+                send_ws_notice_bounded(&mut ws, "\r\n[会话空闲超时已自动断开]\r\n").await;
+                break;
             }
             _ = auth_ticker.tick() => {
                 if !session_alive() {
-                    let _ = ws.send(Message::Text("\r\n[登录会话已失效，连接已终止]\r\n".into())).await;
+                    send_ws_notice_bounded(&mut ws, "\r\n[登录会话已失效，连接已终止]\r\n").await;
                     break;
                 }
             }
@@ -382,7 +775,7 @@ pub async fn handle_pty_websocket<F>(
                         if valid_up_to > 0 {
                             let text = String::from_utf8_lossy(&utf8_carry[..valid_up_to]).into_owned();
                             utf8_carry.drain(..valid_up_to);
-                            if ws.send(Message::Text(text.into())).await.is_err() {
+                            if !send_ws_bounded(&mut ws, Message::Text(text.into()), pty_mgr, &session_alive).await {
                                 break;
                             }
                         }
@@ -396,7 +789,7 @@ pub async fn handle_pty_websocket<F>(
                         if let Some((c, r)) = parse_resize_message(&txt) {
                             pty.resize(c, r);
                         } else if let Some(ref m) = pty.master {
-                            if write_pty_all(m, txt.as_bytes()).await.is_err() {
+                            if !write_pty_bounded(m, txt.as_bytes(), pty_mgr, &session_alive).await {
                                 break;
                             }
                         }
@@ -404,7 +797,7 @@ pub async fn handle_pty_websocket<F>(
                     Some(Ok(Message::Binary(bin))) => {
                         idle_sleep.as_mut().reset(tokio::time::Instant::now() + idle_limit);
                         if let Some(ref m) = pty.master {
-                            if write_pty_all(m, &bin).await.is_err() {
+                            if !write_pty_bounded(m, &bin, pty_mgr, &session_alive).await {
                                 break;
                             }
                         }
@@ -474,5 +867,144 @@ mod tests {
         let tok3 = mgr.issue_bound_ticket("sess1", "host", peer_a, 2).unwrap();
         assert!(mgr.consume_bound_ticket(&tok3, "host", peer_a).is_some());
         assert!(mgr.consume_bound_ticket(&tok3, "host", peer_a).is_none());
+
+        // 校验 shell 绑定与非法 shell 拦截
+        assert!(mgr.issue_bound_ticket_with_shell("sess1", "host", "/bin/evil", peer_a, 2).is_err());
+        let tok4 = mgr.issue_bound_ticket_with_shell("sess1", "host", "bash", peer_a, 2).unwrap();
+        assert!(mgr.consume_bound_ticket_with_shell(&tok4, "host", "sh", peer_a).is_none());
+        let tok5 = mgr.issue_bound_ticket_with_shell("sess1", "host", "sh", peer_a, 2).unwrap();
+        assert!(mgr.consume_bound_ticket_with_shell(&tok5, "host", "sh", peer_a).is_some());
+    }
+
+    #[test]
+    fn shell_detection_prefers_bash_over_sh_and_allows_override() {
+        let both = vec![
+            DetectedShell { id: "bash".into(), path: "/bin/bash".into() },
+            DetectedShell { id: "sh".into(), path: "/bin/sh".into() },
+        ];
+        assert_eq!(default_shell_id("auto", &both), "bash");
+        assert_eq!(default_shell_id("sh", &both), "sh");
+        assert_eq!(default_shell_id("/bin/sh", &both), "sh");
+        assert_eq!(default_shell_id("bash", &both), "bash");
+
+        let only_sh = vec![DetectedShell { id: "sh".into(), path: "/bin/sh".into() }];
+        assert_eq!(default_shell_id("auto", &only_sh), "sh");
+        assert_eq!(default_shell_id("bash", &only_sh), "sh");
+
+        let detected = detect_available_shells();
+        assert!(!detected.is_empty(), "at least sh should exist on Unix host");
+        if detected.iter().any(|s| s.id == "bash") {
+            assert_eq!(detected[0].id, "bash");
+            assert_eq!(default_shell_id("auto", &detected), "bash");
+        }
+        assert!(validate_shell_choice("bash").is_ok());
+        assert!(validate_shell_choice("sh").is_ok());
+        assert!(validate_shell_choice("auto").is_ok());
+        assert!(validate_shell_choice("zsh").is_err());
+
+        assert!(supports_login_flag("/bin/bash"));
+        assert!(supports_login_flag("/bin/sh"));
+        assert!(supports_login_flag("/bin/ash"));
+        assert!(!supports_login_flag("/usr/bin/custom-tool"));
+
+        let merged = build_merged_path(Some("/opt/bin:/usr/bin"));
+        assert!(merged.starts_with("/opt/bin:/usr/bin:"));
+        assert!(merged.contains("/usr/sbin"));
+        assert!(merged.contains("/sbin"));
+        assert_eq!(merged.matches("/usr/bin").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn host_shell_env_sets_shell_path_home_and_strips_master_key() {
+        let shell = resolve_shell("auto", "sh").unwrap();
+        let mut cmd = Command::new(&shell);
+        cmd.env("VANE_MASTER_KEY", "should-never-leak");
+        apply_host_shell_env(&mut cmd, &shell);
+        cmd.args([
+            "-c",
+            "printf 'SHELL=%s;HOME=%s;PATH_HAS_SBIN=%s;MK=%s\\n' \"$SHELL\" \"$HOME\" \"$(printf %s \"$PATH\" | grep -c /sbin)\" \"${VANE_MASTER_KEY:-NONE}\"",
+        ]);
+        let pty = spawn_pty_command(cmd, 80, 24).unwrap();
+        let master = pty.master.as_ref().unwrap();
+        let mut buf = [0u8; 512];
+        let mut out = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline && !out.contains("MK=NONE") {
+            if let Ok(Ok(k)) = tokio::time::timeout(Duration::from_millis(300), read_pty_chunk(master, &mut buf)).await {
+                if k == 0 {
+                    break;
+                }
+                out.push_str(&String::from_utf8_lossy(&buf[..k]));
+            }
+        }
+        pty.terminate_and_reap().await;
+        assert!(out.contains(&format!("SHELL={shell}")), "out={out:?}");
+        assert!(!out.contains("HOME=;"), "HOME must be populated: out={out:?}");
+        assert!(out.contains("PATH_HAS_SBIN=1"), "PATH must include /sbin: out={out:?}");
+        assert!(out.contains("MK=NONE"), "VANE_MASTER_KEY must be stripped: out={out:?}");
+    }
+
+    #[test]
+    fn docker_socket_validation_accepts_only_real_non_symlink_unix_socket() {
+        let pid = std::process::id();
+        let sock_path = std::path::PathBuf::from(format!("/tmp/vane-pty-{pid}.sock"));
+        let link_path = std::path::PathBuf::from(format!("/tmp/vane-pty-{pid}.link"));
+        let file_path = std::path::PathBuf::from(format!("/tmp/vane-pty-{pid}.file"));
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&link_path);
+        let _ = std::fs::remove_file(&file_path);
+
+        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        std::os::unix::fs::symlink(&sock_path, &link_path).unwrap();
+        std::fs::write(&file_path, b"not a socket").unwrap();
+
+        assert!(validate_docker_socket_path(sock_path.to_str().unwrap()).is_ok());
+
+        // 符号链接、普通文件、目录、路径穿越与不存在路径统一拒绝且报错文案一致
+        let err_symlink = validate_docker_socket_path(link_path.to_str().unwrap()).unwrap_err();
+        let err_file = validate_docker_socket_path(file_path.to_str().unwrap()).unwrap_err();
+        let err_dir = validate_docker_socket_path("/tmp").unwrap_err();
+        let err_missing = validate_docker_socket_path("/tmp/vane-nonexistent-999999.sock").unwrap_err();
+        let err_traversal = validate_docker_socket_path("/tmp/../tmp/vane.sock").unwrap_err();
+        let err_relative = validate_docker_socket_path("var/run/docker.sock").unwrap_err();
+        assert_eq!(err_symlink, err_file);
+        assert_eq!(err_file, err_dir);
+        assert_eq!(err_dir, err_missing);
+        assert_eq!(err_missing, err_traversal);
+        assert_eq!(err_traversal, err_relative);
+
+        drop(listener);
+        let _ = std::fs::remove_file(&sock_path);
+        let _ = std::fs::remove_file(&link_path);
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[tokio::test]
+    async fn wait_until_revoked_ignores_spurious_notify_and_wakes_immediately_on_revoke() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let mgr = Arc::new(PtyManager::new());
+        let alive = Arc::new(AtomicBool::new(true));
+
+        let mgr_w = mgr.clone();
+        let alive_w = alive.clone();
+        let waiter = tokio::spawn(async move {
+            wait_until_revoked(&mgr_w, &move || alive_w.load(Ordering::SeqCst)).await;
+        });
+
+        tokio::task::yield_now().await;
+        // 虚假通知（其他会话被撤销但本会话仍存活）不得提前中断
+        mgr.notify_revoke();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!waiter.is_finished(), "spurious revoke_notify must not cancel live session");
+
+        // 本会话被标记失效并通知后应立即唤醒
+        alive.store(false, Ordering::SeqCst);
+        mgr.notify_revoke();
+        tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("revoked session must wake immediately")
+            .unwrap();
     }
 }

@@ -77,7 +77,7 @@ pub async fn serve(listener: TcpListener, app: Router, tls: Arc<rustls::ServerCo
                 let peer_guard = {
                     let Ok(mut g) = per_peer.lock() else { continue };
                     let cnt = g.entry(peer_key).or_insert(0);
-                    if *cnt >= 6 {
+                    if *cnt >= 16 {
                         continue;
                     }
                     *cnt += 1;

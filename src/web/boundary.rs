@@ -139,6 +139,59 @@ fn reject(code: &'static str, is_api: bool) -> Response {
     resp
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SecretPathGateDecision {
+    Allow { issue_entry_cookie: bool },
+    RejectTooManyRequests,
+    RejectNotFound { newly_banned: bool },
+}
+
+fn evaluate_secret_path_gate(
+    path: &str,
+    secret_path: &str,
+    authorized: bool,
+    peer_ban_key: Option<crate::net::dual_stack::BanKey>,
+    fail2ban: &crate::security::fail2ban::Fail2Ban,
+    max_probe_failures: u32,
+    ban_duration_secs: u64,
+) -> SecretPathGateDecision {
+    let hit_secret_path = path == secret_path
+        || path
+            .strip_prefix(secret_path)
+            .is_some_and(|rest| rest == "/" || rest.starts_with('/'));
+    if !authorized {
+        if let Some(ban_key) = peer_ban_key {
+            // 先执行 Fail2Ban（含表满 Fail-Closed）拦截，再判定是否命中 secret_path，消除路径探测预言机。
+            if fail2ban.is_key_blocked(ban_key) {
+                return SecretPathGateDecision::RejectTooManyRequests;
+            }
+            if !hit_secret_path {
+                return match fail2ban.record_failure_checked(
+                    ban_key,
+                    max_probe_failures,
+                    ban_duration_secs,
+                    "secret_path_probe",
+                ) {
+                    crate::security::fail2ban::FailureOutcome::NewlyBanned => {
+                        SecretPathGateDecision::RejectNotFound { newly_banned: true }
+                    }
+                    crate::security::fail2ban::FailureOutcome::SaturatedFailClosed => {
+                        SecretPathGateDecision::RejectTooManyRequests
+                    }
+                    crate::security::fail2ban::FailureOutcome::Tracked => {
+                        SecretPathGateDecision::RejectNotFound { newly_banned: false }
+                    }
+                };
+            }
+        } else if !hit_secret_path {
+            return SecretPathGateDecision::RejectNotFound { newly_banned: false };
+        }
+    }
+    SecretPathGateDecision::Allow {
+        issue_entry_cookie: hit_secret_path,
+    }
+}
+
 pub async fn guard(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
     let cfg = state.config.load_full();
     let path = request.uri().path().to_string();
@@ -175,36 +228,51 @@ pub async fn guard(State(state): State<Arc<AppState>>, request: Request, next: N
 
     let session_scope = super::current_session_scope(&state, headers);
 
-    // 安全入口路径守卫：启用非 "/" 的 secret_path 时，未命中入口路径且无有效入口/会话凭据的请求统一返回 404，并计入 Fail2Ban 防爆破扫描
+    // 安全入口路径守卫：启用非 "/" 的 secret_path 时，未授权来源先校验 Fail2Ban 返回 429，再核验入口路径，防止封禁态探测与绕过
     let mut issue_entry_cookie: Option<HeaderValue> = None;
     if let Some(sp) = active_secret_path(&cfg) {
-        let hit_secret_path = path == sp
-            || path
-                .strip_prefix(sp)
-                .is_some_and(|rest| rest == "/" || rest.starts_with('/'));
-        if hit_secret_path {
-            issue_entry_cookie = build_entry_set_cookie(state.vault.mac_key(), sp);
-        } else {
-            let authorized = has_valid_entry_cookie(headers, state.vault.mac_key(), sp) || session_scope.is_some();
-            if !authorized {
-                if let Some(axum::extract::ConnectInfo(peer)) = request.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>() {
-                    let ban_key = crate::net::dual_stack::BanKey::from_peer(peer.ip());
-                    if state.fail2ban.is_key_banned(ban_key) {
-                        let mut resp = StatusCode::TOO_MANY_REQUESTS.into_response();
-                        apply_security_headers(&mut resp, is_api);
-                        return resp;
-                    }
-                    if state.fail2ban.record_failure(
-                        ban_key,
-                        cfg.security.max_login_failures.saturating_mul(2),
-                        cfg.security.ban_duration_secs,
-                        "secret_path_probe",
-                    ) && cfg.security.kernel_ban_offload
-                    {
-                        let _ = state
+        let authorized =
+            has_valid_entry_cookie(headers, state.vault.mac_key(), sp) || session_scope.is_some();
+        let peer_ban_key = request
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|axum::extract::ConnectInfo(peer)| crate::net::dual_stack::BanKey::from_peer(peer.ip()));
+        match evaluate_secret_path_gate(
+            &path,
+            sp,
+            authorized,
+            peer_ban_key,
+            &state.fail2ban,
+            cfg.security.max_login_failures.saturating_mul(2),
+            cfg.security.ban_duration_secs,
+        ) {
+            SecretPathGateDecision::Allow {
+                issue_entry_cookie: should_issue,
+            } => {
+                if should_issue {
+                    issue_entry_cookie = build_entry_set_cookie(state.vault.mac_key(), sp);
+                }
+            }
+            SecretPathGateDecision::RejectTooManyRequests => {
+                let mut resp = StatusCode::TOO_MANY_REQUESTS.into_response();
+                apply_security_headers(&mut resp, is_api);
+                return resp;
+            }
+            SecretPathGateDecision::RejectNotFound { newly_banned } => {
+                if newly_banned && cfg.security.kernel_ban_offload {
+                    if let Some(ban_key) = peer_ban_key {
+                        let kernel_capable = !ban_key.is_loopback_or_link_local()
+                            && state.firewall.is_auto_manage()
+                            && state.firewall.backend() != crate::firewall::FirewallBackend::DryRun;
+                        if state
                             .firewall
                             .ban_source_cidr(&ban_key.display_cidr(), cfg.security.ban_duration_secs)
-                            .await;
+                            .await
+                            .is_ok()
+                            && kernel_capable
+                        {
+                            state.fail2ban.mark_kernel_offloaded(ban_key);
+                        }
                     }
                 }
                 let mut resp = StatusCode::NOT_FOUND.into_response();
@@ -214,8 +282,8 @@ pub async fn guard(State(state): State<Arc<AppState>>, request: Request, next: N
         }
     }
 
-    // 仅在已建立有效会话后检查模块启用状态，防止未认证调用者探测已启用子模块
-    if session_scope.is_some() {
+    // 仅在已建立有效会话后检查模块启用状态与按模块二次验证门禁，防止未认证调用者探测已启用子模块
+    if let Some((ref session_token, _)) = session_scope {
         let module = [
             ("/api/proxy/", "reverse_proxy"),
             ("/api/port-forwards/", "port_forward"),
@@ -229,8 +297,32 @@ pub async fn guard(State(state): State<Arc<AppState>>, request: Request, next: N
         .into_iter()
         .find(|(prefix, _)| path.starts_with(prefix))
         .map(|(_, name)| name);
-        if module.is_some_and(|name| cfg.modules.get(name) != Some(true)) {
-            return reject("MODULE_DISABLED", is_api);
+        if let Some(name) = module {
+            if cfg.modules.get(name) != Some(true) {
+                return reject("MODULE_DISABLED", is_api);
+            }
+            // /api/pty/ws 走一次性绑定 ticket；/api/pty/ticket 支持单次 reauth_token 或会话解锁（在 handler 内核验）
+            let exempt_pty_auth = path == "/api/pty/ws" || path == "/api/pty/ticket";
+            if !exempt_pty_auth && cfg.module_requires_reauth(name) {
+                let unlocked = state
+                    .auth
+                    .lock()
+                    .map(|a| a.sessions.is_module_unlocked(session_token, name))
+                    .unwrap_or(false);
+                if !unlocked {
+                    let mut resp = (
+                        StatusCode::FORBIDDEN,
+                        Json(serde_json::json!({
+                            "error": "MODULE_REAUTH_REQUIRED",
+                            "module": name,
+                            "message": "访问该子模块前需要完成二次身份验证"
+                        })),
+                    )
+                        .into_response();
+                    apply_security_headers(&mut resp, is_api);
+                    return resp;
+                }
+            }
         }
     }
 
@@ -271,5 +363,65 @@ mod tests {
         assert!(!trusted_authority("192.168.1.1.evil.example:23456", &cfg));
         cfg.admin.canonical_origin = "http://192.168.1.1:23456".into();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn secret_path_gate_blocks_banned_and_saturated_peers_before_path_match() {
+        use crate::net::dual_stack::BanKey;
+        use crate::security::fail2ban::{Fail2Ban, MAX_TRACKED_KEYS};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let f2b = Fail2Ban::new();
+        let sp = "/_vane_secret1234";
+        let attacker = BanKey::from_peer(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)));
+
+        // 未封禁前命中真实 secret_path 可放行并签发入口 Cookie
+        assert_eq!(
+            evaluate_secret_path_gate(sp, sp, false, Some(attacker), &f2b, 3, 600),
+            SecretPathGateDecision::Allow { issue_entry_cookie: true }
+        );
+
+        // 连续 3 次探测错误路径触发封禁
+        assert_eq!(
+            evaluate_secret_path_gate("/wrong1", sp, false, Some(attacker), &f2b, 3, 600),
+            SecretPathGateDecision::RejectNotFound { newly_banned: false }
+        );
+        assert_eq!(
+            evaluate_secret_path_gate("/wrong2", sp, false, Some(attacker), &f2b, 3, 600),
+            SecretPathGateDecision::RejectNotFound { newly_banned: false }
+        );
+        assert_eq!(
+            evaluate_secret_path_gate("/wrong3", sp, false, Some(attacker), &f2b, 3, 600),
+            SecretPathGateDecision::RejectNotFound { newly_banned: true }
+        );
+
+        // 封禁后即使猜中真实 secret_path，也必须在路径判定前返回 429，消除探测预言机
+        assert_eq!(
+            evaluate_secret_path_gate(sp, sp, false, Some(attacker), &f2b, 3, 600),
+            SecretPathGateDecision::RejectTooManyRequests
+        );
+        assert_eq!(
+            evaluate_secret_path_gate("/wrong4", sp, false, Some(attacker), &f2b, 3, 600),
+            SecretPathGateDecision::RejectTooManyRequests
+        );
+
+        // 表满（1024 条活跃未卸载封禁）时，新的未授权来源即使命中 secret_path 也 Fail-Closed 返回 429
+        let saturated_f2b = Fail2Ban::new();
+        for i in 0..MAX_TRACKED_KEYS {
+            let k = BanKey::from_peer(IpAddr::V4(Ipv4Addr::new(10, 9, ((i >> 8) & 0xff) as u8, (i & 0xff) as u8)));
+            for _ in 0..3 {
+                saturated_f2b.record_failure(k, 3, 600, "flood");
+            }
+        }
+        let newcomer = BanKey::from_peer(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 88)));
+        assert_eq!(
+            evaluate_secret_path_gate(sp, sp, false, Some(newcomer), &saturated_f2b, 3, 600),
+            SecretPathGateDecision::RejectTooManyRequests
+        );
+        // 已持有有效会话或入口 Cookie 的管理员不受表满影响
+        assert_eq!(
+            evaluate_secret_path_gate("/api/dashboard", sp, true, Some(newcomer), &saturated_f2b, 3, 600),
+            SecretPathGateDecision::Allow { issue_entry_cookie: false }
+        );
     }
 }

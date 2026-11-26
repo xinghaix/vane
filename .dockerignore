@@ -2,7 +2,26 @@ target
 web-ui/node_modules
 web-ui/dist
 .git
+.DS_Store
+
+# 运行时敏感凭据、证书与持久化数据（同步自 .gitignore，严禁打入构建上下文）
 .master.key
+**/.master.key
 config.toml
 config.toml.bak
 *.tmp.*
+certs/
+**/certs/
+acme-accounts/
+**/acme-accounts/
+acme-challenges/
+**/acme-challenges/
+*.vane.bak
+notifications.json
+**/notifications.json
+.neighbor_cache.json
+**/.neighbor_cache.json
+.lockdown
+**/.lockdown
+vane-ddns-hosts
+split-dns.hosts

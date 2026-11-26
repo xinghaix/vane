@@ -1,9 +1,14 @@
 services:
   vane:
-    image: ghcr.io/example/vane:latest
+    # 生产环境建议固定为精确发布标签，并进一步锁定镜像摘要（例如 ghcr.io/xinghaix/vane:v0.1.0@sha256:<digest>），切勿使用可变 :latest 标签
+    image: ghcr.io/xinghaix/vane:v0.1.0
     container_name: vane
     restart: unless-stopped
     network_mode: host
+    # 默认因防火墙管理 (NET_ADMIN) 与低位端口绑定 (NET_BIND_SERVICE) 需以特权能力运行；
+    # 若禁用自动防火墙管理 (firewall.auto_manage = false) 且仅监听 >=1024 端口，
+    # 建议取消下方注释以非 Root 用户运行，并移除 NET_ADMIN / NET_BIND_SERVICE 能力：
+    # user: "10001:10001"
     cap_drop:
       - ALL
     cap_add:
@@ -15,8 +20,10 @@ services:
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=8m
     pids_limit: 64
-    mem_limit: 24m
-    memswap_limit: 24m
+    # 日常网关转发内存占用约 16~24 MiB，但导入大型加密备份 (.vane.bak，最大 24 MiB 负载) 时
+    # 解密与解析峰值可达 60~80 MiB；24m 限制会导致大备份导入触发 OOM，建议至少保留 64m~96m
+    mem_limit: 64m
+    memswap_limit: 64m
     logging:
       driver: json-file
       options:
@@ -29,11 +36,15 @@ services:
         target: /run/xtables.lock
         bind:
           create_host_path: false
-      - type: bind
-        source: /var/run/docker.sock
-        target: /var/run/docker.sock
-        bind:
-          create_host_path: false
+      # [安全警告] 直接挂载宿主 /var/run/docker.sock 等价于授予容器宿主机 Root 权限，
+      # 一旦容器被攻破将直接绕过上方的 cap_drop / no-new-privileges / read_only 隔离防线！
+      # 默认注释禁用；如确需开启 Docker 管理模块，强烈建议通过受限策略的 Docker Socket Proxy
+      # （仅开放必要只读/受限 API，禁止容器创建与特权挂载）接入，切勿直接暴露宿主原始 docker.sock。
+      # - type: bind
+      #   source: /var/run/docker.sock
+      #   target: /var/run/docker.sock
+      #   bind:
+      #     create_host_path: false
 
 volumes:
   vane_data:

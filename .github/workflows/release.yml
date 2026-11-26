@@ -66,7 +66,7 @@ jobs:
       - name: Build static binary with cross
         if: matrix.use_cross
         run: |
-          cargo install cross --git https://github.com/cross-rs/cross --locked
+          cargo install cross --version 0.2.5 --locked
           cross build --release --locked --target ${{ matrix.target }}
 
       - name: Build native binary
@@ -103,14 +103,48 @@ jobs:
         working-directory: artifacts
         run: sha256sum *.tar.gz > SHA256SUMS
 
+      - name: Sign SHA256SUMS (optional Ed25519 / minisign)
+        working-directory: artifacts
+        shell: bash
+        env:
+          VANE_RELEASE_SIGNING_KEY: ${{ secrets.VANE_RELEASE_SIGNING_KEY }}
+          VANE_MINISIGN_PASSWORD: ${{ secrets.VANE_MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VANE_RELEASE_SIGNING_KEY:-}" ]; then
+            echo "Notice: secrets.VANE_RELEASE_SIGNING_KEY is not configured; skipping detached signature generation."
+            exit 0
+          fi
+          KEY_FILE="$(mktemp)"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          chmod 0600 "$KEY_FILE"
+          printf '%s\n' "$VANE_RELEASE_SIGNING_KEY" > "$KEY_FILE"
+          if head -n 1 "$KEY_FILE" | grep -q '^-----BEGIN '; then
+            openssl pkeyutl -sign -inkey "$KEY_FILE" -rawin -in SHA256SUMS -out SHA256SUMS.sig
+            # 同时为每个归档生成原始 Ed25519 分离签名（Base64），供 Web UI 手动上传更新验签
+            for f in *.tar.gz; do
+              openssl pkeyutl -sign -inkey "$KEY_FILE" -rawin -in "$f" | base64 -w 0 > "${f}.sig.b64"
+            done
+            echo "Signed SHA256SUMS (SHA256SUMS.sig) and archives (*.tar.gz.sig.b64) with Ed25519."
+          elif head -n 1 "$KEY_FILE" | grep -q '^untrusted comment:'; then
+            if ! command -v minisign >/dev/null 2>&1; then
+              sudo apt-get update && sudo apt-get install -y minisign
+            fi
+            printf '%s\n' "${VANE_MINISIGN_PASSWORD:-}" | minisign -S -s "$KEY_FILE" -m SHA256SUMS -x SHA256SUMS.minisig
+            echo "Signed SHA256SUMS with minisign (SHA256SUMS.minisig)."
+          else
+            echo "Error: unrecognized VANE_RELEASE_SIGNING_KEY format (expected OpenSSL Ed25519 PEM or minisign secret key)." >&2
+            exit 1
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
           files: |
-            artifacts/*.tar.gz
-            artifacts/SHA256SUMS
+            artifacts/*.tar.gz*
+            artifacts/SHA256SUMS*
 
   publish-ghcr:
     name: Build & Push Multi-Arch GHCR Image

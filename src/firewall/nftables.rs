@@ -18,6 +18,27 @@ pub async fn apply_rules(
     ensure_fw4_jumps_with_dnat(exec, has_dnat).await
 }
 
+/// 仅清空 fw4 下 Vane WAN 放行链，绝不触碰 `table inet vane_shield`，完整保留活跃 Fail2Ban 封禁集
+pub fn build_lockdown_preserve_bans_script() -> String {
+    let lines = [
+        "add chain inet fw4 vane_input",
+        "flush chain inet fw4 vane_input",
+        "add chain inet fw4 vane_forward",
+        "flush chain inet fw4 vane_forward",
+        "add chain inet fw4 vane_dstnat",
+        "flush chain inet fw4 vane_dstnat",
+        "",
+    ];
+    lines.join("\n")
+}
+
+pub async fn apply_lockdown_preserve_bans(exec: &dyn FirewallExecutor) -> Result<(), String> {
+    let script = build_lockdown_preserve_bans_script();
+    exec.run("nft", &["-f", "-"], Some(script.as_bytes()))
+        .await
+        .map(|_| ())
+}
+
 pub async fn ensure_fw4_jumps(exec: &dyn FirewallExecutor) -> Result<(), String> {
     ensure_fw4_jumps_with_dnat(exec, true).await
 }

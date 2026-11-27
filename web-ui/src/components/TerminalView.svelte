@@ -67,12 +67,22 @@
   let shellsLoaded = $state(false);
 
   let nextTabId = 1;
-  let nextHostSeq = 1;
   let lastHandledNonce = -1;
 
-  function makeTab(target = 'host', autoConnect = false) {
+  function nextAvailableHostSeq(list) {
+    const used = new Set(
+      (list || [])
+        .filter((tb) => tb.target === 'host' && tb.seq > 0)
+        .map((tb) => tb.seq)
+    );
+    let n = 1;
+    while (used.has(n)) n++;
+    return n;
+  }
+
+  function makeTab(target = 'host', autoConnect = false, existingTabs = []) {
     const id = nextTabId++;
-    const seq = target === 'host' ? nextHostSeq++ : 0;
+    const seq = target === 'host' ? nextAvailableHostSeq(existingTabs) : 0;
     return {
       id,
       seq,
@@ -87,14 +97,43 @@
     };
   }
 
-  let tabs = $state([makeTab('host', false)]);
+  let tabs = $state([makeTab('host', false, [])]);
   let activeTabId = $state(1);
   let editingTabId = $state(0);
   let editingTitle = $state('');
+  let tabListEl = $state(null);
+  let tabsCanScrollLeft = $state(false);
+  let tabsCanScrollRight = $state(false);
 
   let connectedCount = $derived(
     tabs.filter((tb) => tb.connState === 'connected' || tb.connState === 'connecting').length
   );
+
+  function updateTabScrollFade() {
+    const el = tabListEl;
+    if (!el) {
+      tabsCanScrollLeft = false;
+      tabsCanScrollRight = false;
+      return;
+    }
+    tabsCanScrollLeft = el.scrollLeft > 4;
+    tabsCanScrollRight = el.scrollLeft + el.clientWidth < el.scrollWidth - 4;
+  }
+
+  $effect(() => {
+    const _active = activeTabId;
+    const _len = tabs.length;
+    const el = tabListEl;
+    if (!el) return;
+    queueMicrotask(() => {
+      const activeNode = el.querySelector(`[data-pty-tab="${_active}"]`);
+      activeNode?.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
+      updateTabScrollFade();
+    });
+    const onResize = () => updateTabScrollFade();
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  });
 
   async function loadAvailableShells() {
     try {
@@ -136,7 +175,7 @@
     const active = tabs.find((tb) => tb.id === activeTabId);
     const shouldAutoConnect = !requireReauth && !(reqTarget.startsWith('container:') && dockerRequireReauth);
     if (active && active.connState === 'disconnected' && !active.hasOutput && active.target === 'host' && reqTarget !== 'host') {
-      const replaced = makeTab(reqTarget, shouldAutoConnect);
+      const replaced = makeTab(reqTarget, shouldAutoConnect, tabs);
       tabs = tabs.map((tb) => (tb.id === active.id ? replaced : tb));
       activeTabId = replaced.id;
       return;
@@ -147,7 +186,7 @@
       return;
     }
 
-    const created = makeTab(reqTarget, shouldAutoConnect);
+    const created = makeTab(reqTarget, shouldAutoConnect, tabs);
     tabs = [...tabs, created];
     activeTabId = created.id;
   });
@@ -157,7 +196,18 @@
     if (tb.target && tb.target.startsWith('container:')) {
       return tb.target.slice('container:'.length);
     }
-    return `${t.term.hostTab} #${tb.seq || tb.id}`;
+    return `${t.term.hostTab} #${tb.seq || 1}`;
+  }
+
+  function isTabClosable(tb) {
+    if (tabs.length > 1) return true;
+    return (
+      tb.connState === 'connected' ||
+      tb.connState === 'connecting' ||
+      tb.hasOutput ||
+      tb.target !== 'host' ||
+      Boolean(tb.customTitle)
+    );
   }
 
   function selectTab(id) {
@@ -170,7 +220,7 @@
       showToast(t.term.tabLimitReached.replace('{max}', String(maxTabs)), 'warn');
       return;
     }
-    const created = makeTab('host', !requireReauth);
+    const created = makeTab('host', false, tabs);
     tabs = [...tabs, created];
     activeTabId = created.id;
   }
@@ -180,7 +230,7 @@
     if (idx < 0) return;
     const remaining = tabs.filter((tb) => tb.id !== id);
     if (remaining.length === 0) {
-      const fresh = makeTab('host', false);
+      const fresh = makeTab('host', false, []);
       tabs = [fresh];
       activeTabId = fresh.id;
       return;
@@ -194,6 +244,7 @@
   }
 
   function requestCloseTab(tb) {
+    if (!isTabClosable(tb)) return;
     const isRunning = tb.connState === 'connected' || tb.connState === 'connecting';
     if (isRunning && askConfirm) {
       askConfirm({
@@ -241,7 +292,11 @@
     ) {
       return;
     }
-    tabs = tabs.map((tb) => (tb.id === id ? { ...tb, ...patch } : tb));
+    const nextPatch =
+      patch.target === 'host' && cur.target !== 'host' && !cur.seq
+        ? { ...patch, seq: nextAvailableHostSeq(tabs) }
+        : patch;
+    tabs = tabs.map((tb) => (tb.id === id ? { ...tb, ...nextPatch } : tb));
   }
 
   function markTabUnread(id) {
@@ -254,82 +309,96 @@
 
 <div class="card pty-shell-card">
   <!-- 多标签终端顶栏 -->
-  <div class="pty-tabbar">
-    <div class="pty-tab-list" role="tablist" aria-label={t.nav.web_terminal}>
-      {#each tabs as tb (tb.id)}
-        {@const isActive = tb.id === activeTabId}
-        <div
-          class="pty-tab {isActive ? 'active' : ''}"
-          onauxclick={(e) => {
-            if (e.button === 1) {
-              e.preventDefault();
-              requestCloseTab(tb);
-            }
-          }}
-        >
-          {#if editingTabId === tb.id}
-            <input
-              use:autofocus
-              type="text"
-              class="pty-tab-rename"
-              maxlength="32"
-              aria-label={t.term.renameHint}
-              bind:value={editingTitle}
-              onblur={commitRenameTab}
-              onkeydown={(e) => {
-                if (e.key === 'Enter') {
-                  e.preventDefault();
-                  commitRenameTab();
-                } else if (e.key === 'Escape') {
-                  e.preventDefault();
-                  cancelRenameTab();
-                }
-              }}
-            />
-          {:else}
-            <button
-              type="button"
-              role="tab"
-              aria-selected={isActive}
-              class="pty-tab-main"
-              title={t.term.renameHint}
-              onclick={() => selectTab(tb.id)}
-              ondblclick={() => startRenameTab(tb)}
-            >
-              <span
-                class="status-dot {tb.connState === 'connected'
-                  ? 'ok'
-                  : tb.connState === 'connecting'
-                    ? 'warn'
-                    : 'muted'}"
-              ></span>
-              {#if tb.target.startsWith('container:')}
-                <Icons name="docker" size={13} />
-              {/if}
-              <span class="pty-tab-title">{tabDisplayTitle(tb)}</span>
-              {#if tb.shell && tb.shell !== 'auto'}
-                <span class="pty-tab-shell mono">{tb.shell}</span>
-              {/if}
-              {#if tb.unread && !isActive}
-                <span class="pty-tab-unread" aria-label="Unread output"></span>
-              {/if}
-            </button>
-          {/if}
-          <button
-            type="button"
-            class="pty-tab-close"
-            title={t.term.closeTab}
-            aria-label={`${t.term.closeTab} ${tabDisplayTitle(tb)}`}
-            onclick={() => requestCloseTab(tb)}
+  <div class="pty-tabbar tv-tabbar">
+    <div class="tv-tabs-group">
+      <div
+        bind:this={tabListEl}
+        class="pty-tab-list tv-tab-list"
+        class:fade-left={tabsCanScrollLeft}
+        class:fade-right={tabsCanScrollRight}
+        role="tablist"
+        aria-label={t.nav.web_terminal}
+        onscroll={updateTabScrollFade}
+      >
+        {#each tabs as tb (tb.id)}
+          {@const isActive = tb.id === activeTabId}
+          <div
+            data-pty-tab={tb.id}
+            class="pty-tab tv-tab {isActive ? 'active' : ''}"
+            onauxclick={(e) => {
+              if (e.button === 1) {
+                e.preventDefault();
+                requestCloseTab(tb);
+              }
+            }}
           >
-            <Icons name="x" size={12} />
-          </button>
-        </div>
-      {/each}
+            {#if editingTabId === tb.id}
+              <input
+                use:autofocus
+                type="text"
+                class="pty-tab-rename tv-tab-rename"
+                maxlength="32"
+                aria-label={t.term?.renameTab || t.term.renameHint}
+                bind:value={editingTitle}
+                onblur={commitRenameTab}
+                onkeydown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    commitRenameTab();
+                  } else if (e.key === 'Escape') {
+                    e.preventDefault();
+                    cancelRenameTab();
+                  }
+                }}
+              />
+            {:else}
+              <button
+                type="button"
+                role="tab"
+                aria-selected={isActive}
+                class="pty-tab-main tv-tab-main"
+                title={t.term.renameHint}
+                onclick={() => selectTab(tb.id)}
+                ondblclick={() => startRenameTab(tb)}
+              >
+                <span
+                  class="status-dot {tb.connState === 'connected'
+                    ? 'ok'
+                    : tb.connState === 'connecting'
+                      ? 'warn'
+                      : 'muted'}"
+                ></span>
+                {#if tb.target.startsWith('container:')}
+                  <Icons name="docker" size={13} />
+                {/if}
+                <span class="pty-tab-title tv-tab-title">{tabDisplayTitle(tb)}</span>
+                {#if tb.shell && tb.shell !== 'auto'}
+                  <span class="pty-tab-shell mono tv-tab-shell">{tb.shell}</span>
+                {/if}
+                {#if tb.unread && !isActive}
+                  <span class="pty-tab-unread" aria-label="Unread output"></span>
+                {/if}
+              </button>
+            {/if}
+            {#if isTabClosable(tb)}
+              <button
+                type="button"
+                class="pty-tab-close tv-tab-close"
+                title={t.term.closeTab}
+                aria-label={`${t.term.closeTab} ${tabDisplayTitle(tb)}`}
+                onclick={() => requestCloseTab(tb)}
+              >
+                <Icons name="x" size={12} />
+              </button>
+            {/if}
+          </div>
+        {/each}
+      </div>
 
+      <!-- 新建标签按钮固定于滚动列表右侧，窄屏下永不被挤出可视区 -->
       <button
         type="button"
-        class="pty-tab-add"
+        class="pty-tab-add tv-tab-add"
         disabled={tabs.length >= maxTabs}
         title={tabs.length >= maxTabs ? t.term.tabLimitReached.replace('{max}', String(maxTabs)) : t.term.newTab}
         aria-label={t.term.newTab}
@@ -339,14 +408,25 @@
       </button>
     </div>
 
-    <div class="pty-tabbar-meta">
-      <span class="badge {connectedCount > 0 ? 'badge-ok' : 'badge-muted'} num">
-        {connectedCount} / {maxTabs}
+    <div class="pty-tabbar-meta tv-tabbar-meta">
+      <span
+        class="badge {connectedCount > 0 ? 'badge-ok' : 'badge-muted'} num tv-count-badge"
+        title={lang === 'en'
+          ? `${connectedCount} active / ${maxTabs} max sessions`
+          : `活跃会话 ${connectedCount} / 上限 ${maxTabs}`}
+      >
+        {connectedCount}/{maxTabs}
       </span>
       {#if settingsJson && onSaveSettings}
-        <button type="button" class="btn btn-xs" onclick={openTermSettings}>
-          <Icons name="settings" size={12} />
-          <span>{lang === 'en' ? 'Settings' : '终端设置'}</span>
+        <button
+          type="button"
+          class="btn btn-xs tv-settings-btn"
+          aria-label={lang === 'en' ? 'Terminal Settings' : '终端设置'}
+          title={lang === 'en' ? 'Terminal Settings' : '终端设置'}
+          onclick={openTermSettings}
+        >
+          <Icons name="settings" size={14} />
+          <span class="tv-settings-label">{lang === 'en' ? 'Settings' : '终端设置'}</span>
         </button>
       {/if}
     </div>
@@ -373,6 +453,8 @@
           {requestReauth}
           {apiFetch}
           {showToast}
+          tabTitle={tabDisplayTitle(tb)}
+          onStartRename={() => startRenameTab(tb)}
           onStateChange={(patch) => updateTabState(tb.id, patch)}
           onBackgroundActivity={() => markTabUnread(tb.id)}
         />
@@ -422,3 +504,84 @@
     </div>
   </div>
 </EditorDialog>
+
+<style>
+  .tv-tabbar {
+    gap: 8px;
+  }
+  .tv-tabs-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
+  }
+  .tv-tab-list {
+    flex: 0 1 auto;
+    max-width: 100%;
+    min-width: 0;
+    scroll-behavior: smooth;
+    -webkit-overflow-scrolling: touch;
+  }
+  .tv-tab-list.fade-right {
+    mask-image: linear-gradient(to right, #000 0%, #000 88%, transparent 100%);
+    -webkit-mask-image: linear-gradient(to right, #000 0%, #000 88%, transparent 100%);
+  }
+  .tv-tab-list.fade-left {
+    mask-image: linear-gradient(to right, transparent 0%, #000 12%, #000 100%);
+    -webkit-mask-image: linear-gradient(to right, transparent 0%, #000 12%, #000 100%);
+  }
+  .tv-tab-list.fade-left.fade-right {
+    mask-image: linear-gradient(to right, transparent 0%, #000 10%, #000 90%, transparent 100%);
+    -webkit-mask-image: linear-gradient(to right, transparent 0%, #000 10%, #000 90%, transparent 100%);
+  }
+  .tv-tab-add {
+    flex-shrink: 0;
+  }
+  .tv-tabbar-meta {
+    gap: 6px;
+  }
+  .tv-count-badge {
+    padding: 2px 8px;
+    font-size: 11.5px;
+  }
+  @media (max-width: 920px) {
+    .tv-tabbar {
+      padding: 8px 10px;
+    }
+    .tv-tab-main {
+      min-height: 36px;
+      padding: 0 4px 0 10px;
+    }
+    .tv-tab-close {
+      width: 30px;
+      height: 30px;
+      margin-right: 3px;
+    }
+    .tv-tab-add {
+      width: 36px;
+      height: 36px;
+    }
+    .tv-tab-rename {
+      font-size: 16px !important;
+      min-height: 34px !important;
+      width: 132px !important;
+    }
+  }
+  @media (max-width: 640px) {
+    .tv-tab-title {
+      max-width: 88px;
+    }
+    .tv-tab-shell {
+      display: none;
+    }
+    .tv-settings-label {
+      display: none;
+    }
+    .tv-settings-btn {
+      min-width: 36px;
+      min-height: 36px;
+      padding: 0;
+    }
+  }
+</style>

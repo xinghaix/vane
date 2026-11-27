@@ -22,6 +22,8 @@
     showToast,
     onStateChange,
     onBackgroundActivity,
+    tabTitle = '',
+    onStartRename = null,
   } = $props();
 
   const ANSI_COLORS = {
@@ -82,9 +84,21 @@
   let viewportEl = $state(null);
   let viewportFocused = $state(false);
   let cursorTyping = $state(false);
+  let isAtBottom = $state(true);
   let gridCols = $state(100);
   let gridRows = $state(24);
   let autoConnectDone = false;
+
+  function onViewportScroll() {
+    if (!viewportEl) return;
+    isAtBottom = viewportEl.scrollHeight - viewportEl.scrollTop - viewportEl.clientHeight < 48;
+  }
+
+  function scrollToBottom() {
+    if (!viewportEl) return;
+    viewportEl.scrollTop = viewportEl.scrollHeight;
+    isAtBottom = true;
+  }
 
   // 终端屏幕缓冲
   let historyLines = $state([]);
@@ -436,8 +450,17 @@
     if (!viewportEl || viewportEl.clientWidth <= 0 || viewportEl.clientHeight <= 0) {
       return { cols: gridCols || 100, rows: gridRows || 24 };
     }
-    const cols = Math.max(40, Math.min(240, Math.floor((viewportEl.clientWidth - 32) / 8)));
-    const rows = Math.max(16, Math.min(80, Math.floor((viewportEl.clientHeight - 32) / 19)));
+    let fontSize = 13;
+    try {
+      const parsed = parseFloat(getComputedStyle(viewportEl).fontSize || '13');
+      if (Number.isFinite(parsed) && parsed > 0) fontSize = parsed;
+    } catch {
+      // ignore
+    }
+    const charW = Math.max(6.8, fontSize * 0.62);
+    const lineH = Math.max(16, fontSize * 1.45);
+    const cols = Math.max(40, Math.min(240, Math.floor((viewportEl.clientWidth - 28) / charW)));
+    const rows = Math.max(14, Math.min(80, Math.floor((viewportEl.clientHeight - 28) / lineH)));
     return { cols, rows };
   }
 
@@ -516,9 +539,12 @@
         if (!active) {
           onBackgroundActivity?.();
         } else if (shouldStick) {
+          isAtBottom = true;
           queueMicrotask(() => {
             if (viewportEl) viewportEl.scrollTop = viewportEl.scrollHeight;
           });
+        } else {
+          isAtBottom = false;
         }
       };
       ws.onerror = () => {
@@ -656,63 +682,74 @@
 
 <svelte:window onresize={sendResize} />
 
-<!-- 单标签操作工具栏：左侧快捷控制键，右侧目标/Shell/连接控制 -->
-<div class="pty-pane-bar">
-  <div class="btn-group" aria-label={t.cfg.lblQuickKeys}>
-    {#if ptySocket}
-      <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b')}>Esc</button>
-      <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\t')}>Tab</button>
-      <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x03')}>Ctrl+C</button>
-      <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x04')}>Ctrl+D</button>
-      <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1a')}>Ctrl+Z</button>
-      <button
-        type="button"
-        class="btn btn-xs mono"
-        onmousedown={(e) => e.preventDefault()}
-        onclick={() => {
-          resetScreen();
-          sendRaw('\x0c');
-        }}
-      >
-        Ctrl+L
-      </button>
-      <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b[D')}>←</button>
-      <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b[A')}>↑</button>
-      <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b[B')}>↓</button>
-      <button type="button" class="btn btn-xs mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b[C')}>→</button>
-    {:else}
-      <span class="badge badge-muted">
-        <span class="status-dot {connState === 'connecting' ? 'warn' : 'muted'}"></span>
-        <span>{connState === 'connecting' ? t.term.connecting : t.term.disconnected}</span>
+<!-- 单标签会话顶栏：状态、会话操作与目标/Shell/连接控制 -->
+<div class="pty-pane-bar tp-session-bar">
+  <div class="tp-session-left">
+    <span class="badge {connState === 'connected' ? 'badge-ok' : connState === 'connecting' ? 'badge-warn' : 'badge-muted'}">
+      <span class="status-dot {connState === 'connected' ? 'ok' : connState === 'connecting' ? 'warn' : 'muted'}"></span>
+      <span>
+        {connState === 'connected'
+          ? t.term.connected
+          : connState === 'connecting'
+            ? t.term.connecting
+            : t.term.disconnected}
+      </span>
+    </span>
+
+    {#if connState === 'connected'}
+      <span class="meta-chip mono tp-grid-chip" title={`${gridCols} cols × ${gridRows} rows`}>
+        {gridCols}×{gridRows}
       </span>
     {/if}
+
+    {#if onStartRename}
+      <button
+        type="button"
+        class="btn btn-ghost btn-xs tp-rename-btn"
+        title={t.term?.renameTab || t.term.renameHint}
+        aria-label={`${t.term?.renameTab || (lang === 'en' ? 'Rename tab' : '重命名标签')} ${tabTitle || ''}`.trim()}
+        onclick={() => onStartRename?.()}
+      >
+        <Icons name="sliders" size={12} />
+        <span>{t.term?.renameTab || (lang === 'en' ? 'Rename' : '重命名')}</span>
+      </button>
+    {/if}
+
     {#if ptySocket || hasOutput}
-      <button type="button" class="btn btn-xs" onmousedown={(e) => e.preventDefault()} onclick={resetScreen}>
-        {t.cfg.lblClearScreen}
-      </button>
-      <button
-        type="button"
-        class="btn btn-xs"
-        disabled={!hasOutput}
-        onmousedown={(e) => e.preventDefault()}
-        onclick={copyScreenOutput}
-      >
-        <Icons name="copy" size={12} />
-        <span>{t.cfg.lblCopyOut}</span>
-      </button>
-      <button
-        type="button"
-        class="btn btn-xs"
-        disabled={connState === 'connecting'}
-        onclick={reconnectPty}
-      >
-        {t.cfg.lblReconnect}
-      </button>
+      <div class="btn-group tp-util-group">
+        <button
+          type="button"
+          class="btn btn-xs"
+          onmousedown={(e) => e.preventDefault()}
+          onclick={resetScreen}
+        >
+          <span>{t.cfg.lblClearScreen}</span>
+        </button>
+        <button
+          type="button"
+          class="btn btn-xs"
+          disabled={!hasOutput}
+          onmousedown={(e) => e.preventDefault()}
+          onclick={copyScreenOutput}
+        >
+          <Icons name="copy" size={12} />
+          <span>{t.cfg.lblCopyOut}</span>
+        </button>
+        <button
+          type="button"
+          class="btn btn-xs"
+          disabled={connState === 'connecting'}
+          onclick={reconnectPty}
+        >
+          <Icons name="refresh" size={12} />
+          <span>{t.cfg.lblReconnect}</span>
+        </button>
+      </div>
     {/if}
   </div>
 
   <form
-    class="btn-group"
+    class="tp-connect-form"
     onsubmit={(e) => {
       e.preventDefault();
       if (!ptySocket) connectPty();
@@ -727,90 +764,417 @@
           label: `Docker: ${c.name || c.id}`,
         })),
       ]}
-      <Select
-        compact
-        style="width:auto;min-width:160px;max-width:230px;"
-        ariaLabel={t.term.hostShell}
-        bind:value={target}
-        options={targetOptions}
-        onchange={onTargetChange}
-        disabled={Boolean(ptySocket)}
-      />
+      <div class="tp-select-target">
+        <Select
+          compact
+          ariaLabel={t.term.hostShell}
+          bind:value={target}
+          options={targetOptions}
+          onchange={onTargetChange}
+          disabled={Boolean(ptySocket)}
+        />
+      </div>
     {/if}
     {#if target === 'host'}
       {@const hostShells = availableShells.length ? availableShells : [{ id: 'bash', path: '/bin/bash' }, { id: 'sh', path: '/bin/sh' }]}
       {#if hostShells.length > 1}
-        <Select
-          compact
-          mono
-          style="width:auto;min-width:92px;"
-          ariaLabel="Shell"
-          title={hostShells.find((s) => s.id === selectedShell)?.path || ''}
-          bind:value={selectedShell}
-          options={hostShells.map((sh) => ({ value: sh.id, label: sh.id, sub: sh.path }))}
-          onchange={() => (shellUserPicked = true)}
-          disabled={Boolean(ptySocket)}
-        />
+        <div class="tp-select-shell">
+          <Select
+            compact
+            mono
+            ariaLabel="Shell"
+            title={hostShells.find((s) => s.id === selectedShell)?.path || ''}
+            bind:value={selectedShell}
+            options={hostShells.map((sh) => ({ value: sh.id, label: sh.id, sub: sh.path }))}
+            onchange={() => (shellUserPicked = true)}
+            disabled={Boolean(ptySocket)}
+          />
+        </div>
       {:else if hostShells.length === 1}
         <span class="badge badge-muted mono" title={hostShells[0].path}>{hostShells[0].id}</span>
       {/if}
     {:else}
-      <Select
-        compact
-        mono
-        style="width:auto;min-width:132px;"
-        ariaLabel="Shell"
-        bind:value={selectedShell}
-        options={[
-          { value: 'auto', label: 'auto (bash/sh)' },
-          { value: 'bash', label: 'bash' },
-          { value: 'sh', label: 'sh' },
-        ]}
-        onchange={() => (shellUserPicked = true)}
-        disabled={Boolean(ptySocket)}
-      />
+      <div class="tp-select-shell tp-select-shell-wide">
+        <Select
+          compact
+          mono
+          ariaLabel="Shell"
+          bind:value={selectedShell}
+          options={[
+            { value: 'auto', label: 'auto (bash/sh)' },
+            { value: 'bash', label: 'bash' },
+            { value: 'sh', label: 'sh' },
+          ]}
+          onchange={() => (shellUserPicked = true)}
+          disabled={Boolean(ptySocket)}
+        />
+      </div>
     {/if}
     {#if !ptySocket}
-      <button type="submit" class="btn btn-primary btn-sm" disabled={connState === 'connecting'}>
-        {connState === 'connecting' ? t.term.connecting : t.term.connect}
+      <button type="submit" class="btn btn-primary btn-sm tp-conn-btn" disabled={connState === 'connecting'}>
+        <Icons name="terminal" size={14} />
+        <span>{connState === 'connecting' ? t.term.connecting : t.term.connect}</span>
       </button>
     {:else}
-      <button type="button" class="btn btn-danger btn-sm" onclick={() => ptySocket?.close()}>
-        {t.term.disconnect}
+      <button type="button" class="btn btn-danger btn-sm tp-conn-btn" onclick={() => ptySocket?.close()}>
+        <Icons name="x" size={14} />
+        <span>{t.term.disconnect}</span>
       </button>
     {/if}
   </form>
 </div>
 
 <!-- 交互式 PTY 视口 -->
-<div
-  bind:this={viewportEl}
-  role="textbox"
-  aria-multiline="true"
-  aria-label="PTY Terminal Viewport"
-  tabindex="0"
-  onfocus={() => (viewportFocused = true)}
-  onblur={() => (viewportFocused = false)}
-  onkeydown={handleTerminalKeydown}
-  onpaste={handleTerminalPaste}
-  class="mono pty-viewport {viewportFocused ? 'focused' : ''}"
->
-  {#if hasOutput || connState === 'connected'}
-    {#each historyLines as line (line.id)}<div class="pty-line">{#if line.segs.length > 0}{#each line.segs as seg, i (i)}{#if seg.color || seg.bold}<span style={`${seg.color ? `color:${seg.color};` : ''}${seg.bold ? 'font-weight:700;' : ''}`}>{seg.text}</span>{:else}{seg.text}{/if}{/each}{:else}{'\u00a0'}{/if}</div>{/each}<div class="pty-line">{#each beforeCursorSegs as seg, i (i)}{#if seg.color || seg.bold}<span style={`${seg.color ? `color:${seg.color};` : ''}${seg.bold ? 'font-weight:700;' : ''}`}>{seg.text}</span>{:else}{seg.text}{/if}{/each}{#if connState === 'connected' && !cursorHidden}<span class="pty-cursor {viewportFocused ? 'focused' : ''} {cursorTyping ? 'typing' : ''}" style={`${cursorCell.color ? `color:${cursorCell.color};` : ''}${cursorCell.bold ? 'font-weight:700;' : ''}`}>{cursorCell.ch === ' ' ? '\u00a0' : cursorCell.ch}</span>{:else if cursorCol < activeLine.length}{#if cursorCell.color || cursorCell.bold}<span style={`${cursorCell.color ? `color:${cursorCell.color};` : ''}${cursorCell.bold ? 'font-weight:700;' : ''}`}>{cursorCell.ch}</span>{:else}{cursorCell.ch}{/if}{/if}{#each afterCursorSegs as seg, i (i)}{#if seg.color || seg.bold}<span style={`${seg.color ? `color:${seg.color};` : ''}${seg.bold ? 'font-weight:700;' : ''}`}>{seg.text}</span>{:else}{seg.text}{/if}{/each}</div>
-  {:else}
-    <span style="color:#94a3b8;">{t.term.placeholder}</span>
+<div class="tp-viewport-wrap">
+  <div
+    bind:this={viewportEl}
+    role="textbox"
+    aria-multiline="true"
+    aria-label="PTY Terminal Viewport"
+    tabindex="0"
+    onfocus={() => (viewportFocused = true)}
+    onblur={() => (viewportFocused = false)}
+    onscroll={onViewportScroll}
+    onkeydown={handleTerminalKeydown}
+    onpaste={handleTerminalPaste}
+    class="mono pty-viewport tp-viewport {viewportFocused ? 'focused' : ''}"
+  >
+    {#if hasOutput || connState === 'connected'}
+      {#each historyLines as line (line.id)}<div class="pty-line">{#if line.segs.length > 0}{#each line.segs as seg, i (i)}{#if seg.color || seg.bold}<span style={`${seg.color ? `color:${seg.color};` : ''}${seg.bold ? 'font-weight:700;' : ''}`}>{seg.text}</span>{:else}{seg.text}{/if}{/each}{:else}{'\u00a0'}{/if}</div>{/each}<div class="pty-line">{#each beforeCursorSegs as seg, i (i)}{#if seg.color || seg.bold}<span style={`${seg.color ? `color:${seg.color};` : ''}${seg.bold ? 'font-weight:700;' : ''}`}>{seg.text}</span>{:else}{seg.text}{/if}{/each}{#if connState === 'connected' && !cursorHidden}<span class="pty-cursor {viewportFocused ? 'focused' : ''} {cursorTyping ? 'typing' : ''}" style={`${cursorCell.color ? `color:${cursorCell.color};` : ''}${cursorCell.bold ? 'font-weight:700;' : ''}`}>{cursorCell.ch === ' ' ? '\u00a0' : cursorCell.ch}</span>{:else if cursorCol < activeLine.length}{#if cursorCell.color || cursorCell.bold}<span style={`${cursorCell.color ? `color:${cursorCell.color};` : ''}${cursorCell.bold ? 'font-weight:700;' : ''}`}>{cursorCell.ch}</span>{:else}{cursorCell.ch}{/if}{/if}{#each afterCursorSegs as seg, i (i)}{#if seg.color || seg.bold}<span style={`${seg.color ? `color:${seg.color};` : ''}${seg.bold ? 'font-weight:700;' : ''}`}>{seg.text}</span>{:else}{seg.text}{/if}{/each}</div>
+    {:else}
+      <div class="tp-empty-hero">
+        <span class="tp-hero-icon">
+          <Icons name={target.startsWith('container:') ? 'docker' : 'terminal'} size={22} />
+        </span>
+        <div class="tp-hero-target">
+          {target === 'host' ? t.term.hostShell : `Docker · ${target.slice('container:'.length)}`}
+          {#if selectedShell}
+            <span class="tp-hero-shell">{selectedShell}</span>
+          {/if}
+        </div>
+        <div class="tp-hero-desc">{t.term.placeholder}</div>
+        {#if !ptySocket}
+          <button
+            type="button"
+            class="btn btn-primary btn-sm"
+            disabled={connState === 'connecting'}
+            onclick={() => connectPty()}
+          >
+            <Icons name="play" size={13} />
+            <span>{connState === 'connecting' ? t.term.connecting : t.term.connect}</span>
+          </button>
+        {/if}
+      </div>
+    {/if}
+  </div>
+
+  {#if hasOutput && !isAtBottom}
+    <button
+      type="button"
+      class="btn btn-xs tp-jump-bottom"
+      onmousedown={(e) => e.preventDefault()}
+      onclick={scrollToBottom}
+    >
+      <Icons name="chevron" size={13} />
+      <span>{t.term?.scrollToBottom || (lang === 'en' ? 'Jump to bottom' : '回到底部')}</span>
+    </button>
   {/if}
 </div>
 
+<!-- 底部独立快捷按键坞 + 移动端友好命令行输入（始终贴近虚拟键盘） -->
 {#if ptySocket}
-  <form onsubmit={submitLine} style="display:flex;gap:8px;margin-top:12px;">
-    <input
-      type="text"
-      class="mono"
-      aria-label={t.term.inputPh}
-      bind:value={lineInput}
-      placeholder={t.term.inputPh}
-    />
-    <button type="submit" class="btn btn-primary">{t.term.send}</button>
-  </form>
+  <div class="tp-bottom-dock">
+    <div class="tp-quick-keys" role="toolbar" aria-label={t.cfg.lblQuickKeys}>
+      <button type="button" class="tp-keycap mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b')}>Esc</button>
+      <button type="button" class="tp-keycap mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\t')}>Tab</button>
+      <button type="button" class="tp-keycap mono tp-keycap-warn" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x03')}>Ctrl+C</button>
+      <button type="button" class="tp-keycap mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x04')}>Ctrl+D</button>
+      <button type="button" class="tp-keycap mono" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1a')}>Ctrl+Z</button>
+      <button
+        type="button"
+        class="tp-keycap mono"
+        onmousedown={(e) => e.preventDefault()}
+        onclick={() => {
+          resetScreen();
+          sendRaw('\x0c');
+        }}
+      >
+        Ctrl+L
+      </button>
+      <span class="tp-keycap-sep" aria-hidden="true"></span>
+      <button type="button" class="tp-keycap mono tp-keycap-arrow" aria-label="Left arrow" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b[D')}>←</button>
+      <button type="button" class="tp-keycap mono tp-keycap-arrow" aria-label="Up arrow" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b[A')}>↑</button>
+      <button type="button" class="tp-keycap mono tp-keycap-arrow" aria-label="Down arrow" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b[B')}>↓</button>
+      <button type="button" class="tp-keycap mono tp-keycap-arrow" aria-label="Right arrow" onmousedown={(e) => e.preventDefault()} onclick={() => sendRaw('\x1b[C')}>→</button>
+    </div>
+
+    <form onsubmit={submitLine} class="tp-cmd-form">
+      <div class="tp-cmd-input-wrap">
+        <span class="tp-cmd-prompt mono" aria-hidden="true">$</span>
+        <input
+          type="text"
+          class="mono tp-cmd-input"
+          aria-label={t.term.inputPh}
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="off"
+          spellcheck="false"
+          enterkeyhint="send"
+          bind:value={lineInput}
+          placeholder={t.term.inputPh}
+        />
+      </div>
+      <button type="submit" class="btn btn-primary tp-send-btn">{t.term.send}</button>
+    </form>
+  </div>
 {/if}
+
+<style>
+  .tp-session-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
+  }
+  .tp-session-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .tp-grid-chip {
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-muted);
+  }
+  .tp-rename-btn {
+    color: var(--text-secondary);
+  }
+  .tp-util-group {
+    gap: 6px;
+  }
+  .tp-connect-form {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .tp-select-target {
+    width: 196px;
+    max-width: 100%;
+    min-width: 0;
+  }
+  .tp-select-shell {
+    width: 102px;
+    min-width: 0;
+  }
+  .tp-select-shell-wide {
+    width: 144px;
+  }
+  .tp-viewport-wrap {
+    position: relative;
+  }
+  .tp-viewport {
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+  .tp-empty-hero {
+    height: 100%;
+    min-height: 220px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    gap: 10px;
+    padding: 24px 16px;
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter', 'PingFang SC', system-ui, sans-serif;
+  }
+  .tp-hero-icon {
+    width: 48px;
+    height: 48px;
+    border-radius: 14px;
+    background: rgba(52, 211, 153, 0.12);
+    border: 1px solid rgba(52, 211, 153, 0.25);
+    color: #34d399;
+    display: inline-grid;
+    place-items: center;
+  }
+  .tp-hero-target {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: center;
+    font-size: 14px;
+    font-weight: 600;
+    color: #f4f4f5;
+  }
+  .tp-hero-shell {
+    font-family: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-size: 11.5px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    color: #a1a1aa;
+  }
+  .tp-hero-desc {
+    max-width: 440px;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: #a1a1aa;
+    margin-bottom: 4px;
+  }
+  .tp-jump-bottom {
+    position: absolute;
+    right: 14px;
+    bottom: 14px;
+    z-index: 5;
+    background: rgba(24, 24, 27, 0.9);
+    color: #f4f4f5;
+    border-color: rgba(255, 255, 255, 0.18);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  }
+  .tp-jump-bottom:hover:not(:disabled) {
+    background: rgba(39, 39, 42, 0.96);
+    border-color: var(--accent);
+    color: #ffffff;
+  }
+  .tp-bottom-dock {
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .tp-quick-keys {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    padding: 4px 2px;
+  }
+  .tp-quick-keys::-webkit-scrollbar {
+    display: none;
+  }
+  .tp-keycap {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 30px;
+    min-width: 34px;
+    padding: 0 10px;
+    border-radius: 9px;
+    border: 1px solid var(--border-strong);
+    background: var(--bg-elevated);
+    color: var(--text-primary);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    flex-shrink: 0;
+    box-shadow: 0 1px 0 var(--border-strong);
+    transition: background-color 0.12s ease, border-color 0.12s ease, transform 0.08s ease;
+  }
+  .tp-keycap:hover {
+    background: var(--bg-hover);
+    border-color: var(--accent);
+  }
+  .tp-keycap:active {
+    transform: translateY(1px);
+  }
+  .tp-keycap:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px var(--accent-soft);
+    border-color: var(--accent);
+  }
+  .tp-keycap-warn {
+    color: var(--danger);
+    border-color: color-mix(in srgb, var(--danger) 32%, var(--border-subtle));
+    background: color-mix(in srgb, var(--danger-soft) 55%, var(--bg-elevated));
+  }
+  .tp-keycap-arrow {
+    min-width: 36px;
+    font-size: 13px;
+  }
+  .tp-keycap-sep {
+    width: 1px;
+    height: 18px;
+    background: var(--border-strong);
+    flex-shrink: 0;
+    margin: 0 2px;
+  }
+  .tp-cmd-form {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .tp-cmd-input-wrap {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+  }
+  .tp-cmd-prompt {
+    position: absolute;
+    left: 13px;
+    color: var(--accent);
+    font-weight: 700;
+    font-size: 13px;
+    pointer-events: none;
+  }
+  .tp-cmd-input {
+    padding-left: 28px !important;
+  }
+  .tp-send-btn {
+    flex-shrink: 0;
+  }
+  @media (max-width: 920px) {
+    .tp-viewport {
+      font-size: 12px;
+      padding: 12px;
+      height: min(360px, 46dvh);
+    }
+    .tp-keycap {
+      min-height: 38px;
+      min-width: 42px;
+      padding: 0 12px;
+      font-size: 12.5px;
+    }
+  }
+  @media (max-width: 680px) {
+    .tp-session-bar {
+      flex-direction: column;
+      align-items: stretch;
+      gap: 8px;
+    }
+    .tp-session-left {
+      justify-content: space-between;
+    }
+    .tp-connect-form {
+      width: 100%;
+    }
+    .tp-select-target {
+      flex: 1 1 150px;
+      width: auto;
+    }
+    .tp-select-shell,
+    .tp-select-shell-wide {
+      flex: 0 1 112px;
+      width: auto;
+    }
+    .tp-conn-btn {
+      flex: 1 0 auto;
+    }
+  }
+</style>

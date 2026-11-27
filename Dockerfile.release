@@ -1,0 +1,28 @@
+# 发布流水线专用运行时镜像：直接复用 build-binaries 交叉编译的 musl 静态二进制（已内置官方 Ed25519 公钥），
+# 避免在 QEMU arm64 下重复编译 Rust，与 GitHub Release 同架构二进制保持字节级一致。
+FROM alpine:3.20.6
+ARG TARGETOS
+ARG TARGETARCH
+
+RUN apk add --no-cache \
+    nftables \
+    iptables \
+    iptables-legacy \
+    ip6tables \
+    conntrack-tools \
+    ca-certificates \
+    tzdata \
+    && addgroup -g 10001 -S vane \
+    && adduser -u 10001 -S -G vane -H -s /sbin/nologin vane \
+    && mkdir -p /data/vane \
+    && chown vane:vane /data/vane \
+    && chmod 0700 /data/vane
+
+COPY ${TARGETOS}/${TARGETARCH}/vane /usr/local/bin/vane
+RUN chmod 0755 /usr/local/bin/vane
+
+EXPOSE 23456
+VOLUME ["/data/vane"]
+
+ENTRYPOINT ["/usr/local/bin/vane"]
+CMD ["run", "--config", "/data/vane/config.toml"]

@@ -66,15 +66,19 @@ jobs:
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
+            asset_target: linux-amd64
             os: ubuntu-latest
             use_cross: true
           - target: aarch64-unknown-linux-musl
+            asset_target: linux-arm64
             os: ubuntu-latest
             use_cross: true
           - target: armv7-unknown-linux-musleabihf
+            asset_target: linux-armv7
             os: ubuntu-latest
             use_cross: true
           - target: aarch64-apple-darwin
+            asset_target: darwin-arm64
             os: macos-latest
             use_cross: false
     steps:
@@ -117,7 +121,7 @@ jobs:
         shell: bash
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          STAGE="vane-${TAG}-${{ matrix.target }}"
+          STAGE="vane-${TAG}-${{ matrix.asset_target }}"
           mkdir -p dist-release
           cp "target/${{ matrix.target }}/release/vane" ./vane
           tar -czf "dist-release/${STAGE}.tar.gz" vane config.example.toml README.md README_CN.md LICENSE scripts/install.sh
@@ -125,7 +129,7 @@ jobs:
       - name: Upload release archive
         uses: actions/upload-artifact@v4
         with:
-          name: binary-${{ matrix.target }}
+          name: binary-${{ matrix.asset_target }}
           path: dist-release/*.tar.gz
 
   publish-release:
@@ -192,11 +196,30 @@ jobs:
 
   publish-ghcr:
     name: Build & Push Multi-Arch GHCR Image
-    needs: prepare-signing-pubkey
+    needs: build-binaries
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Download prebuilt Linux binaries (amd64 & arm64)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binary-linux-a*64
+          path: artifacts-docker
+          merge-multiple: true
+
+      - name: Stage platform binaries for Docker Buildx
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-docker/linux/amd64 dist-docker/linux/arm64
+          AMD64_TAR="$(ls artifacts-docker/*-linux-amd64.tar.gz | head -n 1)"
+          ARM64_TAR="$(ls artifacts-docker/*-linux-arm64.tar.gz | head -n 1)"
+          tar -xzf "$AMD64_TAR" -C dist-docker/linux/amd64 vane
+          tar -xzf "$ARM64_TAR" -C dist-docker/linux/arm64 vane
+          chmod 0755 dist-docker/linux/amd64/vane dist-docker/linux/arm64/vane
+          ls -lh dist-docker/linux/amd64/vane dist-docker/linux/arm64/vane
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -225,11 +248,10 @@ jobs:
       - name: Build and push multi-arch container image to GHCR
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./dist-docker
+          file: ./Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: true
-          build-args: |
-            VANE_BUILTIN_UPDATE_PUBKEY=${{ needs.prepare-signing-pubkey.outputs.pubkey_hex }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

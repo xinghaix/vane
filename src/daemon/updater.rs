@@ -252,6 +252,17 @@ pub fn current_arch() -> &'static str {
     std::env::consts::ARCH
 }
 
+pub fn current_release_target() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "linux-amd64",
+        ("linux", "aarch64") => "linux-arm64",
+        ("linux", "arm") => "linux-armv7",
+        ("macos", "aarch64") => "darwin-arm64",
+        ("macos", "x86_64") => "darwin-amd64",
+        _ => "unknown",
+    }
+}
+
 pub fn current_target_triple() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "x86_64-unknown-linux-musl",
@@ -261,6 +272,29 @@ pub fn current_target_triple() -> &'static str {
         ("macos", "x86_64") => "x86_64-apple-darwin",
         _ => "unknown",
     }
+}
+
+fn release_target_aliases(target: &str) -> Vec<&str> {
+    match target {
+        "linux-amd64" => vec!["linux-amd64", "x86_64-unknown-linux-musl"],
+        "linux-arm64" => vec!["linux-arm64", "aarch64-unknown-linux-musl"],
+        "linux-armv7" => vec!["linux-armv7", "armv7-unknown-linux-musleabihf"],
+        "darwin-arm64" => vec!["darwin-arm64", "aarch64-apple-darwin"],
+        "darwin-amd64" => vec!["darwin-amd64", "x86_64-apple-darwin"],
+        "x86_64-unknown-linux-musl" => vec!["x86_64-unknown-linux-musl", "linux-amd64"],
+        "aarch64-unknown-linux-musl" => vec!["aarch64-unknown-linux-musl", "linux-arm64"],
+        "armv7-unknown-linux-musleabihf" => vec!["armv7-unknown-linux-musleabihf", "linux-armv7"],
+        "aarch64-apple-darwin" => vec!["aarch64-apple-darwin", "darwin-arm64"],
+        "x86_64-apple-darwin" => vec!["x86_64-apple-darwin", "darwin-amd64"],
+        "" | "unknown" => Vec::new(),
+        other => vec![other],
+    }
+}
+
+fn asset_matches_target(asset_name: &str, alias: &str) -> bool {
+    let tar_gz = format!("-{alias}.tar.gz");
+    let tgz = format!("-{alias}.tgz");
+    asset_name.ends_with(&tar_gz) || asset_name.ends_with(&tgz)
 }
 
 // ---------------------------------------------------------------------------
@@ -416,7 +450,7 @@ async fn check_github_release_url(url: &str) -> Result<ReleaseInfo, String> {
         return Err("GitHub API 触发速率限制（HTTP 403），请稍后再试".into());
     }
     let json = resp.json()?;
-    parse_github_release_json(&json, current_target_triple())
+    parse_github_release_json(&json, current_release_target())
 }
 
 pub fn parse_github_release_json(v: &serde_json::Value, target_triple: &str) -> Result<ReleaseInfo, String> {
@@ -469,13 +503,21 @@ pub fn parse_github_release_json(v: &serde_json::Value, target_triple: &str) -> 
                 .unwrap_or("");
             if aname == "SHA256SUMS" && !aurl.is_empty() {
                 checksums_url = aurl.to_string();
-            } else if target_triple != "unknown"
-                && aname.contains(target_triple)
-                && (aname.ends_with(".tar.gz") || aname.ends_with(".tgz"))
-                && !aurl.is_empty()
-            {
-                asset_name = aname.to_string();
-                asset_url = aurl.to_string();
+            }
+        }
+        'alias_loop: for alias in release_target_aliases(target_triple) {
+            for a in assets {
+                let aname = a.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                let aurl = a
+                    .get("browser_download_url")
+                    .and_then(|x| x.as_str())
+                    .filter(|u| u.starts_with("https://github.com/") || u.starts_with("https://objects.githubusercontent.com/"))
+                    .unwrap_or("");
+                if asset_matches_target(aname, alias) && !aurl.is_empty() {
+                    asset_name = aname.to_string();
+                    asset_url = aurl.to_string();
+                    break 'alias_loop;
+                }
             }
         }
     }
@@ -551,13 +593,15 @@ pub fn parse_expected_sha256(raw: &str, filename_hint: Option<&str>) -> Result<O
         }
         return Err("预期 SHA-256 格式无效（需 64 位十六进制摘要或官方 SHA256SUMS 对应行）".into());
     }
-    // 多行 SHA256SUMS：优先匹配文件名，其次匹配当前 target triple
+    // 多行 SHA256SUMS：优先匹配文件名，其次匹配当前发布短名，最后兼容旧版 Rust target triple
+    let release_target = current_release_target();
     let triple = current_target_triple();
     let pick_line = |needle: &str| -> Option<&str> {
         lines.iter().copied().find(|l| !needle.is_empty() && l.contains(needle))
     };
     let chosen = filename_hint
         .and_then(pick_line)
+        .or_else(|| (release_target != "unknown").then(|| pick_line(release_target)).flatten())
         .or_else(|| (triple != "unknown").then(|| pick_line(triple)).flatten())
         .ok_or_else(|| "多行 SHA256SUMS 中未找到与当前架构或文件名匹配的校验行".to_string())?;
     let token = chosen.split_whitespace().next().unwrap_or("");
@@ -1842,7 +1886,39 @@ mod tests {
 
     #[test]
     fn parses_github_release_payload_and_picks_matching_asset() {
-        let j = serde_json::json!({
+        // 1. 新版友好短名资产（linux-arm64 / darwin-arm64 等）
+        let j_short = serde_json::json!({
+            "tag_name": "v0.2.1",
+            "name": "Vane v0.2.1",
+            "html_url": "https://github.com/xinghaix/vane/releases/tag/v0.2.1",
+            "published_at": "2026-11-27T08:00:00Z",
+            "body": "Clean asset names",
+            "assets": [
+                {
+                    "name": "vane-v0.2.1-linux-arm64.tar.gz.sig.b64",
+                    "browser_download_url": "https://github.com/xinghaix/vane/releases/download/v0.2.1/vane-v0.2.1-linux-arm64.tar.gz.sig.b64"
+                },
+                {
+                    "name": "vane-v0.2.1-linux-arm64.tar.gz",
+                    "browser_download_url": "https://github.com/xinghaix/vane/releases/download/v0.2.1/vane-v0.2.1-linux-arm64.tar.gz"
+                },
+                {
+                    "name": "vane-v0.2.1-darwin-arm64.tar.gz",
+                    "browser_download_url": "https://github.com/xinghaix/vane/releases/download/v0.2.1/vane-v0.2.1-darwin-arm64.tar.gz"
+                },
+                {
+                    "name": "SHA256SUMS",
+                    "browser_download_url": "https://github.com/xinghaix/vane/releases/download/v0.2.1/SHA256SUMS"
+                }
+            ]
+        });
+        let info_short = parse_github_release_json(&j_short, "linux-arm64").unwrap();
+        assert_eq!(info_short.version, "0.2.1");
+        assert_eq!(info_short.asset_name, "vane-v0.2.1-linux-arm64.tar.gz");
+        assert!(info_short.checksums_url.ends_with("/SHA256SUMS"));
+
+        // 2. 向后兼容旧版 Rust target triple 命名（如 v0.2.0）
+        let j_legacy = serde_json::json!({
             "tag_name": "v0.2.0",
             "name": "Vane v0.2.0",
             "html_url": "https://github.com/xinghaix/vane/releases/tag/v0.2.0",
@@ -1859,10 +1935,10 @@ mod tests {
                 }
             ]
         });
-        let info = parse_github_release_json(&j, "aarch64-unknown-linux-musl").unwrap();
-        assert_eq!(info.version, "0.2.0");
-        assert_eq!(info.asset_name, "vane-v0.2.0-aarch64-unknown-linux-musl.tar.gz");
-        assert!(info.checksums_url.ends_with("/SHA256SUMS"));
+        let info_legacy = parse_github_release_json(&j_legacy, "linux-arm64").unwrap();
+        assert_eq!(info_legacy.version, "0.2.0");
+        assert_eq!(info_legacy.asset_name, "vane-v0.2.0-aarch64-unknown-linux-musl.tar.gz");
+        assert!(info_legacy.checksums_url.ends_with("/SHA256SUMS"));
     }
 
     #[test]

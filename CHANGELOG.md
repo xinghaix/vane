@@ -7,7 +7,7 @@ All notable changes to this project will be documented in this file.
 ## [0.2.0] - 2026-11-27
 
 ### Added
-- **内置官方 Ed25519 发布公钥与开箱可用签名更新**：支持编译期注入 `VANE_BUILTIN_UPDATE_PUBKEY`（CI Release 与 GHCR 构建自动从 `secrets.VANE_RELEASE_SIGNING_KEY` 推导并附带 `RELEASE_PUBKEY.{pem,hex}`）；按 `config.toml` 自定义公钥 > 二进制内置官方公钥解析并展示短指纹，`admin.allow_manual_update_upload` 默认改为 `true`（仅放行验签通过且不降级的发布包，未内置且未配置公钥时仍 Fail-Closed，写 `false` 可彻底关闭），CLI `vane update` 同步支持内置公钥回退。
+- **内置官方 Ed25519 发布公钥与开箱可用签名更新**：支持编译期注入 `VANE_BUILTIN_UPDATE_PUBKEY`（CI Release 自动从 `secrets.VANE_RELEASE_SIGNING_KEY` 推导并附带 `RELEASE_PUBKEY.{pem,hex}`）；按 `config.toml` 自定义公钥 > 二进制内置官方公钥解析并展示短指纹，`admin.allow_manual_update_upload` 默认改为 `true`（仅放行验签通过且不降级的发布包，未内置且未配置公钥时仍 Fail-Closed，写 `false` 可彻底关闭），CLI `vane update` 同步支持内置公钥回退；Release 压缩包与签名统一切换为 `linux-amd64`/`linux-arm64`/`linux-armv7`/`darwin-arm64` 短名（同时向后兼容旧 triple），`publish-ghcr` 改用 `Dockerfile.release` 直接复用交叉编译产出的静态二进制加速多架构镜像发布。
 - **WebAuthn / Passkey 与分级二次认证**：新增 Passkey（ES256/Ed25519）注册与无密码登录、有界 CBOR 解析及克隆计数器检测，支持纯 Passkey 无密码配置；新增 `ReauthModal` 与强因子（MFA）分级 Reauth 令牌体系。
 - **反代门禁、通知收件箱与签名更新管理**：新增独立反向代理 Auth-Gate 门户（`proxy_gate`）、持久化通知收件箱（`NotificationInboxPanel`）、纯 Rust Ed25519 验签自更新与前端 `SystemUpdatePanel`、以及完整 PWA 图标/离线清单与可复用 UI 基础组件库（`EditorDialog`、`FacetFilter`、`CronSchedulePicker`、`TerminalPane` 等）。
 - **跨机全量加密备份 (`.vane.bak`)**：完整纳入 ACME 账户（导出解密、导入自动用目标机 Vault 主密钥重封）、未完成清理的 `acme-challenges` 日志、有效代际证书 (`bundle.json` 验签并即时热加载) 及管理端 TLS 证书/私钥 (`certs/admin.{crt,key}`)，升级至 `VANEBAK2`（600k PBKDF2 + 40B 完整头 AAD + 强口令校验，兼容读取 `VANEBAK1`），并在 UI 中展示备份范围清单、安全降级确认与恢复汇总。

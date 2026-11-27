@@ -49,9 +49,9 @@ validate_semver_tag() {
 detect_target() {
   ARCH="$(uname -m)"
   case "$ARCH" in
-    aarch64|arm64) echo "aarch64-unknown-linux-musl" ;;
-    x86_64|amd64)  echo "x86_64-unknown-linux-musl" ;;
-    armv7l|armv7*) echo "armv7-unknown-linux-musleabihf" ;;
+    aarch64|arm64) echo "linux-arm64" ;;
+    x86_64|amd64)  echo "linux-amd64" ;;
+    armv7l|armv7*) echo "linux-armv7" ;;
     *) err "暂不支持的 CPU 架构: $ARCH" ;;
   esac
 }

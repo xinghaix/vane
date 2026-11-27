@@ -472,7 +472,7 @@ async fn run_cli_self_update(
     println!(
         "正在通过纯 Rust 严格 HTTPS 检查 Vane 最新版本 (仓库: {}, 架构: {})...",
         clean_repo,
-        daemon::updater::current_target_triple()
+        daemon::updater::current_release_target()
     );
 
     let release = daemon::updater::check_github_release(&clean_repo).await?;
@@ -480,7 +480,7 @@ async fn run_cli_self_update(
         return Err(format!(
             "Release {} 未提供匹配当前目标平台 ({}) 的安装包",
             release.tag_name,
-            daemon::updater::current_target_triple()
+            daemon::updater::current_release_target()
         ));
     }
     if !force && !daemon::updater::is_newer_version(&release.version, daemon::updater::current_version()) {

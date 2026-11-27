@@ -1,7 +1,7 @@
 <script>
   import Icons from './Icons.svelte';
   import { registerOverlay } from '../lib/overlay.js';
-  import { formatUnixTime } from '../lib/helpers.js';
+  import { copyText, formatUnixTime } from '../lib/helpers.js';
 
   let {
     open = false,
@@ -28,11 +28,31 @@
   let expanded = $state(false);
   let detailItem = $state(null);
 
+  let alertCount = $derived(
+    items.filter((m) => ['warning', 'error', 'critical'].includes(m.severity)).length
+  );
+
   let filteredItems = $derived.by(() => {
     if (filter === 'unread') return items.filter((m) => !m.read);
     if (filter === 'alerts') return items.filter((m) => ['warning', 'error', 'critical'].includes(m.severity));
     return items;
   });
+
+  let expandLabel = $derived(
+    expanded
+      ? t.inbox?.collapse || t.common?.collapse || (lang === 'en' ? 'Collapse' : '收起')
+      : t.inbox?.expand || t.common?.expand || (lang === 'en' ? 'Expand' : '展开')
+  );
+  let copyMsgLabel = $derived(
+    t.inbox?.copyMessage || (lang === 'en' ? 'Copy' : '复制正文')
+  );
+
+  async function copyDetailMessage() {
+    if (!detailItem) return;
+    const text = `[${detailItem.title}]\n${detailItem.message || ''}`.trim();
+    if (await copyText(text)) showToast(t.copied, 'success');
+    else showToast(t.copyFailed, 'error');
+  }
 
   function moduleLabel(mod) {
     if (!mod) return t.nav.logs;
@@ -199,9 +219,10 @@
         {#if detailItem}
           <button
             type="button"
-            class="btn btn-ghost btn-xs"
-            style="padding:0 6px;margin-left:-4px;"
+            class="btn btn-ghost btn-icon inbox-head-btn"
+            style="margin-left:-4px;"
             aria-label={t.inbox.backToList}
+            title={t.inbox.backToList}
             onclick={() => (detailItem = null)}
           >
             <Icons name="arrow_left" size={16} />
@@ -210,7 +231,7 @@
             {t.inbox.detailTitle}
           </span>
         {:else}
-          <span style="font-size:15px;font-weight:700;">{t.inbox.title}</span>
+          <span style="font-size:15px;font-weight:700;white-space:nowrap;">{t.inbox.title}</span>
           {#if unreadCount > 0}
             <span class="badge badge-info num" style="font-size:11px;padding:1px 8px;">
               {unreadCount} {t.inbox.unreadUnit}
@@ -219,32 +240,62 @@
         {/if}
       </div>
 
-      <div style="display:flex;align-items:center;gap:4px;">
+      <div class="inbox-head-actions">
         {#if !detailItem}
-          <button type="button" class="btn btn-ghost btn-xs" style="padding:0 6px;" title={t.refresh} disabled={loading} onclick={() => loadInbox(false)}>
-            <Icons name="refresh" size={14} />
+          <button
+            type="button"
+            class="btn btn-ghost btn-icon inbox-head-btn"
+            aria-label={t.refresh}
+            title={t.refresh}
+            disabled={loading}
+            onclick={() => loadInbox(false)}
+          >
+            <span class:is-spinning={loading} style="display:inline-flex;">
+              <Icons name="refresh" size={14} />
+            </span>
           </button>
           {#if unreadCount > 0}
-            <button type="button" class="btn btn-ghost btn-xs" style="padding:0 7px;" title={t.inbox.markAllRead} disabled={Boolean(busy)} onclick={() => markRead(null)}>
+            <button
+              type="button"
+              class="btn btn-ghost btn-icon inbox-head-btn"
+              aria-label={t.inbox.markAllRead}
+              title={t.inbox.markAllRead}
+              disabled={Boolean(busy)}
+              onclick={() => markRead(null)}
+            >
               <Icons name="check" size={14} />
             </button>
           {/if}
           {#if items.length > 0}
-            <button type="button" class="btn btn-ghost btn-xs" style="padding:0 6px;color:var(--danger);" title={t.inbox.clearAll} disabled={Boolean(busy)} onclick={confirmClearAll}>
+            <button
+              type="button"
+              class="btn btn-ghost btn-icon btn-icon-danger inbox-head-btn"
+              style="color:var(--danger);"
+              aria-label={t.inbox.clearAll}
+              title={t.inbox.clearAll}
+              disabled={Boolean(busy)}
+              onclick={confirmClearAll}
+            >
               <Icons name="trash" size={14} />
             </button>
           {/if}
         {/if}
         <button
           type="button"
-          class="btn btn-ghost btn-xs"
-          style="padding:0 6px;"
-          title={expanded ? t.close : 'Expand'}
+          class="btn btn-ghost btn-icon inbox-head-btn inbox-expand-btn"
+          aria-label={expandLabel}
+          title={expandLabel}
           onclick={() => (expanded = !expanded)}
         >
           <Icons name="expand" size={14} />
         </button>
-        <button type="button" class="btn btn-ghost btn-xs" style="padding:0 6px;" aria-label={t.close} onclick={() => onClose?.()}>
+        <button
+          type="button"
+          class="btn btn-ghost btn-icon inbox-head-btn"
+          aria-label={t.close}
+          title={t.close}
+          onclick={() => onClose?.()}
+        >
           <Icons name="x" size={15} />
         </button>
       </div>
@@ -257,84 +308,134 @@
           <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
             <span class="badge {severityClass(detailItem.severity)}">{severityLabel(detailItem.severity)}</span>
             <span class="badge badge-muted">{moduleLabel(detailItem.module)}</span>
-            <span class="badge badge-muted mono">{t.events?.[detailItem.event] || detailItem.event}</span>
+            <span class="badge badge-muted" class:mono={!t.events?.[detailItem.event]}>
+              {t.events?.[detailItem.event] || detailItem.event}
+            </span>
           </div>
           <div style="font-size:15.5px;font-weight:700;line-height:1.4;word-break:break-word;">
             {detailItem.title}
           </div>
-          <div class="mono" style="font-size:11.5px;color:var(--text-muted);">
-            {formatUnixTime(detailItem.ts)}
+          <div class="row-between" style="gap:8px;">
+            <div class="mono" style="font-size:11.5px;color:var(--text-muted);">
+              {formatUnixTime(detailItem.ts)}
+            </div>
+            <div class="btn-group" style="gap:6px;">
+              <button type="button" class="btn btn-xs" onclick={copyDetailMessage}>
+                <Icons name="copy" size={12} />
+                <span>{copyMsgLabel}</span>
+              </button>
+              <button
+                type="button"
+                class="btn btn-xs btn-danger"
+                disabled={busy === `del-${detailItem.id}`}
+                onclick={() => deleteItem(detailItem.id)}
+              >
+                <Icons name="trash" size={12} />
+                <span>{t.delete}</span>
+              </button>
+            </div>
           </div>
           <pre class="inbox-detail-body">{detailItem.message}</pre>
         </div>
       {:else}
-        <div class="row-between" style="gap:6px;padding:4px 4px 10px;">
-          <div class="btn-group" style="gap:5px;">
-            <button type="button" class="chip {filter === 'all' ? 'active' : ''}" style="min-height:27px;padding:2px 10px;font-size:12px;" onclick={() => (filter = 'all')}>
-              {t.all} ({items.length})
+        <div class="inbox-filter-bar">
+          <div class="btn-group" style="gap:6px;">
+            <button
+              type="button"
+              class="chip inbox-filter-chip {filter === 'all' ? 'active' : ''}"
+              aria-pressed={filter === 'all'}
+              onclick={() => (filter = 'all')}
+            >
+              <span>{t.all}</span>
+              <span class="num inbox-chip-num">{items.length}</span>
             </button>
-            <button type="button" class="chip {filter === 'unread' ? 'active' : ''}" style="min-height:27px;padding:2px 10px;font-size:12px;" onclick={() => (filter = 'unread')}>
-              {t.inbox.filterUnread} ({unreadCount})
+            <button
+              type="button"
+              class="chip inbox-filter-chip {filter === 'unread' ? 'active' : ''}"
+              aria-pressed={filter === 'unread'}
+              onclick={() => (filter = 'unread')}
+            >
+              <span>{t.inbox.filterUnread}</span>
+              <span class="num inbox-chip-num">{unreadCount}</span>
             </button>
-            <button type="button" class="chip {filter === 'alerts' ? 'active' : ''}" style="min-height:27px;padding:2px 10px;font-size:12px;" onclick={() => (filter = 'alerts')}>
-              {t.inbox.filterAlerts}
+            <button
+              type="button"
+              class="chip inbox-filter-chip {filter === 'alerts' ? 'active' : ''}"
+              aria-pressed={filter === 'alerts'}
+              onclick={() => (filter = 'alerts')}
+            >
+              <span>{t.inbox.filterAlerts}</span>
+              <span class="num inbox-chip-num">{alertCount}</span>
             </button>
           </div>
-          <span class="mono" style="font-size:11px;color:var(--text-muted);" title={t.inbox.quotaTip}>
+          <span
+            class="mono inbox-quota"
+            title={`${t.inbox.quotaTip} (${formatKiB(storageBytes)} / ${formatKiB(maxStorageBytes)})`}
+          >
             {items.length}/{capacity}
           </span>
         </div>
 
         {#if loading && !items.length}
           <div style="padding:6px;display:grid;gap:8px;">
-            <div class="skeleton" style="height:48px;"></div>
-            <div class="skeleton" style="height:48px;"></div>
+            <div class="skeleton" style="height:56px;"></div>
+            <div class="skeleton" style="height:56px;"></div>
+            <div class="skeleton" style="height:56px;"></div>
           </div>
         {:else if !filteredItems.length}
-          <div class="empty-state" style="margin:6px;padding:32px 16px;">
-            {items.length ? t.common.noMatches : t.inbox.empty}
+          <div class="empty-state-rich inbox-empty">
+            <span class="empty-state-icon"><Icons name="bell" size={20} /></span>
+            <div class="empty-state-desc">
+              {items.length ? t.common.noMatches : t.inbox.empty}
+            </div>
+            {#if items.length && filter !== 'all'}
+              <button type="button" class="btn btn-xs" style="margin-top:8px;" onclick={() => (filter = 'all')}>
+                {t.common?.clearFilters || (lang === 'en' ? 'Show all' : '查看全部')}
+              </button>
+            {/if}
           </div>
         {:else}
-          <div style="display:flex;flex-direction:column;gap:2px;">
+          <div class="inbox-list">
             {#each filteredItems as item (item.id)}
-              <div class="activity-row {item.read ? '' : 'unread'}">
+              <div class="activity-row inbox-row {item.read ? '' : 'unread'}">
                 <span class="activity-dot {item.severity}"></span>
                 <button
                   type="button"
-                  style="border:none;background:transparent;padding:0;text-align:left;min-width:0;flex:1;cursor:pointer;font-family:inherit;color:inherit;"
+                  class="inbox-row-main"
                   onclick={() => openDetail(item)}
                 >
-                  <div style="display:flex;align-items:baseline;justify-content:space-between;gap:8px;">
-                    <span style="font-size:13.5px;font-weight:{item.read ? '500' : '700'};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                  <div class="inbox-row-top">
+                    <span class="inbox-row-title" class:is-unread={!item.read}>
                       {item.title}
                     </span>
-                    <span style="font-size:11.5px;color:var(--text-muted);flex-shrink:0;" class="num">
+                    <span class="inbox-row-time num">
                       {formatRelative(item.ts)}
                     </span>
                   </div>
-                  <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
-                    {moduleLabel(item.module)} · {item.message}
+                  <div class="inbox-row-msg">
+                    <span class="inbox-row-mod">{moduleLabel(item.module)}</span>
+                    <span>{item.message}</span>
                   </div>
                 </button>
-                <div style="display:flex;align-items:center;gap:2px;flex-shrink:0;">
+                <div class="inbox-row-actions">
                   <button
                     type="button"
-                    class="btn btn-ghost btn-xs"
-                    style="padding:0 6px;color:var(--accent);"
+                    class="btn btn-ghost btn-icon inbox-row-btn inbox-jump-btn"
+                    aria-label={`${t.inbox.jumpTo} ${moduleLabel(item.module)}`}
                     title={`${t.inbox.jumpTo} ${moduleLabel(item.module)}`}
                     onclick={() => jumpToModule(item)}
                   >
-                    <Icons name="arrow_right" size={13} />
+                    <Icons name="arrow_right" size={14} />
                   </button>
                   <button
                     type="button"
-                    class="btn btn-ghost btn-xs"
-                    style="padding:0 5px;color:var(--text-muted);"
-                    aria-label={t.delete}
+                    class="btn btn-ghost btn-icon inbox-row-btn inbox-del-btn"
+                    aria-label={`${t.delete} ${item.title}`}
+                    title={t.delete}
                     disabled={busy === `del-${item.id}`}
                     onclick={() => deleteItem(item.id)}
                   >
-                    <Icons name="x" size={13} />
+                    <Icons name="x" size={14} />
                   </button>
                 </div>
               </div>
@@ -347,21 +448,193 @@
     <!-- 底部操作栏 -->
     <div class="activity-tray-foot">
       {#if detailItem}
-        <button type="button" class="btn btn-xs" onclick={() => (detailItem = null)}>
+        <button type="button" class="btn btn-sm" onclick={() => (detailItem = null)}>
           <Icons name="arrow_left" size={13} />
           <span>{t.inbox.backToList}</span>
         </button>
-        <button type="button" class="btn btn-xs btn-primary" onclick={() => jumpToModule(detailItem)}>
+        <button type="button" class="btn btn-sm btn-primary" onclick={() => jumpToModule(detailItem)}>
           <span>{t.inbox.jumpTo} {moduleLabel(detailItem.module)}</span>
           <Icons name="arrow_right" size={13} />
         </button>
       {:else}
-        <button type="button" class="btn btn-xs btn-ghost" onclick={() => onOpenChannelSettings?.()}>
-          <Icons name="settings" size={13} />
-          <span>{t.inbox.channelSettingsBtn}</span>
-        </button>
-        <button type="button" class="btn btn-xs" onclick={() => onClose?.()}>{t.close}</button>
+        <div class="btn-group" style="gap:6px;">
+          <button type="button" class="btn btn-sm btn-ghost" onclick={() => onOpenChannelSettings?.()}>
+            <Icons name="settings" size={13} />
+            <span>{t.inbox.channelSettingsBtn}</span>
+          </button>
+          {#if unreadCount > 0}
+            <button
+              type="button"
+              class="btn btn-sm btn-soft"
+              disabled={Boolean(busy)}
+              onclick={() => markRead(null)}
+            >
+              <Icons name="check" size={13} />
+              <span>{t.inbox.markAllRead}</span>
+            </button>
+          {/if}
+        </div>
+        <button type="button" class="btn btn-sm" onclick={() => onClose?.()}>{t.close}</button>
       {/if}
     </div>
   </div>
 {/if}
+
+<style>
+  .inbox-head-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+  }
+  .inbox-head-btn {
+    min-width: 34px;
+    min-height: 34px;
+    padding: 0;
+  }
+  .inbox-filter-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 4px 4px 10px;
+    flex-wrap: wrap;
+  }
+  .inbox-filter-chip {
+    min-height: 30px;
+    padding: 3px 11px;
+    font-size: 12px;
+  }
+  .inbox-chip-num {
+    font-size: 11px;
+    opacity: 0.78;
+  }
+  .inbox-quota {
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .inbox-empty {
+    margin: 6px;
+    padding: 28px 16px;
+  }
+  .inbox-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .inbox-row {
+    align-items: flex-start;
+    position: relative;
+  }
+  .inbox-row.unread {
+    box-shadow: inset 2.5px 0 0 0 var(--accent);
+  }
+  .inbox-row-main {
+    border: none;
+    background: transparent;
+    padding: 0;
+    text-align: left;
+    min-width: 0;
+    flex: 1;
+    cursor: pointer;
+    font-family: inherit;
+    color: inherit;
+  }
+  .inbox-row-main:focus-visible {
+    outline: none;
+    border-radius: 8px;
+    box-shadow: 0 0 0 2px var(--accent-soft);
+  }
+  .inbox-row-top {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .inbox-row-title {
+    font-size: 13.5px;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .inbox-row-title.is-unread {
+    font-weight: 700;
+  }
+  .inbox-row-time {
+    font-size: 11.5px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+  .inbox-row-msg {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-top: 3px;
+    line-height: 1.45;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    word-break: break-word;
+  }
+  .inbox-row-mod {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 0 5px;
+    margin-right: 5px;
+    vertical-align: baseline;
+  }
+  .inbox-row-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+    margin-left: 2px;
+  }
+  .inbox-row-btn {
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+  }
+  .inbox-jump-btn {
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+  }
+  .inbox-jump-btn:hover:not(:disabled) {
+    background: var(--accent-soft);
+  }
+  .inbox-del-btn {
+    color: var(--text-muted);
+  }
+  .inbox-del-btn:hover:not(:disabled) {
+    color: var(--danger);
+    background: var(--danger-soft);
+  }
+  @media (max-width: 920px) {
+    .inbox-expand-btn {
+      display: none;
+    }
+    .inbox-head-btn {
+      min-width: 40px;
+      min-height: 40px;
+    }
+    .inbox-filter-chip {
+      min-height: 38px;
+      padding: 4px 12px;
+      font-size: 12.5px;
+    }
+    .inbox-row-actions {
+      gap: 8px;
+    }
+    .inbox-row-btn {
+      min-width: 38px;
+      min-height: 38px;
+    }
+  }
+</style>

@@ -254,14 +254,34 @@
 
   async function copyTextSafe(val) {
     if (await copyText(val)) showToast(t.copied, 'success');
+    else showToast(t.copyFailed, 'error');
   }
+
+  function resetUpdateConfig() {
+    const u = settingsJson?.update;
+    if (!u) return;
+    autoCheck = Boolean(u.auto_check);
+    checkIntervalHours = Number(u.check_interval_hours || 24);
+    repo = String(u.repo || 'xinghaix/vane');
+  }
+
+  const MANUAL_UPDATE_SNIPPET = `[admin]\nallow_manual_update_upload = true\nupdate_signing_public_key = "<Ed25519 public key>"`;
+  let uploadLocked = $derived(!manualUploadEnabled || !signingKeyReady);
+  let copySnippetLabel = $derived(
+    t.update?.copyConfigSnippet || (lang === 'en' ? 'Copy config.toml snippet' : '复制 config.toml 配置片段')
+  );
+  let uploadStepLabels = $derived(
+    lang === 'en'
+      ? ['1. Release archive', '2. Ed25519 signature', '3. Optional SHA-256']
+      : ['1. 选择更新包', '2. 填写 Ed25519 签名', '3. 可选 SHA-256 校验']
+  );
 </script>
 
 <!-- 安全承诺横幅：永不自动更新 -->
-<div class="banner banner-info" style="margin-bottom:16px;">
-  <div style="display:flex;align-items:flex-start;gap:10px;">
+<div class="banner banner-info upd-banner-gap">
+  <div class="banner-main">
     <Icons name="shield" size={18} />
-    <div>
+    <div style="min-width:0;flex:1;">
       <div style="font-weight:700;">{t.update.neverAutoTitle}</div>
       <div style="font-size:12.5px;color:var(--text-secondary);margin-top:2px;">
         {t.update.neverAutoDesc}
@@ -273,7 +293,7 @@
 <!-- 1. 当前版本状态与 GitHub Release 自动检查提醒 -->
 <div class="card" style="margin-bottom:18px;">
   <div class="card-header">
-    <div>
+    <div style="min-width:0;flex:1;">
       <div class="card-title">
         <Icons name="refresh" size={16} />
         <span>{t.update.checkCardTitle}</span>
@@ -283,51 +303,65 @@
       </div>
     </div>
     <button type="button" class="btn btn-primary btn-sm" disabled={checking} onclick={checkNow}>
-      <Icons name="refresh" size={14} />
+      <span class:is-spinning={checking} class="upd-icon-inline">
+        <Icons name="refresh" size={14} />
+      </span>
       <span>{checking ? t.update.checking : t.update.checkNow}</span>
     </button>
   </div>
 
   {#if status}
-    <div class="update-meta-grid" style="margin-bottom:16px;grid-template-columns:repeat(3, minmax(0, 1fr));">
-      <div class="subcard">
+    <div class="upd-meta-grid">
+      <div class="subcard upd-meta-card">
         <div class="update-meta-label">{t.update.currentVersion}</div>
         <div class="update-meta-val mono">v{status.current_version}</div>
       </div>
-      <div class="subcard">
-        <div class="update-meta-label">{t.update.platformArch}</div>
-        <div class="update-meta-val mono">{status.os} / {status.arch}</div>
-      </div>
-      <div class="subcard">
+      <div class="subcard upd-meta-card">
         <div class="update-meta-label">{t.update.tempSpace}</div>
         <div class="update-meta-val mono">{status.temp_available_mb} MiB</div>
+      </div>
+      <div class="subcard upd-meta-card upd-meta-card-wide">
+        <div class="update-meta-label">{t.update.platformArch}</div>
+        <div class="update-meta-val mono">{status.os} / {status.arch}</div>
       </div>
     </div>
 
     {#if !status.executable_writable}
-      <div class="banner banner-warn" style="margin-bottom:14px;">
-        <Icons name="alert" size={16} />
-        <div style="font-size:12.5px;">
-          {t.update.notWritableWarn} <code class="mono">{status.executable_path}</code>
+      <div class="banner banner-warn upd-banner-gap">
+        <div class="banner-main">
+          <Icons name="alert" size={16} />
+          <div style="font-size:12.5px;min-width:0;flex:1;">
+            {t.update.notWritableWarn} <code class="code-chip mono">{status.executable_path}</code>
+          </div>
         </div>
       </div>
     {/if}
 
     {#if status.last_error}
-      <div class="banner banner-danger" style="margin-bottom:14px;">
-        <Icons name="alert" size={16} />
-        <div style="font-size:12.5px;">{status.last_error}</div>
+      <div class="banner banner-danger upd-banner-gap">
+        <div class="banner-main">
+          <Icons name="alert" size={16} />
+          <div style="font-size:12.5px;min-width:0;flex:1;word-break:break-word;">{status.last_error}</div>
+        </div>
       </div>
     {/if}
 
     {#if status.latest}
-      <div class="subcard" style="margin-bottom:16px;border-color:{status.has_update ? 'var(--accent)' : 'var(--border-subtle)'};">
-        <div class="row-between" style="gap:10px;flex-wrap:wrap;margin-bottom:8px;">
-          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+      <div class="subcard upd-release-card" class:has-update={status.has_update}>
+        <div class="row-between" style="gap:10px;margin-bottom:8px;">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0;">
             <span class="badge {status.has_update ? 'badge-ok' : 'badge-muted'}">
               {status.has_update ? t.update.newVersionFound : t.update.upToDate}
             </span>
-            <span class="mono" style="font-weight:700;font-size:14.5px;">{status.latest.tag_name}</span>
+            {#if status.has_update}
+              <span class="upd-ver-jump mono">
+                <span class="upd-ver-old">v{status.current_version}</span>
+                <Icons name="arrow_right" size={12} />
+                <span class="upd-ver-new">{status.latest.tag_name}</span>
+              </span>
+            {:else}
+              <span class="mono" style="font-weight:700;font-size:14.5px;">{status.latest.tag_name}</span>
+            {/if}
             {#if status.latest.name && status.latest.name !== status.latest.tag_name}
               <span style="font-size:13px;color:var(--text-secondary);">{status.latest.name}</span>
             {/if}
@@ -338,24 +372,37 @@
             </span>
           {/if}
         </div>
+        {#if status.latest.asset_name}
+          <div class="upd-asset-row">
+            <span class="meta-chip mono upd-asset-chip" title={status.latest.asset_name}>
+              {status.latest.asset_name}
+            </span>
+          </div>
+        {/if}
         {#if status.latest.notes}
           <pre class="inbox-detail-body" style="max-height:180px;margin-bottom:10px;">{status.latest.notes}</pre>
         {/if}
-        <div class="btn-group">
+        <div class="btn-group upd-release-actions">
+          {#if status.latest.asset_url}
+            <a
+              class="btn btn-sm btn-primary"
+              href={status.latest.asset_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={status.latest.asset_name || t.update.downloadMatching}
+            >
+              <Icons name="download" size={14} />
+              <span>{t.update.downloadMatching}</span>
+            </a>
+          {/if}
           {#if status.latest.html_url}
-            <a class="btn btn-xs" href={status.latest.html_url} target="_blank" rel="noopener noreferrer">
+            <a class="btn btn-sm" href={status.latest.html_url} target="_blank" rel="noopener noreferrer">
               <Icons name="external_link" size={13} />
               <span>{t.update.viewRelease}</span>
             </a>
           {/if}
-          {#if status.latest.asset_url}
-            <a class="btn btn-xs btn-primary" href={status.latest.asset_url} target="_blank" rel="noopener noreferrer">
-              <Icons name="download" size={13} />
-              <span>{t.update.downloadMatching} ({status.latest.asset_name})</span>
-            </a>
-          {/if}
           {#if status.latest.checksums_url}
-            <a class="btn btn-xs" href={status.latest.checksums_url} target="_blank" rel="noopener noreferrer">
+            <a class="btn btn-sm" href={status.latest.checksums_url} target="_blank" rel="noopener noreferrer">
               <Icons name="shield" size={13} />
               <span>SHA256SUMS</span>
             </a>
@@ -374,7 +421,12 @@
   <form onsubmit={saveUpdateConfig}>
     <div class="subcard row-between" style="margin-bottom:12px;">
       <div style="min-width:0;flex:1;">
-        <div style="font-weight:600;font-size:13.5px;">{t.update.autoCheckToggle}</div>
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+          <span style="font-weight:600;font-size:13.5px;">{t.update.autoCheckToggle}</span>
+          <span class="badge {autoCheck ? 'badge-ok' : 'badge-muted'}" style="font-size:10.5px;padding:1px 7px;">
+            {autoCheck ? t.enabled : t.disabled}
+          </span>
+        </div>
         <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">{t.update.autoCheckDesc}</div>
       </div>
       <button
@@ -389,7 +441,7 @@
       </button>
     </div>
 
-    <div class="form-grid" style="margin-bottom:12px;">
+    <div class="form-grid" class:upd-dimmed={!autoCheck} style="margin-bottom:12px;">
       <div class="field" style="margin-bottom:0;">
         <label for="upd-interval">{t.update.checkInterval}</label>
         <input id="upd-interval" type="number" min="1" max="168" bind:value={checkIntervalHours} />
@@ -400,9 +452,16 @@
       </div>
     </div>
 
-    <div style="display:flex;justify-content:flex-end;">
+    <div class="row-between" style="justify-content:flex-end;gap:8px;">
+      {#if cfgDirty}
+        <span class="badge badge-warn" style="margin-right:auto;">{t.common.unsavedChanges}</span>
+        <button type="button" class="btn btn-sm" disabled={savingCfg} onclick={resetUpdateConfig}>
+          {t.common.discardChanges}
+        </button>
+      {/if}
       <button type="submit" class="btn btn-sm btn-primary" disabled={savingCfg || !cfgDirty}>
-        {savingCfg ? '...' : t.saveSettings}
+        <Icons name="save" size={14} />
+        <span>{savingCfg ? '...' : t.saveSettings}</span>
       </button>
     </div>
   </form>
@@ -411,7 +470,7 @@
 <!-- 2. 手动上传压缩包安全沙箱更新 -->
 <div class="card">
   <div class="card-header">
-    <div>
+    <div style="min-width:0;flex:1;">
       <div class="card-title">
         <Icons name="upload" size={16} />
         <span>{t.update.uploadCardTitle}</span>
@@ -426,27 +485,62 @@
   </div>
 
   {#if !manualUploadEnabled}
-    <div class="banner banner-warn" style="margin-bottom:14px;">
-      <div style="display:flex;align-items:flex-start;gap:10px;">
+    <div class="banner banner-warn upd-banner-gap">
+      <div class="banner-main">
         <Icons name="shield" size={16} />
-        <div>
+        <div style="min-width:0;flex:1;">
           <div style="font-weight:700;font-size:13px;">{t.update.manualUploadDisabledTitle}</div>
-          <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;line-height:1.5;">
+          <div style="font-size:12px;color:var(--text-secondary);margin-top:3px;line-height:1.5;">
             {t.update.manualUploadDisabledGuide}
+          </div>
+          <div class="upd-snippet-box">
+            <pre class="mono upd-snippet-pre">{MANUAL_UPDATE_SNIPPET}</pre>
+            <button
+              type="button"
+              class="btn btn-xs"
+              onclick={() => copyTextSafe(MANUAL_UPDATE_SNIPPET)}
+            >
+              <Icons name="copy" size={12} />
+              <span>{copySnippetLabel}</span>
+            </button>
           </div>
         </div>
       </div>
     </div>
   {:else if !signingKeyReady}
-    <div class="banner banner-warn" style="margin-bottom:14px;">
-      <div style="display:flex;align-items:flex-start;gap:10px;">
+    <div class="banner banner-warn upd-banner-gap">
+      <div class="banner-main">
         <Icons name="alert" size={16} />
-        <div style="font-size:12.5px;">{t.update.signingKeyMissingWarn}</div>
+        <div style="font-size:12.5px;min-width:0;flex:1;">
+          <div>{t.update.signingKeyMissingWarn}</div>
+          <div class="upd-snippet-box">
+            <pre class="mono upd-snippet-pre">{MANUAL_UPDATE_SNIPPET}</pre>
+            <button
+              type="button"
+              class="btn btn-xs"
+              onclick={() => copyTextSafe(MANUAL_UPDATE_SNIPPET)}
+            >
+              <Icons name="copy" size={12} />
+              <span>{copySnippetLabel}</span>
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   {/if}
 
-  <form onsubmit={startUploadUpdate}>
+  <div class="upd-step-strip" aria-hidden="true">
+    {#each uploadStepLabels as stepLabel, idx (stepLabel)}
+      <span class="upd-step-pill" class:done={(idx === 0 && Boolean(selectedFile)) || (idx === 1 && Boolean(updateSignature.trim())) || (idx === 2 && Boolean(expectedSha256.trim()))}>
+        {#if (idx === 0 && Boolean(selectedFile)) || (idx === 1 && Boolean(updateSignature.trim())) || (idx === 2 && Boolean(expectedSha256.trim()))}
+          <Icons name="check" size={12} />
+        {/if}
+        <span>{stepLabel}</span>
+      </span>
+    {/each}
+  </div>
+
+  <form onsubmit={startUploadUpdate} class:upd-form-locked={uploadLocked}>
     <div class="field">
       <label for="upd-file">{t.update.selectArchive}</label>
       <input
@@ -454,13 +548,15 @@
         id="upd-file"
         type="file"
         accept=".tar.gz,.tgz,application/gzip,application/x-gzip"
-        disabled={uploading || !manualUploadEnabled || !signingKeyReady}
+        disabled={uploading || uploadLocked}
         onchange={handleFileChange}
         required
       />
       {#if selectedFile}
-        <div class="mono" style="font-size:12px;color:var(--text-secondary);margin-top:6px;">
-          {selectedFile.name} · {formatMB(selectedFile.size)}
+        <div class="upd-file-pill mono">
+          <Icons name="check" size={13} />
+          <span class="upd-file-name">{selectedFile.name}</span>
+          <span class="upd-file-size">{formatMB(selectedFile.size)}</span>
         </div>
       {/if}
     </div>
@@ -470,16 +566,16 @@
       <input
         id="upd-sig"
         type="text"
-        class="mono"
-        style="font-size:12px;"
+        class="mono upd-mono-input"
         placeholder={t.update.signaturePh}
-        disabled={uploading || !manualUploadEnabled || !signingKeyReady}
+        autocomplete="off"
+        spellcheck="false"
+        autocapitalize="off"
+        disabled={uploading || uploadLocked}
         bind:value={updateSignature}
         required
       />
-      <div style="font-size:11.5px;color:var(--text-muted);margin-top:4px;">
-        {t.update.signatureHint}
-      </div>
+      <div class="field-hint">{t.update.signatureHint}</div>
     </div>
 
     <div class="field">
@@ -487,43 +583,45 @@
       <textarea
         id="upd-sha"
         rows="2"
-        class="mono"
-        style="font-size:12px;"
+        class="mono upd-mono-input"
         placeholder={t.update.expectedShaPh}
-        disabled={uploading || !manualUploadEnabled || !signingKeyReady}
+        autocomplete="off"
+        spellcheck="false"
+        autocapitalize="off"
+        disabled={uploading || uploadLocked}
         bind:value={expectedSha256}
       ></textarea>
-      <div style="font-size:11.5px;color:var(--text-muted);margin-top:4px;">
-        {t.update.expectedShaHint}
-      </div>
+      <div class="field-hint">{t.update.expectedShaHint}</div>
     </div>
 
     {#if uploadError}
-      <div class="banner banner-danger" style="margin-bottom:14px;">
-        <Icons name="alert" size={16} />
-        <div style="font-size:12.5px;word-break:break-word;">{uploadError}</div>
+      <div class="banner banner-danger upd-banner-gap">
+        <div class="banner-main">
+          <Icons name="alert" size={16} />
+          <div style="font-size:12.5px;min-width:0;flex:1;word-break:break-word;">{uploadError}</div>
+        </div>
       </div>
     {/if}
 
     {#if uploadResult}
-      <div class="banner banner-ok" style="margin-bottom:14px;display:block;">
-        <div style="display:flex;align-items:center;gap:8px;font-weight:700;margin-bottom:8px;">
+      <div class="banner banner-ok upd-banner-gap" style="display:block;">
+        <div style="display:flex;align-items:center;gap:8px;font-weight:700;margin-bottom:8px;flex-wrap:wrap;">
           <Icons name="check" size={16} />
           <span>{t.update.uploadSuccessTitle}: v{uploadResult.previous_version} → v{uploadResult.new_version} ({uploadResult.os}/{uploadResult.arch})</span>
         </div>
-        <div class="mono" style="font-size:12px;color:var(--text-secondary);display:grid;gap:4px;">
-          <div>{t.update.installedPath}: {uploadResult.executable_path}</div>
-          <div>{t.update.backupPath}: {uploadResult.backup_path}</div>
+        <div class="mono upd-result-paths">
+          <div>{t.update.installedPath}: <span class="upd-path-val">{uploadResult.executable_path}</span></div>
+          <div>{t.update.backupPath}: <span class="upd-path-val">{uploadResult.backup_path}</span></div>
         </div>
         <div style="margin-top:10px;font-size:12.5px;font-weight:600;color:var(--text-primary);">
           {t.update.restartNotice}
         </div>
         <div class="btn-group" style="margin-top:8px;">
-          <button type="button" class="btn btn-xs" onclick={() => copyTextSafe('/etc/init.d/vane restart')}>
+          <button type="button" class="btn btn-sm" onclick={() => copyTextSafe('/etc/init.d/vane restart')}>
             <Icons name="copy" size={12} />
             <span class="mono">/etc/init.d/vane restart</span>
           </button>
-          <button type="button" class="btn btn-xs" onclick={() => copyTextSafe('systemctl restart vane')}>
+          <button type="button" class="btn btn-sm" onclick={() => copyTextSafe('systemctl restart vane')}>
             <Icons name="copy" size={12} />
             <span class="mono">systemctl restart vane</span>
           </button>
@@ -531,14 +629,14 @@
       </div>
     {/if}
 
-    <div class="row-between" style="flex-wrap:wrap;gap:10px;">
-      <div style="font-size:12px;color:var(--text-muted);">
+    <div class="row-between upd-submit-bar">
+      <div style="font-size:12px;color:var(--text-muted);flex:1;min-width:200px;">
         {t.update.reauthRequiredNote}
       </div>
       <button
         type="submit"
-        class="btn btn-primary btn-sm"
-        disabled={!manualUploadEnabled || !signingKeyReady || !selectedFile || !updateSignature.trim() || uploading || (status && !status.executable_writable)}
+        class="btn btn-primary btn-sm upd-submit-btn"
+        disabled={uploadLocked || !selectedFile || !updateSignature.trim() || uploading || (status && !status.executable_writable)}
       >
         <Icons name="shield" size={14} />
         <span>{uploading ? t.update.uploading : t.update.verifyAndUpload}</span>
@@ -546,3 +644,172 @@
     </div>
   </form>
 </div>
+
+<style>
+  .upd-banner-gap {
+    margin-bottom: 14px;
+  }
+  .upd-icon-inline {
+    display: inline-flex;
+    align-items: center;
+  }
+  .upd-meta-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .upd-meta-card {
+    min-width: 0;
+  }
+  .upd-release-card {
+    margin-bottom: 16px;
+  }
+  .upd-release-card.has-update {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border-subtle));
+    background: color-mix(in srgb, var(--accent-soft) 35%, var(--bg-elevated));
+  }
+  .upd-ver-jump {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13.5px;
+    font-weight: 700;
+  }
+  .upd-ver-old {
+    color: var(--text-muted);
+    font-weight: 500;
+  }
+  .upd-ver-new {
+    color: var(--accent);
+  }
+  .upd-asset-row {
+    margin-bottom: 10px;
+    min-width: 0;
+  }
+  .upd-asset-chip {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 3px 9px;
+    border-radius: 8px;
+    font-size: 11.5px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+  }
+  .upd-dimmed {
+    opacity: 0.72;
+  }
+  .upd-snippet-box {
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .upd-snippet-pre {
+    width: 100%;
+    margin: 0;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-primary);
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .upd-step-strip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+  }
+  .upd-step-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 11.5px;
+    font-weight: 600;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-secondary);
+  }
+  .upd-step-pill.done {
+    background: var(--accent-soft);
+    border-color: color-mix(in srgb, var(--accent) 30%, transparent);
+    color: var(--accent);
+  }
+  .upd-form-locked {
+    opacity: 0.78;
+  }
+  .upd-file-pill {
+    margin-top: 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    padding: 4px 10px;
+    border-radius: 10px;
+    background: var(--accent-soft);
+    border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
+    color: var(--accent);
+    font-size: 12px;
+  }
+  .upd-file-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .upd-file-size {
+    flex-shrink: 0;
+    color: var(--text-secondary);
+  }
+  .upd-mono-input {
+    font-size: 12.5px;
+  }
+  .upd-result-paths {
+    font-size: 12px;
+    color: var(--text-secondary);
+    display: grid;
+    gap: 4px;
+  }
+  .upd-path-val {
+    word-break: break-all;
+    overflow-wrap: anywhere;
+  }
+  .upd-submit-bar {
+    gap: 10px;
+    margin-top: 4px;
+  }
+  @media (max-width: 920px) {
+    .upd-mono-input {
+      font-size: 16px;
+    }
+  }
+  @media (max-width: 640px) {
+    .upd-meta-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    .upd-meta-card-wide {
+      grid-column: 1 / -1;
+    }
+    .upd-release-actions {
+      width: 100%;
+    }
+    .upd-release-actions :global(.btn) {
+      flex: 1 1 auto;
+    }
+    .upd-submit-btn {
+      width: 100%;
+    }
+  }
+</style>

@@ -259,7 +259,7 @@ impl Default for AdminConfig {
         Self {
             listen_lan: vec!["192.168.1.1:23456".into()],
             canonical_origin: "https://192.168.1.1:23456".into(),
-            secret_path: SECRET_PATH_PLACEHOLDER.into(),
+            secret_path: "/".into(),
             username: "admin".into(),
             must_change_password: true,
             password_login_enabled: true,
@@ -2595,6 +2595,7 @@ mod tests {
         let c = Config::default();
         c.validate().unwrap();
         assert_eq!(c.admin.listen_lan, vec!["192.168.1.1:23456".to_string()]);
+        assert_eq!(c.admin.secret_path, "/");
         assert_eq!(c.admin.username, "admin");
         assert!(c.admin.must_change_password);
         assert_eq!(c.admin.session_ttl_secs, 3600);
@@ -2667,12 +2668,22 @@ mod tests {
         let out = load_or_init(&p).unwrap();
         assert!(out.created && out.dirty);
         assert!(out.config.admin.must_change_password);
-        assert_ne!(out.config.admin.secret_path, SECRET_PATH_PLACEHOLDER);
+        assert_eq!(out.config.admin.secret_path, "/");
         let h = crate::security::auth::PasswordHash::parse(&out.config.admin.password_hash).unwrap();
         assert!(h.verify(b"admin321"));
         save_config(&p, &out.config).unwrap();
         let again = load_or_init(&p).unwrap();
         assert!(!again.dirty);
+        assert_eq!(again.config.admin.secret_path, "/");
+
+        // 显式写入占位符仍兼容自动生成 16 位随机安全路径
+        let mut with_placeholder = again.config.clone();
+        with_placeholder.admin.secret_path = SECRET_PATH_PLACEHOLDER.into();
+        save_config(&p, &with_placeholder).unwrap();
+        let upgraded = load_or_init(&p).unwrap();
+        assert!(upgraded.dirty);
+        assert_ne!(upgraded.config.admin.secret_path, SECRET_PATH_PLACEHOLDER);
+        assert!(upgraded.config.admin.secret_path.starts_with("/_vane_"));
         fs::remove_dir_all(&d).unwrap();
     }
 

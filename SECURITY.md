@@ -12,7 +12,7 @@ Vane 运行于路由器边界并管理公网端口防火墙，安全是最高优
 
 - 管理监听使用 TLS（管理证书采用世代目录原子切换），Cookie 带有 `HttpOnly`、`Secure` 与 `SameSite=Strict`。
 - 明文 GET/HEAD 只跳转至配置的 HTTPS Origin，不拼接客户端 Host；明文写请求不进入管理 API。
-- Host/Origin 白名单检查覆盖管理请求，写操作与 WebSocket 缺少 Origin 时拒绝；`secret_path` 门禁先校验 Fail2Ban 封禁状态再匹配路径，且仅首次初始化向 `stderr` 打印明文路径。
+- Host/Origin 白名单检查覆盖管理请求，写操作与 WebSocket 缺少 Origin 时拒绝；可选启用 `secret_path` 安全入口路径（默认 `"/"`），开启后先校验 Fail2Ban 封禁状态再匹配路径，且仅首次初始化/待改密时向 `stderr` 打印明文路径。
 - 登录防爆破使用实际 TCP 对端（不可经 `X-Real-IP`/`X-Forwarded-For` 伪造），管理面/`secret_path` 与反向代理门户 `Fail2Ban` 按信任域完全隔离，表满且未确认内核卸载时 Fail-Closed 拒绝新请求。
 - Step-Up 二次认证（`REAUTH_REQUIRED` / `MFA_REAUTH_REQUIRED`）：启用 TOTP 或 Passkey 后，备份导出/导入（含安全基线降级 `409` 二次确认）、TOTP/Passkey 因子增删开关与恢复码重置、模块二次认证关闭、手动更新及管理面敏感配置修改均强制强因子（MFA）参与；恢复码消费与生成已完成并发加锁并移出耗时 PBKDF2 持锁区间。
 - 静态资源仅来自构建清单，拒绝路径穿越；未知 API 不回退到单页应用；Svelte 5 前端无 `{@html}` / `innerHTML` / `eval` 等不安全 DOM 注入点。

@@ -32,7 +32,7 @@ docker = false
 # 默认仅绑定局域网地址并自动启用 HTTPS（首次启动自动生成本地自签 ECDSA 证书或复用 ACME 证书）
 listen_lan = ["192.168.1.1:23456"]
 canonical_origin = "https://192.168.1.1:23456"
-secret_path = "/_vane_init_change_me"  # 首次引导时自动替换为 16 位随机安全路径
+secret_path = "/"                      # 默认关闭（直接访问根路径 /）；需防扫描或公网访问时可设为 /<8位以上路径> 或在 Web 设置页一键开启
 username = "admin"                     # 全局唯一管理员（默认用户名可不修改，不做多用户管理）
 # 1) 初次部署默认密码为 "admin321"，must_change_password = true 强制登录后硬步骤改密：
 #    新密码需 >= 8 位且包含英文字母 + 数字/符号之一；未改密或仍为 "admin321" 时禁止跳过进入管理页面！

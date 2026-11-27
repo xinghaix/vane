@@ -1,6 +1,6 @@
 [package]
 name = "vane"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "面向资源受限路由器的高安全双栈全能网关"
 license = "GPL-3.0-or-later"

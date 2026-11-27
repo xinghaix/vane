@@ -30,6 +30,10 @@
   let menuStyle = $state('');
   let openUp = $state(false);
 
+  function isZh() {
+    return typeof document !== 'undefined' && (document.documentElement.lang || '').toLowerCase().startsWith('zh');
+  }
+
   let normalized = $derived(
     (options || []).map((opt) =>
       opt !== null && typeof opt === 'object'
@@ -81,16 +85,27 @@
     };
   }
 
+  function getViewport() {
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+    return {
+      vw: vv?.width || window.innerWidth,
+      vh: vv?.height || window.innerHeight,
+      offsetTop: vv?.offsetTop || 0,
+      offsetLeft: vv?.offsetLeft || 0,
+    };
+  }
+
   function updatePosition() {
     if (!wrapEl) return;
     const rect = wrapEl.getBoundingClientRect();
-    const vw = window.innerWidth;
-    const vh = window.innerHeight;
+    const { vw, vh, offsetTop, offsetLeft } = getViewport();
     const width = Math.min(Math.max(rect.width, 200), vw - 16);
-    const left = Math.max(8, Math.min(rect.left, vw - width - 8));
+    const left = Math.max(8 + offsetLeft, Math.min(rect.left, offsetLeft + vw - width - 8));
     const estH = Math.min(300, Math.max(64, filteredOptions.length * 42 + (multiple ? 52 : 16)));
-    const spaceBelow = vh - rect.bottom - 12;
-    const spaceAbove = rect.top - 12;
+    const topEdge = offsetTop + 10;
+    const bottomEdge = offsetTop + vh - 10;
+    const spaceBelow = bottomEdge - rect.bottom - 6;
+    const spaceAbove = rect.top - topEdge - 6;
 
     if (spaceBelow >= estH || spaceBelow >= spaceAbove) {
       openUp = false;
@@ -99,7 +114,7 @@
     } else {
       openUp = true;
       const maxH = Math.min(300, Math.max(120, spaceAbove));
-      menuStyle = `bottom:${Math.round(vh - rect.top + 6)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${Math.round(maxH)}px;`;
+      menuStyle = `bottom:${Math.round(window.innerHeight - rect.top + 6)}px;left:${Math.round(left)}px;width:${Math.round(width)}px;max-height:${Math.round(maxH)}px;`;
     }
   }
 
@@ -218,11 +233,15 @@
     window.addEventListener('keydown', onKeyDownCapture, true);
     window.addEventListener('resize', onResize);
     window.addEventListener('scroll', onScroll, true);
+    window.visualViewport?.addEventListener('resize', onResize);
+    window.visualViewport?.addEventListener('scroll', onResize);
     return () => {
       window.removeEventListener('pointerdown', onPointerDown, true);
       window.removeEventListener('keydown', onKeyDownCapture, true);
       window.removeEventListener('resize', onResize);
       window.removeEventListener('scroll', onScroll, true);
+      window.visualViewport?.removeEventListener('resize', onResize);
+      window.visualViewport?.removeEventListener('scroll', onResize);
     };
   });
 </script>
@@ -236,6 +255,7 @@
     aria-autocomplete="list"
     aria-expanded={open}
     aria-controls={open ? `${uid}-list` : undefined}
+    aria-activedescendant={open && activeIdx >= 0 ? `${uid}-opt-${activeIdx}` : undefined}
     aria-label={ariaLabel}
     class="{mono ? 'mono' : ''} {normalized.length > 0 ? 'vcombo-has-toggle' : ''}"
     {placeholder}
@@ -253,7 +273,7 @@
       class="vcombo-toggle {open ? 'open' : ''}"
       tabindex="-1"
       {disabled}
-      aria-label="Toggle suggestions"
+      aria-label={isZh() ? '展开或收起建议列表' : 'Toggle suggestions'}
       onclick={toggleMenu}
     >
       <Icons name="chevron" size={15} />
@@ -275,7 +295,7 @@
           <input
             type="text"
             class="vcombo-search mono"
-            placeholder="Filter..."
+            placeholder={isZh() ? '筛选选项…' : 'Filter options...'}
             bind:value={menuSearch}
             onkeydown={(e) => {
               if (e.key === 'Escape') {
@@ -287,12 +307,13 @@
         </div>
       {/if}
       {#if filteredOptions.length === 0}
-        <div class="vcombo-empty">—</div>
+        <div class="vcombo-empty">{isZh() ? '无匹配选项' : 'No matching options'}</div>
       {:else}
         {#each filteredOptions as opt, idx (opt.value)}
           {@const selected = selectedSet.has(opt.value)}
           <button
             type="button"
+            id={`${uid}-opt-${idx}`}
             role="option"
             data-opt-idx={idx}
             aria-selected={selected}

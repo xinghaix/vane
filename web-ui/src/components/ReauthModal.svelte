@@ -19,6 +19,7 @@
     onCancel,
   } = $props();
 
+  let cardEl = $state(null);
   let loadingOpts = $state(false);
   let busy = $state(false);
   let errorMsg = $state('');
@@ -119,11 +120,12 @@
       onDismiss: () => {
         if (!busy) onCancel?.();
       },
+      trapContainer: () => cardEl,
     });
   });
 
   function autofocus(node) {
-    queueMicrotask(() => node.focus());
+    queueMicrotask(() => node.focus({ preventScroll: true }));
   }
 
   async function submitPassword(e) {
@@ -225,19 +227,25 @@
       if (e.target === e.currentTarget && !busy) onCancel?.();
     }}
   >
-    <div class="modal-card" style="max-width:460px;" role="dialog" aria-modal="true" aria-labelledby="reauth-modal-title">
-      <div class="row-between" style="margin-bottom:8px;">
-        <div style="display:flex;align-items:center;gap:10px;min-width:0;">
-          <div
-            style="width:36px;height:36px;border-radius:10px;display:grid;place-items:center;flex-shrink:0;background:var(--accent-soft);color:var(--accent);"
-          >
+    <div
+      bind:this={cardEl}
+      class="modal-card"
+      style="max-width:460px;"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="reauth-modal-title"
+      tabindex="-1"
+    >
+      <div class="row-between" style="margin-bottom:10px;flex-wrap:nowrap;">
+        <div style="display:flex;align-items:center;gap:11px;min-width:0;flex:1;">
+          <div class="icon-tile" style="width:36px;height:36px;border-radius:11px;">
             <Icons name="shield" size={18} />
           </div>
-          <h3 id="reauth-modal-title" style="font-size:16px;font-weight:700;">
+          <h3 id="reauth-modal-title" style="font-size:16px;font-weight:700;line-height:1.3;min-width:0;">
             {title || t.reauth.defaultTitle}
           </h3>
         </div>
-        <button type="button" class="btn btn-ghost btn-xs" disabled={busy} aria-label={t.close} onclick={() => onCancel?.()}>
+        <button type="button" class="btn btn-ghost btn-icon btn-icon-sm" disabled={busy} aria-label={t.close} onclick={() => onCancel?.()}>
           <Icons name="x" size={16} />
         </button>
       </div>
@@ -247,12 +255,13 @@
       {/if}
 
       {#if loadingOpts}
-        <div class="subcard" style="text-align:center;color:var(--text-secondary);font-size:13px;padding:18px;">
-          {t.common.loading}
+        <div class="subcard" style="display:flex;align-items:center;justify-content:center;gap:8px;color:var(--text-secondary);font-size:13px;padding:20px;">
+          <Icons name="loader" size={15} class="is-spinning" />
+          <span>{t.common.loading}</span>
         </div>
       {:else}
         {#if mfaEnforced && availableMethods.length > 0}
-          <div class="banner banner-info" style="margin-bottom:12px;padding:8px 11px;font-size:12px;">
+          <div class="inline-alert inline-alert-info" style="margin-bottom:12px;">
             <Icons name="shield" size={14} />
             <span>{t.reauth.mfaRequiredHint}</span>
           </div>
@@ -300,7 +309,7 @@
         {/if}
 
         {#if errorMsg}
-          <div role="alert" class="badge badge-danger" style="width:100%;padding:9px 12px;border-radius:10px;margin-bottom:12px;white-space:normal;">
+          <div role="alert" class="inline-alert inline-alert-danger" style="margin-bottom:12px;">
             <Icons name="alert" size={15} />
             <span>{errorMsg}</span>
           </div>
@@ -308,19 +317,23 @@
 
         {#if method === 'passkey' && hasUsablePasskey}
           <div class="subcard" style="text-align:center;padding:18px 14px;margin-bottom:14px;">
-            <div style="width:44px;height:44px;border-radius:12px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;margin:0 auto 10px;">
+            <div class="icon-tile" style="width:44px;height:44px;border-radius:12px;margin:0 auto 10px;">
               <Icons name="passkey" size={22} />
             </div>
             <div style="font-size:13.5px;font-weight:600;margin-bottom:4px;">{t.reauth.passkeyReadyTitle}</div>
-            <div style="font-size:12px;color:var(--text-secondary);">
+            <div style="font-size:12px;color:var(--text-secondary);line-height:1.45;">
               {passkeyHint || t.reauth.passkeyReadyDesc}
             </div>
           </div>
-          <div style="display:flex;justify-content:flex-end;gap:10px;">
+          <div class="modal-actions">
             <button type="button" class="btn btn-sm" disabled={busy} onclick={() => onCancel?.()}>{t.cancel}</button>
             <button type="button" class="btn btn-primary btn-sm" disabled={busy} onclick={() => submitPasskey(false)}>
-              <Icons name="passkey" size={15} />
-              <span>{busy ? '...' : (actionLabel || t.reauth.verifyPasskeyBtn)}</span>
+              {#if busy}
+                <Icons name="loader" size={14} class="is-spinning" />
+              {:else}
+                <Icons name="passkey" size={15} />
+              {/if}
+              <span>{actionLabel || t.reauth.verifyPasskeyBtn}</span>
             </button>
           </div>
         {:else if method === 'totp' && hasUsableTotp}
@@ -332,20 +345,23 @@
                 id="reauth-totp"
                 name="otp"
                 type="text"
-                class="mono"
+                class="mono otp-input"
                 inputmode="numeric"
                 maxlength="6"
                 pattern="[0-9]{6}"
                 autocomplete="one-time-code"
-                placeholder="123456"
+                placeholder="000000"
                 bind:value={totpCode}
                 required
               />
             </div>
-            <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:16px;">
+            <div class="modal-actions">
               <button type="button" class="btn btn-sm" disabled={busy} onclick={() => onCancel?.()}>{t.cancel}</button>
               <button type="submit" class="btn btn-primary btn-sm" disabled={busy || totpCode.trim().length < 6}>
-                {busy ? '...' : (actionLabel || t.reauth.verifyBtn)}
+                {#if busy}
+                  <Icons name="loader" size={14} class="is-spinning" />
+                {/if}
+                <span>{actionLabel || t.reauth.verifyBtn}</span>
               </button>
             </div>
           </form>
@@ -364,13 +380,13 @@
             />
             <div class="field">
               <label for="reauth-pw">{t.reauth.passwordLabel}</label>
-              <div style="position:relative;display:flex;align-items:center;">
+              <div class="input-wrap">
                 <input
                   use:autofocus
                   id="reauth-pw"
                   name="password"
                   type={showPassword ? 'text' : 'password'}
-                  style="padding-right:42px;"
+                  class="has-addon"
                   autocomplete="current-password"
                   placeholder={t.passwordPlaceholder}
                   bind:value={password}
@@ -378,31 +394,37 @@
                 />
                 <button
                   type="button"
-                  class="btn btn-ghost btn-xs"
-                  style="position:absolute;right:6px;min-height:28px;padding:0 6px;"
+                  class="input-addon-btn"
                   aria-label={t.common.toggleSecret}
+                  aria-pressed={showPassword}
                   onclick={() => (showPassword = !showPassword)}
                 >
                   <Icons name={showPassword ? 'eye_off' : 'eye'} size={15} />
                 </button>
               </div>
             </div>
-            <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:16px;">
+            <div class="modal-actions">
               <button type="button" class="btn btn-sm" disabled={busy} onclick={() => onCancel?.()}>{t.cancel}</button>
               <button type="submit" class="btn btn-primary btn-sm" disabled={busy || !password}>
-                {busy ? '...' : (actionLabel || t.reauth.verifyBtn)}
+                {#if busy}
+                  <Icons name="loader" size={14} class="is-spinning" />
+                {/if}
+                <span>{actionLabel || t.reauth.verifyBtn}</span>
               </button>
             </div>
           </form>
         {:else}
-          <div class="banner banner-warn" style="margin-bottom:14px;">
-            {#if mfaEnforced}
-              {passkeyReason ? `${t.reauth.mfaUnavailableHint} (${passkeyReason})` : t.reauth.mfaUnavailableHint}
-            {:else}
-              {passkeyReason || (lang === 'en' ? 'No interactive re-auth method is currently available on this origin.' : '当前访问地址下暂无可用的二次验证方式，请在安全设置中开启密码、TOTP 或使用域名访问以启用通行密钥。')}
-            {/if}
+          <div class="inline-alert inline-alert-warn" style="margin-bottom:14px;">
+            <Icons name="alert" size={15} />
+            <span>
+              {#if mfaEnforced}
+                {passkeyReason ? `${t.reauth.mfaUnavailableHint} (${passkeyReason})` : t.reauth.mfaUnavailableHint}
+              {:else}
+                {passkeyReason || (lang === 'en' ? 'No interactive re-auth method is currently available on this origin.' : '当前访问地址下暂无可用的二次验证方式，请在安全设置中开启密码、TOTP 或使用域名访问以启用通行密钥。')}
+              {/if}
+            </span>
           </div>
-          <div style="display:flex;justify-content:flex-end;">
+          <div class="modal-actions">
             <button type="button" class="btn btn-sm" onclick={() => onCancel?.()}>{t.close}</button>
           </div>
         {/if}

@@ -1,6 +1,7 @@
 <script>
   import { I18N } from './lib/i18n.js';
   import { localizeError } from './lib/helpers.js';
+  import { registerOverlay } from './lib/overlay.js';
   import { getPwaState, initPwaListeners, promptPwaInstall, subscribePwaState } from './lib/pwa.js';
   import Icons from './components/Icons.svelte';
   import ToastStack from './components/ToastStack.svelte';
@@ -100,7 +101,11 @@
   let userMenuOpen = $state(false);
   let userBtnEl = $state(null);
   let mobileUserBtnEl = $state(null);
+  let userPopoverEl = $state(null);
   let userMenuStyle = $state('');
+  let sidebarScrollEl = $state(null);
+  let sidebarCanScrollTop = $state(false);
+  let sidebarCanScrollBottom = $state(false);
   let sidebarFlyout = $state(null);
   let activeTab = $state(initHash.tab);
   let settingsSubTab = $state(initHash.sub);
@@ -230,34 +235,254 @@
   let navItems = $derived(navGroups.flatMap((g) => g.items));
 
   let settingsSubItems = $derived([
-    { id: 'general', icon: 'sliders', label: t.cfg.tabGeneral },
-    { id: 'appearance', icon: 'palette', label: t.cfg.tabAppearance },
-    { id: 'security', icon: 'shield', label: t.cfg.tabSecurity },
-    { id: 'notifications', icon: 'bell', label: t.cfg.tabNotifications },
-    { id: 'backup', icon: 'database', label: t.cfg.tabBackup },
-    { id: 'update', icon: 'refresh', label: t.cfg.tabUpdate },
+    { id: 'general', icon: 'sliders', label: t.cfg.tabGeneral, shortLabel: t.cfg.tabGeneral },
+    { id: 'appearance', icon: 'palette', label: t.cfg.tabAppearance, shortLabel: t.cfg.tabAppearance },
+    { id: 'security', icon: 'shield', label: t.cfg.tabSecurity, shortLabel: t.cfg.tabSecurityShort || t.cfg.tabSecurity },
+    { id: 'notifications', icon: 'bell', label: t.cfg.tabNotifications, shortLabel: t.cfg.tabNotifications },
+    { id: 'backup', icon: 'database', label: t.cfg.tabBackup, shortLabel: t.cfg.tabBackup },
+    { id: 'update', icon: 'refresh', label: t.cfg.tabUpdate, shortLabel: t.cfg.tabUpdate },
   ]);
 
   let mobileScrollItems = $derived(navItems.filter((n) => n.id !== 'settings'));
+  let appVersionLabel = $derived.by(() => {
+    const raw = String(dashboard?.version || '').trim();
+    if (!raw) return 'v0.1.0';
+    return raw.startsWith('v') ? raw : `v${raw}`;
+  });
 
-  function updateDockScrollState() {
+  function updateSidebarScrollState() {
+    const el = sidebarScrollEl;
+    if (!el) {
+      sidebarCanScrollTop = false;
+      sidebarCanScrollBottom = false;
+      return;
+    }
+    sidebarCanScrollTop = el.scrollTop > 4;
+    sidebarCanScrollBottom = el.scrollTop + el.clientHeight < el.scrollHeight - 4;
+  }
+
+  $effect(() => {
+    const _open = settingsMenuOpen;
+    const _collapsed = sidebarCollapsed;
+    const _len = navItems.length;
+    const el = sidebarScrollEl;
+    if (!el) return;
+    queueMicrotask(() => {
+      if (_open && !_collapsed) {
+        const subList = el.querySelector('.nav-sub-list');
+        subList?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
+      updateSidebarScrollState();
+    });
+    const onResize = () => updateSidebarScrollState();
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  });
+
+  let dockDragging = $state(false);
+  let dockGlideEl = $state(null);
+  let dockPointerId = null;
+  let dockDragStartX = 0;
+  let dockDragStartScroll = 0;
+  let dockLastMoveX = 0;
+  let dockLastMoveTs = 0;
+  let dockVelX = 0;
+  let dockJustDragged = false;
+  let dockLensRaf = 0;
+  let dockInertiaRaf = 0;
+  let dockGlideInitialized = false;
+
+  function prefersReducedMotion() {
+    return typeof window !== 'undefined' && Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches);
+  }
+
+  function stopDockInertia() {
+    if (dockInertiaRaf) {
+      cancelAnimationFrame(dockInertiaRaf);
+      dockInertiaRaf = 0;
+    }
+  }
+
+  function applyDockLensNow() {
     const el = mobileDockScrollEl;
     if (!el) {
       dockCanScrollLeft = false;
       dockCanScrollRight = false;
       return;
     }
-    dockCanScrollLeft = el.scrollLeft > 4;
-    dockCanScrollRight = el.scrollLeft + el.clientWidth < el.scrollWidth - 4;
+    const viewW = el.clientWidth;
+    const scrollW = el.scrollWidth;
+    const scrollL = el.scrollLeft;
+    const maxScroll = Math.max(0, scrollW - viewW);
+
+    dockCanScrollLeft = scrollL > 4;
+    dockCanScrollRight = maxScroll > 4 && scrollL < maxScroll - 4;
+
+    if (viewW <= 0) return;
+    const reduced = prefersReducedMotion();
+    const scrollable = maxScroll > 4;
+    // 边界感知衰减：在最左端不压暗首项，在最右端不压暗末项，仅向有隐藏菜单的边缘柔和收束
+    const leftAtten = scrollable ? Math.min(1, scrollL / 36) : 0;
+    const rightAtten = scrollable ? Math.min(1, (maxScroll - scrollL) / 36) : 0;
+    const halfW = Math.max(1, viewW / 2);
+
+    const items = el.querySelectorAll('.dock-scroll-item');
+    for (const btn of items) {
+      const centerInView = btn.offsetLeft + btn.offsetWidth / 2 - scrollL;
+      const signed = (centerInView - halfW) / halfW;
+      const absDist = Math.min(1.15, Math.abs(signed));
+      const atten = signed < 0 ? leftAtten : rightAtten;
+      const edgeT = Math.max(0, absDist - 0.2) / 0.8;
+      const falloff = Math.pow(edgeT, 1.55) * atten;
+
+      let scale = reduced ? 1 : scrollable ? 1.02 - falloff * 0.16 : 1;
+      let opacity = scrollable ? 1 - falloff * 0.56 : 1;
+      if (btn.dataset.dockId === activeTab) {
+        scale = Math.max(scale, reduced ? 1 : 0.96);
+        opacity = Math.max(opacity, 0.88);
+      }
+      btn.style.transform = reduced ? '' : `scale(${scale.toFixed(3)})`;
+      btn.style.opacity = opacity.toFixed(3);
+    }
+  }
+
+  function scheduleDockLensUpdate() {
+    if (dockLensRaf) return;
+    dockLensRaf = requestAnimationFrame(() => {
+      dockLensRaf = 0;
+      applyDockLensNow();
+    });
+  }
+
+  function positionDockGlidePill(animate = true) {
+    const el = mobileDockScrollEl;
+    const pill = dockGlideEl;
+    if (!el || !pill) return;
+    const btn = activeTab !== 'settings' ? el.querySelector(`[data-dock-id="${activeTab}"]`) : null;
+    if (!btn) {
+      pill.style.opacity = '0';
+      return;
+    }
+    const useAnim = animate && dockGlideInitialized && !prefersReducedMotion();
+    if (!useAnim) pill.style.transition = 'none';
+    pill.style.opacity = '1';
+    pill.style.width = `${btn.offsetWidth}px`;
+    pill.style.transform = `translateX(${btn.offsetLeft}px)`;
+    if (!useAnim) {
+      pill.getBoundingClientRect();
+      pill.style.transition = '';
+    }
+    dockGlideInitialized = true;
   }
 
   function handleDockWheel(e) {
     const el = mobileDockScrollEl;
     if (!el || el.scrollWidth <= el.clientWidth) return;
+    stopDockInertia();
     if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
       e.preventDefault();
-      el.scrollBy({ left: e.deltaY, behavior: 'smooth' });
+      el.scrollLeft += e.deltaY;
+      scheduleDockLensUpdate();
     }
+  }
+
+  function handleDockPointerDown(e) {
+    // 真实触屏走浏览器原生惯性横滑（touch-action: pan-x）；鼠标/触控笔支持按住拖拽 + 惯性滑行
+    if (e.pointerType === 'touch' || e.button !== 0) return;
+    const el = mobileDockScrollEl;
+    if (!el || el.scrollWidth <= el.clientWidth) return;
+    stopDockInertia();
+    dockPointerId = e.pointerId;
+    dockDragStartX = e.clientX;
+    dockDragStartScroll = el.scrollLeft;
+    dockLastMoveX = e.clientX;
+    dockLastMoveTs = performance.now();
+    dockVelX = 0;
+    dockDragging = false;
+    dockJustDragged = false;
+  }
+
+  function handleDockPointerMove(e) {
+    if (dockPointerId === null || e.pointerId !== dockPointerId) return;
+    const el = mobileDockScrollEl;
+    if (!el) return;
+    const dx = e.clientX - dockDragStartX;
+    const now = performance.now();
+    const dt = Math.max(4, now - dockLastMoveTs);
+    const stepDx = e.clientX - dockLastMoveX;
+    const instV = (stepDx / dt) * 16;
+    dockVelX = dockVelX * 0.45 + instV * 0.55;
+    dockLastMoveX = e.clientX;
+    dockLastMoveTs = now;
+
+    if (!dockDragging && Math.abs(dx) >= 6) {
+      dockDragging = true;
+      dockJustDragged = true;
+      try {
+        el.setPointerCapture(e.pointerId);
+      } catch {}
+    }
+    if (dockDragging) {
+      el.scrollLeft = dockDragStartScroll - dx;
+      scheduleDockLensUpdate();
+    }
+  }
+
+  function startDockInertia() {
+    const el = mobileDockScrollEl;
+    if (!el || prefersReducedMotion() || Math.abs(dockVelX) < 1.2) return;
+    stopDockInertia();
+    const step = () => {
+      if (!mobileDockScrollEl) {
+        dockInertiaRaf = 0;
+        return;
+      }
+      const prev = mobileDockScrollEl.scrollLeft;
+      mobileDockScrollEl.scrollLeft = prev - dockVelX;
+      dockVelX *= 0.91;
+      applyDockLensNow();
+      if (Math.abs(dockVelX) >= 0.35 && Math.abs(mobileDockScrollEl.scrollLeft - prev) > 0.1) {
+        dockInertiaRaf = requestAnimationFrame(step);
+      } else {
+        dockInertiaRaf = 0;
+      }
+    };
+    dockInertiaRaf = requestAnimationFrame(step);
+  }
+
+  function endDockDrag(e) {
+    if (dockPointerId === null || (e && e.pointerId !== dockPointerId)) return;
+    const el = mobileDockScrollEl;
+    const wasDragging = dockDragging;
+    if (wasDragging && el) {
+      try {
+        el.releasePointerCapture(dockPointerId);
+      } catch {}
+    }
+    dockPointerId = null;
+    dockDragging = false;
+    if (wasDragging) {
+      const stale = performance.now() - dockLastMoveTs > 90;
+      if (!stale) startDockInertia();
+    }
+    if (dockJustDragged) {
+      setTimeout(() => {
+        dockJustDragged = false;
+      }, 60);
+    }
+  }
+
+  function centerDockItem(id, smooth = true) {
+    const el = mobileDockScrollEl;
+    if (!el || !id || id === 'settings') return;
+    const btn = el.querySelector(`[data-dock-id="${id}"]`);
+    if (!btn) return;
+    stopDockInertia();
+    const targetLeft = btn.offsetLeft - (el.clientWidth - btn.offsetWidth) / 2;
+    const maxLeft = Math.max(0, el.scrollWidth - el.clientWidth);
+    const clamped = Math.max(0, Math.min(maxLeft, targetLeft));
+    const useSmooth = smooth && !prefersReducedMotion();
+    el.scrollTo({ left: clamped, behavior: useSmooth ? 'smooth' : 'auto' });
   }
 
   $effect(() => {
@@ -265,16 +490,33 @@
     const _len = mobileScrollItems.length;
     const el = mobileDockScrollEl;
     if (!el) return;
+    const wasInit = dockGlideInitialized;
     queueMicrotask(() => {
+      positionDockGlidePill(wasInit);
       if (_tab !== 'settings') {
-        const activeBtn = el.querySelector(`[data-dock-id="${_tab}"]`);
-        activeBtn?.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' });
+        centerDockItem(_tab, wasInit);
       }
-      updateDockScrollState();
+      applyDockLensNow();
+      if (!wasInit) {
+        requestAnimationFrame(() => {
+          positionDockGlidePill(false);
+          applyDockLensNow();
+        });
+      }
     });
-    const onResize = () => updateDockScrollState();
+    const onResize = () => {
+      positionDockGlidePill(false);
+      scheduleDockLensUpdate();
+    };
     window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
+    return () => {
+      window.removeEventListener('resize', onResize);
+      stopDockInertia();
+      if (dockLensRaf) {
+        cancelAnimationFrame(dockLensRaf);
+        dockLensRaf = 0;
+      }
+    };
   });
 
   function toggleUserMenu(anchorEl = null, fromTop = false) {
@@ -286,11 +528,11 @@
     if (target) {
       const r = target.getBoundingClientRect();
       if (fromTop) {
-        const top = Math.round(r.bottom + 8);
+        const top = Math.min(Math.round(r.bottom + 8), Math.max(12, window.innerHeight - 280));
         const right = Math.max(12, Math.round(window.innerWidth - r.right));
         userMenuStyle = `top:${top}px;right:${right}px;`;
       } else {
-        const left = Math.min(window.innerWidth - 244, Math.round(r.right + 12));
+        const left = Math.min(window.innerWidth - 260, Math.round(r.right + 12));
         const bottom = Math.max(12, Math.round(window.innerHeight - r.bottom));
         userMenuStyle = `left:${left}px;bottom:${bottom}px;`;
       }
@@ -304,18 +546,20 @@
     if (!userMenuOpen) return;
     const onDown = (e) => {
       if (userBtnEl?.contains(e.target) || mobileUserBtnEl?.contains(e.target)) return;
-      const pop = document.getElementById('vane-user-popover');
-      if (pop?.contains(e.target)) return;
+      if (userPopoverEl?.contains(e.target)) return;
       userMenuOpen = false;
     };
-    const onKey = (e) => {
-      if (e.key === 'Escape') userMenuOpen = false;
-    };
+    const unregister = registerOverlay({
+      onDismiss: () => {
+        userMenuOpen = false;
+      },
+      lockScroll: false,
+      trapContainer: () => userPopoverEl,
+    });
     window.addEventListener('pointerdown', onDown, true);
-    window.addEventListener('keydown', onKey, true);
     return () => {
+      unregister();
       window.removeEventListener('pointerdown', onDown, true);
-      window.removeEventListener('keydown', onKey, true);
     };
   });
 
@@ -748,9 +992,15 @@
   }
 
   async function apiFetch(path, options = {}) {
+    const { headers: optHeaders, ...restOptions } = options;
+    const headers = new Headers(optHeaders || {});
+    const isFormData = typeof FormData !== 'undefined' && restOptions.body instanceof FormData;
+    if (!isFormData && !headers.has('content-type')) {
+      headers.set('Content-Type', 'application/json');
+    }
     const res = await fetch(path, {
-      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-      ...options,
+      ...restOptions,
+      headers,
     });
     const data = await res.json().catch(() => ({}));
     const errCode = extractApiErrorCode(data);
@@ -1300,9 +1550,10 @@
 
 {#if loading}
   <div class="auth-shell">
-    <div class="card" style="display:flex;align-items:center;gap:12px;">
+    <div class="card boot-card">
       <img src="/icon.svg" alt="Vane" class="brand-icon" />
-      <span class="mono" style="font-size:14px;">{t.loadingGateway}</span>
+      <Icons name="loader" size={16} class="is-spinning" />
+      <span class="mono" style="font-size:13.5px;color:var(--text-secondary);">{t.loadingGateway}</span>
     </div>
   </div>
 {:else if !authenticated || mustChangePassword}
@@ -1310,6 +1561,8 @@
     {t}
     {lang}
     {toggleLang}
+    {themeMode}
+    onSelectThemeMode={(m) => (themeMode = m)}
     {authenticated}
     {mustChangePassword}
     {initialSetup}
@@ -1326,7 +1579,9 @@
   />
 {:else}
   {@const activeNav = navItems.find((n) => n.id === activeTab)}
-  {@const activeSubLabel = activeTab === 'settings' ? settingsSubItems.find((s) => s.id === settingsSubTab)?.label : ''}
+  {@const activeSubItem = activeTab === 'settings' ? settingsSubItems.find((s) => s.id === settingsSubTab) : null}
+  {@const activeSubLabel = activeSubItem?.label || ''}
+  {@const hasMobileTopbarControls = (isModuleProtected(activeTab) && !isModuleLocked(activeTab)) || Boolean(dashboard?.firewall)}
   <div class="layout {sidebarCollapsed ? 'sidebar-collapsed' : ''}">
     <!-- 桌面端左侧悬浮玻璃侧边栏（对齐 Arcane 布局：分组导航 + 可展开设置树 + 底部版本/消息圆钮/用户弹框/折叠） -->
     <aside class="sidebar" onmouseleave={hideSidebarFlyout}>
@@ -1340,7 +1595,14 @@
         {/if}
       </div>
 
-      <div class="sidebar-scroll" onscroll={hideSidebarFlyout}>
+      <div
+        bind:this={sidebarScrollEl}
+        class="sidebar-scroll {sidebarCanScrollTop ? 'fade-top' : ''} {sidebarCanScrollBottom ? 'fade-bottom' : ''}"
+        onscroll={() => {
+          hideSidebarFlyout();
+          updateSidebarScrollState();
+        }}
+      >
         {#each navGroups as group, gIdx (group.label)}
           <div class="nav-group-label {gIdx === 0 ? 'first' : ''}">{group.label}</div>
           {#each group.items as item (item.id)}
@@ -1420,10 +1682,12 @@
                   <button
                     type="button"
                     class="nav-sub-btn {activeTab === 'settings' && settingsSubTab === sub.id ? 'active' : ''}"
+                    title={sub.label}
+                    aria-current={activeTab === 'settings' && settingsSubTab === sub.id ? 'page' : undefined}
                     onclick={() => switchTab('settings', sub.id)}
                   >
                     <Icons name={sub.icon} size={14} />
-                    <span class="nav-label">{sub.label}</span>
+                    <span class="nav-label">{sub.shortLabel}</span>
                   </button>
                 {/each}
               </div>
@@ -1445,7 +1709,7 @@
                 switchTab('settings', 'update');
               }}
             >
-              v0.1.0
+              {appVersionLabel}
             </button>
           {/if}
           <button
@@ -1499,9 +1763,16 @@
       </div>
     </aside>
 
-    <!-- Arcane 用户弹出菜单（Screenshot 7） -->
+    <!-- Arcane 用户弹出菜单（含快捷主题与语言切换） -->
     {#if userMenuOpen}
-      <div id="vane-user-popover" class="user-popover" role="menu" style={userMenuStyle}>
+      <div
+        bind:this={userPopoverEl}
+        id="vane-user-popover"
+        class="user-popover"
+        role="menu"
+        tabindex="-1"
+        style={userMenuStyle}
+      >
         <div class="user-popover-head">
           <span class="sidebar-avatar" style="width:34px;height:34px;font-size:14px;" aria-hidden="true">
             {(username || 'A').slice(0, 1).toUpperCase()}
@@ -1511,6 +1782,37 @@
             <div style="font-size:11.5px;color:var(--text-muted);">{t.adminLabel} · Vane</div>
           </div>
         </div>
+
+        <div class="user-popover-quick">
+          <div class="user-popover-seg" role="group" aria-label={t.themeModeLabel}>
+            {#each [
+              { id: 'auto', icon: 'monitor', label: t.themeAuto },
+              { id: 'light', icon: 'sun', label: t.themeLight },
+              { id: 'dark', icon: 'moon', label: t.themeDark },
+            ] as mode (mode.id)}
+              <button
+                type="button"
+                class="user-popover-seg-btn {themeMode === mode.id ? 'active' : ''}"
+                aria-pressed={themeMode === mode.id}
+                title={mode.label}
+                onclick={() => (themeMode = mode.id)}
+              >
+                <Icons name={mode.icon} size={13} />
+                <span>{mode.label}</span>
+              </button>
+            {/each}
+          </div>
+          <button
+            type="button"
+            class="user-popover-lang-btn"
+            aria-label={t.cfg.lblLanguage}
+            onclick={toggleLang}
+          >
+            <Icons name="globe" size={13} />
+            <span>{lang === 'zh' ? 'Switch to English' : '切换为简体中文'}</span>
+          </button>
+        </div>
+
         <div class="user-popover-sep"></div>
         <button
           type="button"
@@ -1523,7 +1825,7 @@
           }}
         >
           <Icons name="user" size={15} />
-          <span>{t.cfg.tabSecurity}</span>
+          <span>{t.cfg.tabSecurityShort || t.cfg.tabSecurity}</span>
         </button>
         <button
           type="button"
@@ -1611,36 +1913,46 @@
 
     <!-- 右侧独立圆角主内容玻璃外壳 -->
     <div class="main-shell">
-      <!-- 移动端顶部悬浮面包屑胶囊（对齐 Arcane Screenshot 5） -->
+      <!-- 移动端吸顶悬浮磨砂顶栏（单标题、大触控区、快捷刷新/消息/账户） -->
       <div class="mobile-topbar">
         <div class="mobile-crumb">
           {#if activeTab !== 'dashboard'}
             <button type="button" class="mobile-crumb-back" aria-label={t.nav.dashboard} onclick={() => switchTab('dashboard')}>
-              <Icons name="arrow_left" size={16} />
+              <Icons name="arrow_left" size={17} />
             </button>
+          {:else}
+            <img src="/icon.svg" alt="" class="mobile-brand-mark" aria-hidden="true" />
           {/if}
-          <Icons name={activeTab} size={16} />
-          <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
-            {activeNav?.label || t.nav.dashboard}
+          <span class="mobile-crumb-title">
+            {#if activeTab === 'settings' && activeSubItem}
+              {activeSubItem.shortLabel}
+            {:else}
+              {activeNav?.label || t.nav.dashboard}
+            {/if}
           </span>
-          {#if activeSubLabel}
-            <Icons name="chevron_right" size={13} />
-            <span style="color:var(--text-secondary);font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
-              {activeSubLabel}
-            </span>
-          {/if}
         </div>
-        <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+        <div class="mobile-topbar-actions">
+          <button
+            type="button"
+            class="mobile-icon-btn"
+            aria-label={t.refresh}
+            title={t.refresh}
+            disabled={refreshing}
+            onclick={() => refreshActiveView()}
+          >
+            <Icons name="refresh" size={16} class={refreshing ? 'is-spinning' : ''} />
+          </button>
           <button
             type="button"
             class="activity-circle-btn {inboxModalOpen ? 'active' : ''}"
             aria-label={t.inbox.topbarLabel}
+            aria-expanded={inboxModalOpen}
             onclick={() => {
               userMenuOpen = false;
               inboxModalOpen = !inboxModalOpen;
             }}
           >
-            <Icons name="bell" size={15} />
+            <Icons name="bell" size={16} />
             {#if unreadNotifications > 0}
               <span class="activity-circle-badge num">{unreadNotifications > 99 ? '99+' : unreadNotifications}</span>
             {/if}
@@ -1657,7 +1969,7 @@
               toggleUserMenu(mobileUserBtnEl, true);
             }}
           >
-            <span class="sidebar-avatar" style="width:28px;height:28px;font-size:12px;" aria-hidden="true">
+            <span class="sidebar-avatar" aria-hidden="true">
               {(username || 'A').slice(0, 1).toUpperCase()}
             </span>
           </button>
@@ -1665,8 +1977,8 @@
       </div>
 
       <main class="main-area">
-        <header class="topbar">
-          <div>
+        <header class="topbar {hasMobileTopbarControls ? '' : 'mobile-empty'}">
+          <div class="topbar-title-group">
             <h1 class="topbar-title">
               {activeSubLabel || activeNav?.label || t.nav.dashboard}
             </h1>
@@ -1674,26 +1986,26 @@
               <div class="topbar-sub">{t.nav.settings}</div>
             {/if}
           </div>
-          <div class="btn-group">
+          <div class="btn-group topbar-actions">
             {#if isModuleProtected(activeTab) && !isModuleLocked(activeTab)}
               <button
                 type="button"
-                class="btn btn-sm"
-                style="color:var(--accent);border-color:color-mix(in srgb, var(--accent) 40%, var(--border-subtle));"
+                class="btn btn-sm btn-soft"
                 onclick={() => relockCurrentModule(activeTab)}
               >
                 <Icons name="unlock" size={13} />
                 <span>{t.reauth.relockModule}</span>
               </button>
             {/if}
-            <button type="button" class="btn btn-sm" disabled={refreshing} onclick={() => refreshActiveView()}>
-              <Icons name="refresh" size={14} />
+            <button type="button" class="btn btn-sm desktop-only" disabled={refreshing} onclick={() => refreshActiveView()}>
+              <Icons name="refresh" size={14} class={refreshing ? 'is-spinning' : ''} />
               <span>{refreshing ? t.common.loading : t.refresh}</span>
             </button>
             {#if dashboard?.firewall}
+              <span class="topbar-action-sep desktop-only" aria-hidden="true"></span>
               <button
                 type="button"
-                class="btn btn-sm {dashboard.firewall.lockdown ? 'btn-primary' : 'btn-danger'}"
+                class="btn btn-sm {dashboard.firewall.lockdown ? 'btn-primary' : 'btn-lockdown-standby'}"
                 onclick={() => requestLockdownToggle(!dashboard.firewall.lockdown)}
               >
                 <Icons name="shield" size={14} />
@@ -1920,47 +2232,63 @@
       </main>
     </div>
 
-    <!-- 移动端底部悬浮磨砂胶囊 Dock：左侧全部已启用模块支持横向滑动并自动贴靠，右侧固定「系统设置」 -->
+    <!-- 移动端底部悬浮分离式双液态玻璃胶囊：中心焦点微缩光感 + 丝滑滑移高亮 + 独立设置圆钮 -->
     <nav class="mobile-dock" aria-label={t.nav.dashboard}>
-      <div
-        bind:this={mobileDockScrollEl}
-        class="mobile-dock-scroll {dockCanScrollLeft ? 'fade-left' : ''} {dockCanScrollRight ? 'fade-right' : ''}"
-        onscroll={updateDockScrollState}
-        onwheel={handleDockWheel}
-      >
-        {#each mobileScrollItems as item (item.id)}
-          <button
-            type="button"
-            data-dock-id={item.id}
-            class="dock-btn dock-scroll-item {activeTab === item.id ? 'active' : ''}"
-            aria-current={activeTab === item.id ? 'page' : undefined}
-            onclick={() => switchTab(item.id)}
-          >
-            <span class="dock-icon-wrap">
-              <Icons name={item.id} size={18} />
-              {#if isModuleProtected(item.id)}
-                <span class="dock-lock-badge {isModuleLocked(item.id) ? '' : 'unlocked'}" aria-hidden="true">
-                  <Icons name={isModuleLocked(item.id) ? 'lock' : 'unlock'} size={8} />
-                </span>
-              {/if}
-            </span>
-            <span>{item.label}</span>
-          </button>
-        {/each}
+      <div class="mobile-dock-main">
+        <div
+          bind:this={mobileDockScrollEl}
+          role="group"
+          aria-label={t.nav.dashboard}
+          class="mobile-dock-scroll {mobileScrollItems.length > 3 ? 'peek-scroll' : ''} {dockCanScrollLeft ? 'fade-left' : ''} {dockCanScrollRight ? 'fade-right' : ''} {dockDragging ? 'is-dragging' : ''}"
+          onscroll={scheduleDockLensUpdate}
+          onwheel={handleDockWheel}
+          onpointerdown={handleDockPointerDown}
+          onpointermove={handleDockPointerMove}
+          onpointerup={endDockDrag}
+          onpointercancel={endDockDrag}
+        >
+          <div bind:this={dockGlideEl} class="dock-glide-pill" aria-hidden="true"></div>
+          {#each mobileScrollItems as item (item.id)}
+            {@const dot = moduleStatusDot(item.id)}
+            <button
+              type="button"
+              data-dock-id={item.id}
+              class="dock-btn dock-scroll-item {activeTab === item.id ? 'active' : ''}"
+              aria-label={item.label}
+              aria-current={activeTab === item.id ? 'page' : undefined}
+              onclick={() => {
+                if (dockJustDragged) return;
+                switchTab(item.id);
+              }}
+            >
+              <span class="dock-icon-wrap">
+                <Icons name={item.id} size={18} />
+                {#if dot}
+                  <span class="dock-status-dot {dot}" aria-hidden="true"></span>
+                {/if}
+                {#if isModuleProtected(item.id)}
+                  <span class="dock-lock-badge {isModuleLocked(item.id) ? '' : 'unlocked'}" aria-hidden="true">
+                    <Icons name={isModuleLocked(item.id) ? 'lock' : 'unlock'} size={8} />
+                  </span>
+                {/if}
+              </span>
+              <span>{t.navShort?.[item.id] || item.label}</span>
+            </button>
+          {/each}
+        </div>
       </div>
-
-      <span class="mobile-dock-divider" aria-hidden="true"></span>
 
       <button
         type="button"
         class="dock-btn dock-fixed-settings {activeTab === 'settings' ? 'active' : ''}"
+        aria-label={t.nav.settings}
         aria-current={activeTab === 'settings' ? 'page' : undefined}
         onclick={() => switchTab('settings', settingsSubTab)}
       >
         <span class="dock-icon-wrap">
           <Icons name="settings" size={18} />
         </span>
-        <span>{t.nav.settings}</span>
+        <span>{t.navShort?.settings || t.nav.settings}</span>
       </button>
     </nav>
   </div>

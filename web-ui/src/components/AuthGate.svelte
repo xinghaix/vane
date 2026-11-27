@@ -6,6 +6,8 @@
     t,
     lang,
     toggleLang,
+    themeMode = 'auto',
+    onSelectThemeMode = null,
     authenticated,
     mustChangePassword,
     initialSetup = false,
@@ -38,6 +40,18 @@
   let confirmPassword = $state('');
   let showNewPass = $state(false);
   let pwChangeError = $state('');
+
+  function cycleTheme() {
+    if (!onSelectThemeMode) return;
+    const order = ['auto', 'light', 'dark'];
+    const idx = order.indexOf(themeMode);
+    onSelectThemeMode(order[(idx + 1) % order.length]);
+  }
+
+  let themeIcon = $derived(themeMode === 'light' ? 'sun' : themeMode === 'dark' ? 'moon' : 'monitor');
+  let themeTitle = $derived(
+    themeMode === 'light' ? t.themeLight : themeMode === 'dark' ? t.themeDark : t.themeAuto
+  );
 
   $effect(() => {
     if (username && loginUser === 'admin') loginUser = username;
@@ -94,9 +108,15 @@
       newPassword !== effectiveUsername,
     matchConfirm: newPassword.length > 0 && newPassword === confirmPassword,
   });
-  let pwAllValid = $derived(
-    pwChecks.lenOk && pwChecks.hasAlpha && pwChecks.hasDigitOrPunct && pwChecks.notDefault && pwChecks.matchConfirm
-  );
+  let pwCheckList = $derived([
+    { ok: pwChecks.lenOk, text: t.ruleLen },
+    { ok: pwChecks.hasAlpha, text: t.ruleAlpha },
+    { ok: pwChecks.hasDigitOrPunct, text: t.ruleDigit },
+    { ok: pwChecks.notDefault, text: t.ruleNotDefault },
+    { ok: pwChecks.matchConfirm, text: t.ruleMatch },
+  ]);
+  let pwScore = $derived(pwCheckList.filter((c) => c.ok).length);
+  let pwAllValid = $derived(pwScore === 5);
 
   async function submitPasswordLogin(e) {
     e.preventDefault();
@@ -148,23 +168,41 @@
 {#if !authenticated}
   <div class="auth-shell">
     <div class="auth-card">
-      <div class="brand" style="border:none;margin-bottom:14px;padding:0;justify-content:space-between;">
-        <div style="display:flex;align-items:center;gap:12px;">
-          <img src="/icon.svg" alt="Vane" class="brand-icon" />
-          <div>
-            <div style="font-size:18px;font-weight:700;">Vane Gateway</div>
-            <div style="font-size:12px;color:var(--text-secondary);">{t.subtitle}</div>
+      <div class="auth-card-head">
+        <div style="display:flex;align-items:center;gap:12px;min-width:0;">
+          <img src="/icon.svg" alt="Vane" class="brand-icon auth-brand-icon" />
+          <div style="min-width:0;">
+            <div style="font-size:18px;font-weight:750;letter-spacing:-0.02em;line-height:1.2;">Vane Gateway</div>
+            <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;line-height:1.35;">{t.subtitle}</div>
           </div>
         </div>
-        <button type="button" class="btn btn-sm" onclick={toggleLang}>{lang === 'zh' ? 'EN' : '中文'}</button>
+        <div class="auth-head-actions">
+          {#if onSelectThemeMode}
+            <button
+              type="button"
+              class="btn btn-icon btn-icon-sm"
+              title={`${t.themeModeLabel}: ${themeTitle}`}
+              aria-label={`${t.themeModeLabel}: ${themeTitle}`}
+              onclick={cycleTheme}
+            >
+              <Icons name={themeIcon} size={15} />
+            </button>
+          {/if}
+          <button type="button" class="btn btn-sm" aria-label={t.cfg.lblLanguage} onclick={toggleLang}>
+            {lang === 'zh' ? 'EN' : '中文'}
+          </button>
+        </div>
       </div>
 
       {#if connError}
         <div class="banner banner-danger" style="margin-bottom:14px;">
-          <div style="flex:1;min-width:0;">
-            <div style="font-weight:700;">{t.connErrorTitle}</div>
-            <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;">{connError}</div>
-            <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">{t.connErrorDesc}</div>
+          <div class="banner-main">
+            <Icons name="alert" size={16} />
+            <div style="min-width:0;">
+              <div style="font-weight:700;">{t.connErrorTitle}</div>
+              <div style="font-size:12px;color:var(--text-secondary);margin-top:2px;word-break:break-word;">{connError}</div>
+              <div style="font-size:12px;color:var(--text-muted);margin-top:2px;">{t.connErrorDesc}</div>
+            </div>
           </div>
           {#if onRetryStatus}
             <button type="button" class="btn btn-xs" onclick={onRetryStatus}>{t.refresh}</button>
@@ -198,7 +236,7 @@
       {/if}
 
       {#if loginError}
-        <div role="alert" class="badge badge-danger" style="width:100%;padding:10px 12px;border-radius:10px;margin-bottom:14px;white-space:normal;">
+        <div role="alert" class="inline-alert inline-alert-danger" style="margin-bottom:14px;">
           <Icons name="alert" size={15} />
           <span>{loginError}</span>
         </div>
@@ -212,12 +250,12 @@
           </div>
           <div class="field">
             <label for="login-pass">{t.password}</label>
-            <div style="position:relative;display:flex;align-items:center;">
+            <div class="input-wrap">
               <input
                 id="login-pass"
                 name="password"
                 type={showLoginPass ? 'text' : 'password'}
-                style="padding-right:42px;"
+                class="has-addon"
                 placeholder={initialSetup ? t.passwordInitialHint : t.passwordPlaceholder}
                 bind:value={loginPass}
                 autocomplete="current-password"
@@ -225,10 +263,10 @@
               />
               <button
                 type="button"
-                class="btn btn-ghost btn-xs"
-                style="position:absolute;right:6px;min-height:28px;padding:0 6px;"
-                onclick={() => showLoginPass = !showLoginPass}
+                class="input-addon-btn"
+                onclick={() => (showLoginPass = !showLoginPass)}
                 aria-label={t.common.toggleSecret}
+                aria-pressed={showLoginPass}
               >
                 <Icons name={showLoginPass ? 'eye_off' : 'eye'} size={15} />
               </button>
@@ -244,45 +282,62 @@
                 class="mono"
                 inputmode="numeric"
                 autocomplete="one-time-code"
-                placeholder="123456 / xxxx-xxxx-xxxx-xxxx"
+                placeholder="123456 / xxxx-xxxx"
                 bind:value={loginTotp}
                 required
               />
             </div>
           {/if}
-          <button type="submit" class="btn btn-primary" style="width:100%;margin-top:6px;" disabled={busy}>
-            <Icons name="lock" size={15} />
-            <span>{t.loginBtn}</span>
+          <button type="submit" class="btn btn-primary auth-submit-btn" disabled={busy}>
+            {#if busy}
+              <Icons name="loader" size={15} class="is-spinning" />
+            {:else}
+              <Icons name="lock" size={15} />
+            {/if}
+            <span>{busy ? t.common.loading : t.loginBtn}</span>
           </button>
           {#if canUsePasskey}
-            <div style="display:flex;align-items:center;gap:10px;margin:14px 0 12px;color:var(--text-muted);font-size:12px;">
-              <span style="flex:1;height:1px;background:var(--border-subtle);"></span>
-              <span>{t.passkeyOrDivider}</span>
-              <span style="flex:1;height:1px;background:var(--border-subtle);"></span>
+            <div class="auth-divider">
+              <span></span>
+              <em>{t.passkeyOrDivider}</em>
+              <span></span>
             </div>
-            <button type="button" class="btn" style="width:100%;" disabled={busy} onclick={submitPasskeyLogin}>
-              <Icons name="passkey" size={16} />
-              <span>{busy ? '...' : t.passkeyLoginBtn}</span>
+            <button type="button" class="btn auth-submit-btn" disabled={busy} onclick={submitPasskeyLogin}>
+              {#if busy}
+                <Icons name="loader" size={15} class="is-spinning" />
+              {:else}
+                <Icons name="passkey" size={16} />
+              {/if}
+              <span>{t.passkeyLoginBtn}</span>
             </button>
           {/if}
         </form>
       {:else if canUsePasskey}
         <div class="subcard" style="text-align:center;padding:22px 16px;margin-bottom:14px;">
-          <div style="width:48px;height:48px;border-radius:14px;background:var(--accent-soft);color:var(--accent);display:grid;place-items:center;margin:0 auto 10px;">
+          <div class="icon-tile" style="width:48px;height:48px;border-radius:14px;margin:0 auto 10px;">
             <Icons name="passkey" size={24} />
           </div>
           <div style="font-size:14px;font-weight:700;margin-bottom:4px;">{t.passkeyLoginBtn}</div>
-          <div style="font-size:12px;color:var(--text-secondary);">{t.reauth.passkeyReadyDesc}</div>
+          <div style="font-size:12px;color:var(--text-secondary);line-height:1.45;">{t.reauth.passkeyReadyDesc}</div>
         </div>
-        <button type="button" class="btn btn-primary" style="width:100%;" disabled={busy} onclick={submitPasskeyLogin}>
-          <Icons name="passkey" size={16} />
-          <span>{busy ? '...' : t.passkeyLoginBtn}</span>
+        <button type="button" class="btn btn-primary auth-submit-btn" disabled={busy} onclick={submitPasskeyLogin}>
+          {#if busy}
+            <Icons name="loader" size={15} class="is-spinning" />
+          {:else}
+            <Icons name="passkey" size={16} />
+          {/if}
+          <span>{t.passkeyLoginBtn}</span>
         </button>
       {:else}
         <div class="banner banner-warn" style="margin-bottom:12px;">
-          {lang === 'en'
-            ? 'Password login is disabled. Open this console via the HTTPS domain where your Passkey is registered.'
-            : '当前已关闭密码登录，请使用已绑定通行密钥的 HTTPS 域名访问并完成免密登录。'}
+          <div class="banner-main">
+            <Icons name="alert" size={16} />
+            <span>
+              {lang === 'en'
+                ? 'Password login is disabled. Open this console via the HTTPS domain where your Passkey is registered.'
+                : '当前已关闭密码登录，请使用已绑定通行密钥的 HTTPS 域名访问并完成免密登录。'}
+            </span>
+          </div>
         </div>
       {/if}
     </div>
@@ -291,16 +346,32 @@
 {:else if mustChangePassword}
   <div class="auth-shell">
     <div class="auth-card" style="max-width:480px;">
-      <div class="row-between" style="margin-bottom:12px;">
+      <div class="row-between" style="margin-bottom:14px;">
         <span class="badge badge-warn">{t.gateBadge}</span>
-        <button type="button" class="btn btn-sm" onclick={toggleLang}>{lang === 'zh' ? 'EN' : '中文'}</button>
+        <div class="auth-head-actions">
+          {#if onSelectThemeMode}
+            <button
+              type="button"
+              class="btn btn-icon btn-icon-sm"
+              title={`${t.themeModeLabel}: ${themeTitle}`}
+              aria-label={`${t.themeModeLabel}: ${themeTitle}`}
+              onclick={cycleTheme}
+            >
+              <Icons name={themeIcon} size={15} />
+            </button>
+          {/if}
+          <button type="button" class="btn btn-sm" aria-label={t.cfg.lblLanguage} onclick={toggleLang}>
+            {lang === 'zh' ? 'EN' : '中文'}
+          </button>
+        </div>
       </div>
-      <h2 style="font-size:20px;margin-bottom:6px;">{t.gateTitle}</h2>
+      <h2 style="font-size:20px;font-weight:750;letter-spacing:-0.02em;margin-bottom:6px;">{t.gateTitle}</h2>
       <p style="font-size:13px;color:var(--text-secondary);margin-bottom:18px;line-height:1.5;">{t.gateDesc}</p>
 
       {#if pwChangeError}
-        <div role="alert" class="badge badge-danger" style="width:100%;padding:10px 12px;border-radius:10px;margin-bottom:14px;white-space:normal;">
-          {pwChangeError}
+        <div role="alert" class="inline-alert inline-alert-danger" style="margin-bottom:14px;">
+          <Icons name="alert" size={15} />
+          <span>{pwChangeError}</span>
         </div>
       {/if}
 
@@ -315,21 +386,21 @@
         </div>
         <div class="field">
           <label for="new-pw">{t.newPw}</label>
-          <div style="position:relative;display:flex;align-items:center;">
+          <div class="input-wrap">
             <input
               id="new-pw"
               type={showNewPass ? 'text' : 'password'}
-              style="padding-right:42px;"
+              class="has-addon"
               bind:value={newPassword}
               autocomplete="new-password"
               required
             />
             <button
               type="button"
-              class="btn btn-ghost btn-xs"
-              style="position:absolute;right:6px;min-height:28px;padding:0 6px;"
-              onclick={() => showNewPass = !showNewPass}
+              class="input-addon-btn"
+              onclick={() => (showNewPass = !showNewPass)}
               aria-label={t.common.toggleSecret}
+              aria-pressed={showNewPass}
             >
               <Icons name={showNewPass ? 'eye_off' : 'eye'} size={15} />
             </button>
@@ -340,17 +411,36 @@
           <input id="confirm-pw" type={showNewPass ? 'text' : 'password'} bind:value={confirmPassword} autocomplete="new-password" required />
         </div>
 
-        <div class="subcard" style="margin-bottom:16px;font-size:13px;display:grid;gap:6px;">
-          <div style="color:{pwChecks.lenOk ? 'var(--accent)' : 'var(--text-secondary)'}">{pwChecks.lenOk ? '✓' : '○'} {t.ruleLen}</div>
-          <div style="color:{pwChecks.hasAlpha ? 'var(--accent)' : 'var(--text-secondary)'}">{pwChecks.hasAlpha ? '✓' : '○'} {t.ruleAlpha}</div>
-          <div style="color:{pwChecks.hasDigitOrPunct ? 'var(--accent)' : 'var(--text-secondary)'}">{pwChecks.hasDigitOrPunct ? '✓' : '○'} {t.ruleDigit}</div>
-          <div style="color:{pwChecks.notDefault ? 'var(--accent)' : 'var(--text-secondary)'}">{pwChecks.notDefault ? '✓' : '○'} {t.ruleNotDefault}</div>
-          <div style="color:{pwChecks.matchConfirm ? 'var(--accent)' : 'var(--text-secondary)'}">{pwChecks.matchConfirm ? '✓' : '○'} {t.ruleMatch}</div>
+        <div class="subcard pw-checklist-card">
+          <div class="pw-strength-bar" aria-hidden="true">
+            {#each [1, 2, 3, 4, 5] as step (step)}
+              <span
+                class="pw-strength-seg {pwScore >= step ? (pwScore >= 5 ? 'ok' : pwScore >= 3 ? 'warn' : 'danger') : ''}"
+              ></span>
+            {/each}
+          </div>
+          <div class="pw-check-list">
+            {#each pwCheckList as item (item.text)}
+              <div class="pw-check-item {item.ok ? 'ok' : ''}">
+                {#if item.ok}
+                  <Icons name="check_circle" size={14} />
+                {:else}
+                  <span class="pw-check-dot" aria-hidden="true"></span>
+                {/if}
+                <span>{item.text}</span>
+              </div>
+            {/each}
+          </div>
         </div>
 
-        <div style="display:flex;gap:10px;">
-          <button type="submit" class="btn btn-primary" style="flex:1;" disabled={!pwAllValid || busy}>{t.savePwBtn}</button>
+        <div class="modal-actions" style="margin-top:4px;">
           <button type="button" class="btn" onclick={onLogout}>{t.logout}</button>
+          <button type="submit" class="btn btn-primary" style="flex:1;" disabled={!pwAllValid || busy}>
+            {#if busy}
+              <Icons name="loader" size={14} class="is-spinning" />
+            {/if}
+            <span>{t.savePwBtn}</span>
+          </button>
         </div>
       </form>
     </div>

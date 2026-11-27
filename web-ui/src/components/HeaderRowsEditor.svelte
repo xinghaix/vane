@@ -24,6 +24,19 @@
     t,
   } = $props();
 
+  // WeakMap 为每行对象分配稳定的运行时唯一键，既不污染序列化对象，又彻底避免删除行时 revealed 索引错位
+  const rowKeys = new WeakMap();
+  let nextRowKey = 1;
+  function getRowKey(row) {
+    if (!row || typeof row !== 'object') return `row-${nextRowKey++}`;
+    let k = rowKeys.get(row);
+    if (!k) {
+      k = `hdr-${nextRowKey++}`;
+      rowKeys.set(row, k);
+    }
+    return k;
+  }
+
   let revealed = $state({});
 
   function addRow() {
@@ -31,6 +44,15 @@
   }
 
   function removeRow(idx) {
+    const removed = rows[idx];
+    if (removed && rowKeys.has(removed)) {
+      const rk = rowKeys.get(removed);
+      if (rk in revealed) {
+        const copy = { ...revealed };
+        delete copy[rk];
+        revealed = copy;
+      }
+    }
     rows = rows.filter((_, i) => i !== idx);
   }
 
@@ -52,23 +74,23 @@
     <div class="header-empty-box">{t?.common?.noHeaders || '—'}</div>
   {:else}
     <div style="display:grid;gap:8px;">
-      {#each rows as row, i (i)}
+      {#each rows as row, i (getRowKey(row))}
+        {@const rk = getRowKey(row)}
         {@const keepMasked = secret && isSecretConfigured(row.original) && row.origKey === String(row.key || '').trim() && !row.value}
         {@const badKey = isForbiddenKey(row.key)}
-        <div class="rule-card" style="padding:8px 10px;border-color:{badKey ? 'var(--danger)' : 'var(--border-subtle)'};">
-          <div style="display:grid;grid-template-columns:minmax(110px, 0.9fr) minmax(140px, 1.3fr) auto;gap:8px;align-items:center;">
+        <div class="rule-card header-row-card {badKey ? 'has-error' : ''}">
+          <div class="header-row-grid">
             <input
               type="text"
-              class="mono control-compact"
+              class="mono control-compact header-row-key"
               placeholder={t?.common?.headerNamePh || 'Header-Name'}
               aria-label={t?.common?.headerNamePh || 'Header name'}
               bind:value={row.key}
             />
-            <div style="position:relative;display:flex;align-items:center;">
+            <div class="input-wrap header-row-val">
               <input
-                type={secret && !revealed[i] ? 'password' : 'text'}
-                class="mono control-compact"
-                style={secret ? 'padding-right:38px;' : ''}
+                type={secret && !revealed[rk] ? 'password' : 'text'}
+                class="mono control-compact {secret ? 'has-addon' : ''}"
                 autocomplete={secret ? 'new-password' : 'off'}
                 spellcheck="false"
                 placeholder={keepMasked ? secretMaskedHint(row.original, '****') : (t?.common?.headerValPh || 'Value')}
@@ -78,31 +100,31 @@
               {#if secret}
                 <button
                   type="button"
-                  class="btn btn-ghost btn-xs"
-                  style="position:absolute;right:4px;min-height:26px;padding:0 5px;"
+                  class="input-addon-btn"
                   aria-label={t?.common?.toggleSecret || 'Toggle visibility'}
-                  onclick={() => (revealed = { ...revealed, [i]: !revealed[i] })}
+                  aria-pressed={Boolean(revealed[rk])}
+                  onclick={() => (revealed = { ...revealed, [rk]: !revealed[rk] })}
                 >
-                  <Icons name={revealed[i] ? 'eye_off' : 'eye'} size={13} />
+                  <Icons name={revealed[rk] ? 'eye_off' : 'eye'} size={14} />
                 </button>
               {/if}
             </div>
             <button
               type="button"
-              class="btn btn-xs btn-danger"
+              class="btn btn-icon btn-icon-sm btn-danger header-row-del"
               data-dirty="1"
               aria-label={t?.delete || 'Delete'}
               onclick={() => removeRow(i)}
             >
-              <Icons name="trash" size={12} />
+              <Icons name="trash" size={13} />
             </button>
           </div>
           {#if badKey}
-            <div style="font-size:11.5px;color:var(--danger);margin-top:4px;">
+            <div style="font-size:11.5px;color:var(--danger);margin-top:5px;">
               {t?.rp?.forbiddenHeaderHint || 'Host / Content-Length / hop-by-hop headers are not allowed'}
             </div>
           {:else if keepMasked}
-            <div style="font-size:11.5px;color:var(--accent);margin-top:4px;">
+            <div style="font-size:11.5px;color:var(--accent);margin-top:5px;">
               {t?.common?.keepEncryptedHint || 'Encrypted value kept unless replaced'}
             </div>
           {/if}

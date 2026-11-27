@@ -25,6 +25,7 @@
 
 <span
   class="metric-ring"
+  role="img"
   style={`width:${size}px;height:${size}px;`}
   aria-label={label ? `${label} ${sub}` : `${clamped.toFixed(0)}%`}
 >

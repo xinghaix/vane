@@ -25,7 +25,7 @@
   let weekdays = $state([0]); // 0=Sun, 1=Mon ... 6=Sat
   let dayOfMonth = $state(1);
 
-  let serverRuns = $state([]); // [{ ts, text }]
+  let serverRuns = $state([]); // [{ ts, iso }]
   let serverError = $state('');
   let loadingPreview = $state(false);
   let syncedExpr = '';
@@ -110,11 +110,11 @@
   let slotLabels = $derived(
     rawTokens.length === 6
       ? lang === 'en'
-        ? ['Sec (0-59)', 'Min (0-59)', 'Hour (0-23)', 'Day (1-31)', 'Month (1-12)', 'Week (0-6)']
-        : ['秒 (0-59)', '分 (0-59)', '时 (0-23)', '日 (1-31)', '月 (1-12)', '周 (0-6)']
+        ? ['Sec 0-59', 'Min 0-59', 'Hour 0-23', 'Day 1-31', 'Mon 1-12', 'Wk 0-6']
+        : ['秒 0-59', '分 0-59', '时 0-23', '日 1-31', '月 1-12', '周 0-6']
       : lang === 'en'
-        ? ['Min (0-59)', 'Hour (0-23)', 'Day (1-31)', 'Month (1-12)', 'Week (0-6)']
-        : ['分 (0-59)', '时 (0-23)', '日 (1-31)', '月 (1-12)', '周 (0-6)']
+        ? ['Min 0-59', 'Hour 0-23', 'Day 1-31', 'Mon 1-12', 'Wk 0-6']
+        : ['分 0-59', '时 0-23', '日 1-31', '月 1-12', '周 0-6']
   );
 
   function hydrateVisualFromExpr(expr) {
@@ -242,15 +242,14 @@
 </script>
 
 <div class="field">
-  <div class="field-label-row" style="margin-bottom:4px;">
-    <label for="cr-sched">{t.cronPage.scheduleLabel || t.cronPage.expr}</label>
-    <div class="pill-tabs" role="tablist" style="padding:2px;">
+  <div class="field-label-row cron-head-row">
+    <label for={editorMode === 'custom' ? 'cr-sched' : 'cr-freq'}>{t.cronPage.scheduleLabel || t.cronPage.expr}</label>
+    <div class="pill-tabs pill-tabs-compact" role="tablist">
       <button
         type="button"
         role="tab"
         aria-selected={editorMode === 'visual'}
         class="pill-tab {editorMode === 'visual' ? 'active' : ''}"
-        style="min-height:26px;padding:0 11px;font-size:12px;"
         onclick={() => {
           editorMode = 'visual';
           const parsed = parseCronToVisual(value);
@@ -268,7 +267,6 @@
         role="tab"
         aria-selected={editorMode === 'custom'}
         class="pill-tab {editorMode === 'custom' ? 'active' : ''}"
-        style="min-height:26px;padding:0 11px;font-size:12px;"
         onclick={() => (editorMode = 'custom')}
       >
         {lang === 'en' ? 'Custom Cron' : '自定义 Cron'}
@@ -323,7 +321,7 @@
       </div>
 
       {#if freq === 'monthly'}
-        <div class="field" style="margin-bottom:0;max-width:280px;">
+        <div class="field cron-monthly-time" style="margin-bottom:0;">
           <label for="cr-mhm-h">{lang === 'en' ? 'Time of Day' : '执行时间点'}</label>
           <div style="display:grid;grid-template-columns:1fr auto 1fr;gap:6px;align-items:center;">
             <Select id="cr-mhm-h" mono bind:value={hour} options={hourOptions} onchange={applyVisualChange} />
@@ -341,8 +339,8 @@
               {@const picked = weekdays.includes(wd.d)}
               <button
                 type="button"
-                class="chip {picked ? 'active' : ''}"
-                style="min-height:30px;padding:2px 11px;"
+                class="chip cron-chip {picked ? 'active' : ''}"
+                aria-pressed={picked}
                 onclick={() => toggleWeekday(wd.d)}
               >
                 {lang === 'en' ? wd.en : wd.zh}
@@ -355,8 +353,8 @@
           {#each [5, 10, 15, 30] as mStep (mStep)}
             <button
               type="button"
-              class="chip {Number(intervalMinutes) === mStep ? 'active' : ''}"
-              style="min-height:28px;padding:2px 10px;font-size:12px;"
+              class="chip cron-chip {Number(intervalMinutes) === mStep ? 'active' : ''}"
+              aria-pressed={Number(intervalMinutes) === mStep}
               onclick={() => {
                 intervalMinutes = mStep;
                 applyVisualChange();
@@ -386,7 +384,7 @@
           }}
           required
         />
-        <div class="cron-slots-grid" style="grid-template-columns:repeat({slotLabels.length}, minmax(0, 1fr));">
+        <div class="cron-slots-grid cron-slots-{slotLabels.length}">
           {#each slotLabels as sl, idx (sl)}
             <div class="cron-slot-chip">
               <span class="mono" style="font-weight:700;color:var(--text-primary);">{rawTokens[idx] ?? '—'}</span>
@@ -401,8 +399,7 @@
         {#each presets as p (p.expr)}
           <button
             type="button"
-            class="chip {String(value || '').trim() === p.expr ? 'active' : ''}"
-            style="min-height:26px;padding:2px 10px;font-size:12px;"
+            class="chip cron-chip {String(value || '').trim() === p.expr ? 'active' : ''}"
             onclick={() => pickPreset(p.expr)}
           >
             {p.label}

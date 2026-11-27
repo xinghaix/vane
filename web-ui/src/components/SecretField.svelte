@@ -32,14 +32,13 @@
 </script>
 
 <div class="field">
-  <div class="row-between" style="gap:6px;">
+  <div class="field-label-row">
     <label for={id}>{label}</label>
     {#if configured && !required}
       <button
         type="button"
-        class="btn btn-xs {clear ? '' : 'btn-ghost'}"
+        class="field-action-btn {clear ? 'is-undo' : 'is-danger'}"
         data-dirty="1"
-        style="min-height:24px;font-size:11.5px;color:{clear ? 'var(--info)' : 'var(--danger)'};"
         onclick={() => {
           clear = !clear;
           if (clear) value = '';
@@ -50,12 +49,11 @@
       </button>
     {/if}
   </div>
-  <div style="position:relative;display:flex;align-items:center;">
+  <div class="input-wrap">
     <input
       {id}
       type={reveal ? 'text' : 'password'}
-      class="mono"
-      style="padding-right:40px;"
+      class="mono has-addon"
       autocomplete="new-password"
       spellcheck="false"
       autocapitalize="off"
@@ -70,13 +68,13 @@
     />
     <button
       type="button"
-      class="btn btn-ghost btn-xs"
-      style="position:absolute;right:5px;min-height:28px;padding:0 6px;"
+      class="input-addon-btn"
       disabled={clear}
-      onclick={() => reveal = !reveal}
+      onclick={() => (reveal = !reveal)}
       aria-label={t?.common?.toggleSecret || 'Toggle visibility'}
+      aria-pressed={reveal}
     >
-      <Icons name={reveal ? 'eye_off' : 'eye'} size={14} />
+      <Icons name={reveal ? 'eye_off' : 'eye'} size={15} />
     </button>
   </div>
   <div class="field-hint" style="color:{clear ? 'var(--warn)' : 'var(--text-muted)'};">{hint}</div>

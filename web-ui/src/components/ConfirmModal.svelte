@@ -14,12 +14,18 @@
     onCancel,
   } = $props();
 
+  let cardEl = $state(null);
+  let cancelBtnEl = $state(null);
+  let confirmBtnEl = $state(null);
+
   $effect(() => {
     if (!open) return;
     return registerOverlay({
       onDismiss: () => {
         if (!busy) onCancel?.();
       },
+      trapContainer: () => cardEl,
+      initialFocus: () => (danger ? cancelBtnEl : confirmBtnEl),
     });
   });
 </script>
@@ -32,32 +38,42 @@
       if (e.target === e.currentTarget && !busy) onCancel?.();
     }}
   >
-    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title" aria-describedby="confirm-modal-desc">
-      <div style="display:flex;align-items:flex-start;gap:12px;margin-bottom:12px;">
-        <div
-          style="width:36px;height:36px;border-radius:10px;display:grid;place-items:center;flex-shrink:0;background:{danger
-            ? 'var(--danger-soft)'
-            : 'var(--warn-soft)'};color:{danger ? 'var(--danger)' : 'var(--warn)'};"
-        >
+    <div
+      bind:this={cardEl}
+      class="modal-card"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="confirm-modal-title"
+      aria-describedby="confirm-modal-desc"
+      tabindex="-1"
+    >
+      <div style="display:flex;align-items:flex-start;gap:13px;margin-bottom:14px;">
+        <div class="icon-tile {danger ? 'danger' : 'warn'}" style="width:38px;height:38px;border-radius:12px;">
           <Icons name="alert" size={18} />
         </div>
         <div style="min-width:0;flex:1;">
           <h3 id="confirm-modal-title" style="font-size:16px;font-weight:700;line-height:1.35;">{title}</h3>
-          <p id="confirm-modal-desc" style="font-size:13px;color:var(--text-secondary);margin-top:6px;line-height:1.55;white-space:pre-line;">{message}</p>
+          <p id="confirm-modal-desc" style="font-size:13px;color:var(--text-secondary);margin-top:6px;line-height:1.55;white-space:pre-line;word-break:break-word;">
+            {message}
+          </p>
         </div>
       </div>
 
-      <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:18px;">
-        <button type="button" class="btn btn-sm" disabled={busy} onclick={() => onCancel?.()}>
+      <div class="modal-actions">
+        <button bind:this={cancelBtnEl} type="button" class="btn btn-sm" disabled={busy} onclick={() => onCancel?.()}>
           {cancelLabel}
         </button>
         <button
+          bind:this={confirmBtnEl}
           type="button"
           class="btn btn-sm {danger ? 'btn-danger' : 'btn-primary'}"
           disabled={busy}
           onclick={() => onConfirm?.()}
         >
-          {busy ? '...' : confirmLabel}
+          {#if busy}
+            <Icons name="loader" size={14} class="is-spinning" />
+          {/if}
+          <span>{confirmLabel}</span>
         </button>
       </div>
     </div>

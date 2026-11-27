@@ -21,6 +21,7 @@
     footer = null,
   } = $props();
 
+  let panelEl = $state(null);
   let internalDirty = $state(false);
   let effectiveDirty = $derived(confirmDiscard && Boolean(dirty || internalDirty));
 
@@ -32,6 +33,7 @@
     internalDirty = false;
     return registerOverlay({
       onDismiss: () => requestClose(),
+      trapContainer: () => panelEl,
     });
   });
 
@@ -86,10 +88,12 @@
     }}
   >
     <div
+      bind:this={panelEl}
       class="editor-panel editor-size-{size}"
       role="dialog"
       aria-modal="true"
       aria-label={title}
+      tabindex="-1"
       oninput={markDirtyFromInput}
       onchange={markDirtyFromInput}
     >
@@ -99,7 +103,7 @@
             <div class="editor-header-left">
               <button
                 type="button"
-                class="btn btn-ghost btn-sm editor-back-btn"
+                class="btn btn-ghost btn-icon editor-back-btn"
                 disabled={busy}
                 aria-label={t?.common?.back || 'Back'}
                 onclick={requestClose}
@@ -115,7 +119,7 @@
             </div>
             <button
               type="button"
-              class="btn btn-ghost btn-sm editor-close-btn"
+              class="btn btn-ghost btn-icon editor-close-btn"
               disabled={busy}
               aria-label={closeLabel || t?.close || 'Close'}
               onclick={requestClose}
@@ -136,7 +140,10 @@
                 {cancelLabel || t?.cancel || 'Cancel'}
               </button>
               <button type="submit" class="btn btn-primary" disabled={busy}>
-                {busy ? '...' : (submitLabel || t?.confirm || 'Save')}
+                {#if busy}
+                  <Icons name="loader" size={14} class="is-spinning" />
+                {/if}
+                <span>{submitLabel || t?.confirm || 'Save'}</span>
               </button>
             {/if}
           </div>
@@ -146,7 +153,7 @@
           <div class="editor-header-left">
             <button
               type="button"
-              class="btn btn-ghost btn-sm editor-back-btn"
+              class="btn btn-ghost btn-icon editor-back-btn"
               disabled={busy}
               aria-label={t?.common?.back || 'Back'}
               onclick={requestClose}
@@ -159,7 +166,7 @@
           </div>
           <button
             type="button"
-            class="btn btn-ghost btn-sm editor-close-btn"
+            class="btn btn-ghost btn-icon editor-close-btn"
             disabled={busy}
             aria-label={closeLabel || t?.close || 'Close'}
             onclick={requestClose}

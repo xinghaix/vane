@@ -1,7 +1,8 @@
 // 共享弹层栈管理：
-// 1. 引用计数锁定背景页面滚动（防移动端滚动穿透）
-// 2. 统一 Escape 快捷键分发（始终仅作用于栈顶弹层）
-// 3. 单一共享 History 守卫（手机系统返回键 / iOS 右滑返回优先关闭栈顶弹层而不跳出当前页）
+// 1. 引用计数锁定背景页面滚动（防移动端滚动穿透，可按需关闭如轻量弹出菜单）
+// 2. 统一 Escape 快捷键分发与 Tab 焦点陷阱（始终仅作用于栈顶弹层）
+// 3. 关闭弹层后自动恢复焦点至触发元素（提升键盘与无障碍体验）
+// 4. 单一共享 History 守卫（手机系统返回键 / iOS 右滑返回优先关闭栈顶弹层而不跳出当前页）
 
 const overlayStack = [];
 let scrollLockCount = 0;
@@ -12,6 +13,32 @@ let savedBodyOverscroll = '';
 let listenersReady = false;
 let historyGuardActive = false;
 let ignoreNextPops = 0;
+
+const FOCUSABLE_SELECTOR = [
+  'a[href]',
+  'button:not([disabled])',
+  'input:not([disabled]):not([type="hidden"])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+  'summary',
+].join(', ');
+
+function resolveEl(ref) {
+  if (!ref) return null;
+  return typeof ref === 'function' ? ref() : ref;
+}
+
+function getFocusable(container) {
+  if (!container || typeof container.querySelectorAll !== 'function') return [];
+  return [...container.querySelectorAll(FOCUSABLE_SELECTOR)].filter((el) => {
+    if (el.getAttribute('aria-hidden') === 'true') return false;
+    if (el.tabIndex < 0) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    return el.offsetParent !== null || style.position === 'fixed';
+  });
+}
 
 function acquireScrollLock() {
   if (typeof document === 'undefined') return () => {};
@@ -65,10 +92,42 @@ function popHistoryGuardIfNeeded() {
 }
 
 function handleGlobalKeyDown(e) {
-  if (e.key !== 'Escape' || e.defaultPrevented || overlayStack.length === 0) return;
+  if (overlayStack.length === 0) return;
   const top = overlayStack[overlayStack.length - 1];
-  e.preventDefault();
-  top.onDismiss?.('escape');
+
+  if (e.key === 'Escape') {
+    if (e.defaultPrevented) return;
+    e.preventDefault();
+    top.onDismiss?.('escape');
+    return;
+  }
+
+  if (e.key === 'Tab') {
+    const container = resolveEl(top.trapContainer);
+    if (!container) return;
+    const focusables = getFocusable(container);
+    if (focusables.length === 0) {
+      e.preventDefault();
+      if (typeof container.focus === 'function') {
+        if (!container.hasAttribute('tabindex')) container.setAttribute('tabindex', '-1');
+        container.focus({ preventScroll: true });
+      }
+      return;
+    }
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    const active = document.activeElement;
+    if (!container.contains(active)) {
+      e.preventDefault();
+      (e.shiftKey ? last : first).focus({ preventScroll: true });
+    } else if (e.shiftKey && active === first) {
+      e.preventDefault();
+      last.focus({ preventScroll: true });
+    } else if (!e.shiftKey && active === last) {
+      e.preventDefault();
+      first.focus({ preventScroll: true });
+    }
+  }
 }
 
 function handleGlobalPopState() {
@@ -101,15 +160,48 @@ function ensureGlobalListeners() {
 
 /**
  * 将一个打开中的弹层压入全局栈，返回清理函数（适合直接作为 Svelte `$effect` 返回值）。
+ * 支持可选焦点陷阱（trapContainer）、初始聚焦（initialFocus）、关闭后焦点还原（restoreFocus）与滚动锁定控制（lockScroll）。
  */
-export function registerOverlay({ onDismiss }) {
+export function registerOverlay({
+  onDismiss,
+  lockScroll = true,
+  trapContainer = null,
+  initialFocus = null,
+  restoreFocus = true,
+}) {
   ensureGlobalListeners();
-  const releaseScroll = acquireScrollLock();
-  const entry = { onDismiss };
+  const prevFocused =
+    restoreFocus && typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+  const releaseScroll = lockScroll ? acquireScrollLock() : () => {};
+  const entry = { onDismiss, trapContainer };
   const wasEmpty = overlayStack.length === 0;
   overlayStack.push(entry);
   if (wasEmpty) {
     pushHistoryGuard();
+  }
+
+  // 在微任务后将焦点移入弹层（若子元素尚未自行 autofocus）
+  if (trapContainer || initialFocus) {
+    queueMicrotask(() => {
+      if (!overlayStack.includes(entry)) return;
+      const container = resolveEl(trapContainer);
+      const explicit = resolveEl(initialFocus);
+      if (explicit && typeof explicit.focus === 'function') {
+        explicit.focus({ preventScroll: true });
+        return;
+      }
+      if (container && !container.contains(document.activeElement)) {
+        const focusables = getFocusable(container);
+        if (focusables.length > 0) {
+          focusables[0].focus({ preventScroll: true });
+        } else if (typeof container.focus === 'function') {
+          if (!container.hasAttribute('tabindex')) container.setAttribute('tabindex', '-1');
+          container.focus({ preventScroll: true });
+        }
+      }
+    });
   }
 
   let disposed = false;
@@ -121,6 +213,13 @@ export function registerOverlay({ onDismiss }) {
     releaseScroll();
     if (overlayStack.length === 0) {
       popHistoryGuardIfNeeded();
+    }
+    if (prevFocused && prevFocused.isConnected && typeof prevFocused.focus === 'function') {
+      queueMicrotask(() => {
+        if (prevFocused.isConnected) {
+          prevFocused.focus({ preventScroll: true });
+        }
+      });
     }
   };
 }

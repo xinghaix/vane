@@ -22,8 +22,44 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
+  prepare-signing-pubkey:
+    name: Resolve Built-in Ed25519 Update Public Key
+    runs-on: ubuntu-latest
+    outputs:
+      pubkey_hex: ${{ steps.derive.outputs.pubkey_hex }}
+    steps:
+      - name: Derive Ed25519 public key (hex)
+        id: derive
+        shell: bash
+        env:
+          VANE_RELEASE_SIGNING_KEY: ${{ secrets.VANE_RELEASE_SIGNING_KEY }}
+          VANE_BUILTIN_UPDATE_PUBKEY: ${{ vars.VANE_BUILTIN_UPDATE_PUBKEY }}
+        run: |
+          set -euo pipefail
+          PUBKEY_HEX=""
+          if [ -n "${VANE_RELEASE_SIGNING_KEY:-}" ] && printf '%s\n' "$VANE_RELEASE_SIGNING_KEY" | head -n 1 | grep -q '^-----BEGIN '; then
+            KEY_FILE="$(mktemp)"
+            trap 'rm -f "$KEY_FILE"' EXIT
+            chmod 0600 "$KEY_FILE"
+            printf '%s\n' "$VANE_RELEASE_SIGNING_KEY" > "$KEY_FILE"
+            DER_HEX="$(openssl pkey -in "$KEY_FILE" -pubout -outform DER | od -An -tx1 | tr -d ' \n')"
+            if [ "${#DER_HEX}" -ne 88 ] || [ "${DER_HEX:0:24}" != "302a300506032b6570032100" ]; then
+              echo "Error: VANE_RELEASE_SIGNING_KEY is not an Ed25519 OpenSSL key (unexpected SPKI DER)." >&2
+              exit 1
+            fi
+            PUBKEY_HEX="${DER_HEX:24}"
+            echo "Derived built-in Ed25519 public key (${PUBKEY_HEX:0:8}...${PUBKEY_HEX:56}) from secrets.VANE_RELEASE_SIGNING_KEY."
+          elif [ -n "${VANE_BUILTIN_UPDATE_PUBKEY:-}" ]; then
+            PUBKEY_HEX="$(printf '%s' "$VANE_BUILTIN_UPDATE_PUBKEY" | tr -d '[:space:]')"
+            echo "Using built-in Ed25519 public key from vars.VANE_BUILTIN_UPDATE_PUBKEY."
+          else
+            echo "Notice: No Ed25519 signing key configured; release binaries will build without a built-in update public key."
+          fi
+          echo "pubkey_hex=${PUBKEY_HEX}" >> "$GITHUB_OUTPUT"
+
   build-binaries:
     name: Package Binary (${{ matrix.target }})
+    needs: prepare-signing-pubkey
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -65,12 +101,16 @@ jobs:
 
       - name: Build static binary with cross
         if: matrix.use_cross
+        env:
+          VANE_BUILTIN_UPDATE_PUBKEY: ${{ needs.prepare-signing-pubkey.outputs.pubkey_hex }}
         run: |
           cargo install cross --version 0.2.5 --locked
           cross build --release --locked --target ${{ matrix.target }}
 
       - name: Build native binary
         if: '!matrix.use_cross'
+        env:
+          VANE_BUILTIN_UPDATE_PUBKEY: ${{ needs.prepare-signing-pubkey.outputs.pubkey_hex }}
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package release archive
@@ -120,12 +160,15 @@ jobs:
           chmod 0600 "$KEY_FILE"
           printf '%s\n' "$VANE_RELEASE_SIGNING_KEY" > "$KEY_FILE"
           if head -n 1 "$KEY_FILE" | grep -q '^-----BEGIN '; then
+            openssl pkey -in "$KEY_FILE" -pubout > RELEASE_PUBKEY.pem
+            openssl pkey -in "$KEY_FILE" -pubout -outform DER | tail -c 32 | od -An -tx1 | tr -d ' \n' > RELEASE_PUBKEY.hex
+            printf '\n' >> RELEASE_PUBKEY.hex
             openssl pkeyutl -sign -inkey "$KEY_FILE" -rawin -in SHA256SUMS -out SHA256SUMS.sig
             # 同时为每个归档生成原始 Ed25519 分离签名（Base64），供 Web UI 手动上传更新验签
             for f in *.tar.gz; do
               openssl pkeyutl -sign -inkey "$KEY_FILE" -rawin -in "$f" | base64 -w 0 > "${f}.sig.b64"
             done
-            echo "Signed SHA256SUMS (SHA256SUMS.sig) and archives (*.tar.gz.sig.b64) with Ed25519."
+            echo "Signed SHA256SUMS (SHA256SUMS.sig), archives (*.tar.gz.sig.b64), and exported RELEASE_PUBKEY.{pem,hex}."
           elif head -n 1 "$KEY_FILE" | grep -q '^untrusted comment:'; then
             if ! command -v minisign >/dev/null 2>&1; then
               sudo apt-get update && sudo apt-get install -y minisign
@@ -145,9 +188,11 @@ jobs:
           files: |
             artifacts/*.tar.gz*
             artifacts/SHA256SUMS*
+            artifacts/RELEASE_PUBKEY.*
 
   publish-ghcr:
     name: Build & Push Multi-Arch GHCR Image
+    needs: prepare-signing-pubkey
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -183,6 +228,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            VANE_BUILTIN_UPDATE_PUBKEY=${{ needs.prepare-signing-pubkey.outputs.pubkey_hex }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

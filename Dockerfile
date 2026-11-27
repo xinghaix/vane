@@ -8,7 +8,9 @@ COPY web-ui/ ./
 RUN npm run build
 
 # Stage 2: 构建 Rust 单静态二进制
-FROM rust:1.85-alpine3.21 AS rust-builder
+FROM rust:1.98.1-alpine3.21 AS rust-builder
+ARG VANE_BUILTIN_UPDATE_PUBKEY=""
+ENV VANE_BUILTIN_UPDATE_PUBKEY=${VANE_BUILTIN_UPDATE_PUBKEY}
 RUN apk add --no-cache musl-dev make perl
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs ./

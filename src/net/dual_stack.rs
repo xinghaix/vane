@@ -490,9 +490,15 @@ mod tests {
     #[tokio::test]
     async fn nonexistent_interface_is_rejected_honestly() {
         let err = bind_dual_stack_tcp_on(0, StackMode::Ipv4Only, "vane_nonexist9").err().unwrap();
-        assert!(matches!(
+        assert!(
+            matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput | io::ErrorKind::Other
+            ) || err.raw_os_error() == Some(libc::ENODEV)
+                || err.raw_os_error() == Some(libc::EPERM),
+            "unexpected error for nonexistent interface: {err:?} (kind={:?}, raw={:?})",
             err.kind(),
-            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput | io::ErrorKind::Other
-        ));
+            err.raw_os_error()
+        );
     }
 }

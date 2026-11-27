@@ -236,10 +236,13 @@ pub struct AdminConfig {
     /// 可选：自定义管理面板证书路径（留空则自动生成本地自签 ECDSA 证书或复用 ACME 证书）
     pub tls_cert_path: String,
     pub tls_key_path: String,
-    /// 是否允许通过 Web 上传二进制更新包（默认关闭，仅由配置文件显式开启）
-    #[serde(default)]
+    /// 是否允许通过 Web 上传经 Ed25519 验签的二进制更新包（默认 true：存在内置官方公钥或
+    /// config.toml 配置的 update_signing_public_key 时开箱可用；设为 false 可彻底禁用 Web 上传；
+    /// 仅允许通过本地 config.toml 修改，严禁经 Web API 变更）
+    #[serde(default = "default_true")]
     pub allow_manual_update_upload: bool,
-    /// 手动更新包 Ed25519 验签公钥（32 字节 hex 或 base64；空表示未配置）
+    /// 可选：自定义手动更新包 Ed25519 验签公钥（32 字节 hex 或 base64；留空时使用二进制内置官方公钥，
+    /// 若当前构建未内置官方公钥且此处留空则拒绝上传；仅允许通过本地 config.toml 修改）
     #[serde(default)]
     pub update_signing_public_key: String,
     /// 是否允许计划任务执行宿主机命令 CronAction::Exec（默认关闭，仅由配置文件显式开启）
@@ -275,7 +278,7 @@ impl Default for AdminConfig {
             extra_allowed_origins: Vec::new(),
             tls_cert_path: String::new(),
             tls_key_path: String::new(),
-            allow_manual_update_upload: false,
+            allow_manual_update_upload: true,
             update_signing_public_key: String::new(),
             allow_cron_exec: false,
         }
@@ -961,11 +964,16 @@ pub fn encode_secret_segment(seg: &str) -> String {
     out
 }
 
-/// 解析 32 字节 Ed25519 公钥（支持 64 位 hex 或标准/URL-safe base64）
+/// 解析 32 字节 Ed25519 公钥（支持 64 位 hex 或标准/URL-safe base64，可选 `ed25519:` 前缀）
 pub fn decode_ed25519_public_key(raw: &str) -> Option<[u8; 32]> {
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
     use base64::Engine;
-    let s = raw.trim();
+    let trimmed = raw.trim();
+    let s = trimmed
+        .strip_prefix("ed25519:")
+        .or_else(|| trimmed.strip_prefix("ED25519:"))
+        .unwrap_or(trimmed)
+        .trim();
     if s.is_empty() {
         return None;
     }
@@ -980,7 +988,7 @@ pub fn decode_ed25519_public_key(raw: &str) -> Option<[u8; 32]> {
             .or_else(|_| URL_SAFE_NO_PAD.decode(s))
             .ok()?
     };
-    if bytes.len() != 32 {
+    if bytes.len() != 32 || bytes.iter().all(|&b| b == 0) {
         return None;
     }
     let mut out = [0u8; 32];
@@ -2738,12 +2746,21 @@ mod tests {
     fn security_hardening_validations() {
         // VANE-H07 / VANE-M06: AdminConfig defaults & validation
         let mut c = Config::default();
-        assert!(!c.admin.allow_manual_update_upload);
+        assert!(c.admin.allow_manual_update_upload);
         assert!(c.admin.update_signing_public_key.is_empty());
         assert!(!c.admin.allow_cron_exec);
+        // 未写 allow_manual_update_upload 时反序列化默认为 true，显式写 false 时保持 false
+        let parsed_default: Config = toml::from_str("[admin]\n").unwrap();
+        assert!(parsed_default.admin.allow_manual_update_upload);
+        let parsed_disabled: Config = toml::from_str("[admin]\nallow_manual_update_upload = false\n").unwrap();
+        assert!(!parsed_disabled.admin.allow_manual_update_upload);
         c.admin.update_signing_public_key = "not-a-valid-key".into();
         assert!(c.validate().is_err());
+        c.admin.update_signing_public_key = "00".repeat(32); // all-zero key rejected
+        assert!(c.validate().is_err());
         c.admin.update_signing_public_key = "ab".repeat(32); // 32-byte hex
+        c.validate().unwrap();
+        c.admin.update_signing_public_key = format!("ed25519:{}", "ab".repeat(32));
         c.validate().unwrap();
         c.admin.update_signing_public_key = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,

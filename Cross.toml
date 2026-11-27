@@ -1,0 +1,4 @@
+[build.env]
+passthrough = [
+    "VANE_BUILTIN_UPDATE_PUBKEY",
+]

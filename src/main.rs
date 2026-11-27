@@ -163,15 +163,16 @@ fn resolve_update_signing_public_key(
     cli_pubkey: Option<&str>,
     env_pubkey: Option<&str>,
     config_pubkey: Option<&str>,
+    builtin_pubkey: Option<&str>,
 ) -> Result<String, String> {
-    let chosen = [cli_pubkey, env_pubkey, config_pubkey]
+    let chosen = [cli_pubkey, env_pubkey, config_pubkey, builtin_pubkey]
         .into_iter()
         .flatten()
         .map(str::trim)
         .find(|s| !s.is_empty())
         .ok_or_else(|| {
-            "安全拦截：未配置发布签名 Ed25519 公钥，拒绝执行无签名在线更新。\n\
-             请通过以下任一方式提供受信任的 Ed25519 公钥（32 字节 Hex/Base64 或 OpenSSL PEM 文件）：\n  \
+            "安全拦截：当前构建未内置官方发布公钥且未配置发布签名 Ed25519 公钥，拒绝执行无签名在线更新。\n\
+             正式 Release 构建会自动内置官方公钥；自编译版本请通过以下任一方式提供受信任的 Ed25519 公钥（32 字节 Hex/Base64 或 OpenSSL PEM 文件）：\n  \
                1) CLI 参数: vane update --pubkey <key_or_pem_path>\n  \
                2) 环境变量: VANE_RELEASE_PUBKEY=<key_or_pem_path> vane update\n  \
                3) 配置文件: 在 config.toml 的 [admin] 段配置 update_signing_public_key = \"...\""
@@ -454,7 +455,13 @@ async fn run_cli_self_update(
     let cfg_pubkey = existing_cfg
         .as_ref()
         .map(|c| c.admin.update_signing_public_key.as_str());
-    let pubkey_hex = resolve_update_signing_public_key(pubkey_override, env_pubkey.as_deref(), cfg_pubkey)?;
+    let builtin_pubkey = daemon::updater::builtin_update_signing_public_key();
+    let pubkey_hex = resolve_update_signing_public_key(
+        pubkey_override,
+        env_pubkey.as_deref(),
+        cfg_pubkey,
+        builtin_pubkey.as_deref(),
+    )?;
 
     let raw_repo = repo_override
         .map(str::trim)
@@ -2203,29 +2210,35 @@ mod tests {
 
     #[test]
     fn update_pubkey_resolution_precedence_pem_file_and_fail_closed() {
-        // 无任何公钥配置时必须 fail-closed
-        assert!(resolve_update_signing_public_key(None, None, None).is_err());
-        assert!(resolve_update_signing_public_key(Some("  "), Some(""), Some(" ")).is_err());
+        // 无任何公钥配置（含未内置公钥）时必须 fail-closed
+        assert!(resolve_update_signing_public_key(None, None, None, None).is_err());
+        assert!(resolve_update_signing_public_key(Some("  "), Some(""), Some(" "), Some("")).is_err());
 
         let key_a = [0x11u8; 32];
         let key_b = [0x22u8; 32];
         let key_c = [0x33u8; 32];
+        let key_d = [0x44u8; 32];
         let hex_a = daemon::updater::hex_encode(&key_a);
         let b64_b = base64::engine::general_purpose::STANDARD.encode(key_b);
         let hex_c = daemon::updater::hex_encode(&key_c);
+        let hex_d = daemon::updater::hex_encode(&key_d);
 
-        // 优先级：CLI > ENV > config.toml
+        // 优先级：CLI > ENV > config.toml > 内置官方公钥
         assert_eq!(
-            resolve_update_signing_public_key(Some(&hex_a), Some(&b64_b), Some(&hex_c)).unwrap(),
+            resolve_update_signing_public_key(Some(&hex_a), Some(&b64_b), Some(&hex_c), Some(&hex_d)).unwrap(),
             hex_a
         );
         assert_eq!(
-            resolve_update_signing_public_key(None, Some(&b64_b), Some(&hex_c)).unwrap(),
+            resolve_update_signing_public_key(None, Some(&b64_b), Some(&hex_c), Some(&hex_d)).unwrap(),
             daemon::updater::hex_encode(&key_b)
         );
         assert_eq!(
-            resolve_update_signing_public_key(None, None, Some(&hex_c)).unwrap(),
+            resolve_update_signing_public_key(None, None, Some(&hex_c), Some(&hex_d)).unwrap(),
             hex_c
+        );
+        assert_eq!(
+            resolve_update_signing_public_key(None, None, None, Some(&hex_d)).unwrap(),
+            hex_d
         );
 
         // 支持 OpenSSL Ed25519 SPKI PEM 文本与常规文件，并拒绝符号链接文件
@@ -2237,7 +2250,7 @@ mod tests {
             base64::engine::general_purpose::STANDARD.encode(&spki_der)
         );
         assert_eq!(
-            resolve_update_signing_public_key(Some(&pem), None, None).unwrap(),
+            resolve_update_signing_public_key(Some(&pem), None, None, None).unwrap(),
             hex_a
         );
 
@@ -2247,10 +2260,10 @@ mod tests {
         fs::write(&pem_path, &pem).unwrap();
         symlink(&pem_path, &pem_link).unwrap();
         assert_eq!(
-            resolve_update_signing_public_key(Some(pem_path.to_str().unwrap()), None, None).unwrap(),
+            resolve_update_signing_public_key(Some(pem_path.to_str().unwrap()), None, None, None).unwrap(),
             hex_a
         );
-        assert!(resolve_update_signing_public_key(Some(pem_link.to_str().unwrap()), None, None).is_err());
+        assert!(resolve_update_signing_public_key(Some(pem_link.to_str().unwrap()), None, None, None).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -16,6 +16,8 @@
   let limits = $state({ max_upload_mb: 48, max_uncompressed_mb: 128, max_entries: 64 });
   let allowManualUpload = $state(null);
   let signingKeyConfigured = $state(null);
+  let signingKeySource = $state(null);
+  let signingKeyFingerprint = $state('');
   let loading = $state(false);
   let checking = $state(false);
   let savingCfg = $state(false);
@@ -36,12 +38,19 @@
   let manualUploadEnabled = $derived(
     allowManualUpload !== null
       ? allowManualUpload
-      : Boolean(settingsJson?.admin?.allow_manual_update_upload)
+      : settingsJson?.admin?.allow_manual_update_upload !== false
   );
   let signingKeyReady = $derived(
     signingKeyConfigured !== null
       ? signingKeyConfigured
       : Boolean(settingsJson?.admin?.update_signing_public_key)
+  );
+  let resolvedKeySource = $derived(
+    signingKeySource !== null
+      ? signingKeySource
+      : settingsJson?.admin?.update_signing_public_key
+        ? 'config'
+        : 'none'
   );
 
   $effect(() => {
@@ -80,6 +89,12 @@
       }
       if (typeof r.update_signing_key_configured === 'boolean') {
         signingKeyConfigured = r.update_signing_key_configured;
+      }
+      if (typeof r.update_signing_key_source === 'string') {
+        signingKeySource = r.update_signing_key_source;
+      }
+      if (typeof r.update_signing_key_fingerprint === 'string') {
+        signingKeyFingerprint = r.update_signing_key_fingerprint;
       }
     } catch (err) {
       if (!silent) showToast(err.message, 'error');
@@ -129,6 +144,12 @@
       }
       if (typeof r.update_signing_key_configured === 'boolean') {
         signingKeyConfigured = r.update_signing_key_configured;
+      }
+      if (typeof r.update_signing_key_source === 'string') {
+        signingKeySource = r.update_signing_key_source;
+      }
+      if (typeof r.update_signing_key_fingerprint === 'string') {
+        signingKeyFingerprint = r.update_signing_key_fingerprint;
       }
       if (status?.has_update && status?.latest) {
         showToast(`${t.update.newVersionFound}: ${status.latest.tag_name}`, 'info');
@@ -228,6 +249,14 @@
           showToast(t.errors.MANUAL_UPDATE_DISABLED, 'error');
           return;
         }
+        if (res.status === 403 && errCode === 'MANUAL_UPDATE_SIGNING_KEY_MISSING') {
+          signingKeyConfigured = false;
+          signingKeySource = 'none';
+          signingKeyFingerprint = '';
+          uploadError = t.update.signingKeyMissingWarn;
+          showToast(t.errors.MANUAL_UPDATE_SIGNING_KEY_MISSING, 'error');
+          return;
+        }
         const msg = localizeError(data.message || data.error || `HTTP ${res.status}`, lang, errCode);
         uploadError = msg;
         showToast(msg, 'error');
@@ -265,7 +294,10 @@
     repo = String(u.repo || 'xinghaix/vane');
   }
 
-  const MANUAL_UPDATE_SNIPPET = `[admin]\nallow_manual_update_upload = true\nupdate_signing_public_key = "<Ed25519 public key>"`;
+  const MANUAL_UPDATE_ENABLE_SNIPPET = `[admin]\nallow_manual_update_upload = true`;
+  const MANUAL_UPDATE_FULL_SNIPPET = `[admin]\nallow_manual_update_upload = true\nupdate_signing_public_key = "<Ed25519 public key>"`;
+  const SIGNING_KEY_ONLY_SNIPPET = `[admin]\nupdate_signing_public_key = "<Ed25519 public key>"`;
+  let disabledSnippet = $derived(signingKeyReady ? MANUAL_UPDATE_ENABLE_SNIPPET : MANUAL_UPDATE_FULL_SNIPPET);
   let uploadLocked = $derived(!manualUploadEnabled || !signingKeyReady);
   let copySnippetLabel = $derived(
     t.update?.copyConfigSnippet || (lang === 'en' ? 'Copy config.toml snippet' : '复制 config.toml 配置片段')
@@ -494,11 +526,11 @@
             {t.update.manualUploadDisabledGuide}
           </div>
           <div class="upd-snippet-box">
-            <pre class="mono upd-snippet-pre">{MANUAL_UPDATE_SNIPPET}</pre>
+            <pre class="mono upd-snippet-pre">{disabledSnippet}</pre>
             <button
               type="button"
               class="btn btn-xs"
-              onclick={() => copyTextSafe(MANUAL_UPDATE_SNIPPET)}
+              onclick={() => copyTextSafe(disabledSnippet)}
             >
               <Icons name="copy" size={12} />
               <span>{copySnippetLabel}</span>
@@ -510,19 +542,41 @@
   {:else if !signingKeyReady}
     <div class="banner banner-warn upd-banner-gap">
       <div class="banner-main">
-        <Icons name="alert" size={16} />
-        <div style="font-size:12.5px;min-width:0;flex:1;">
-          <div>{t.update.signingKeyMissingWarn}</div>
+        <Icons name="shield" size={16} />
+        <div style="min-width:0;flex:1;">
+          <div style="font-weight:700;font-size:13px;">{t.update.signingKeyMissingTitle}</div>
+          <div style="font-size:12px;color:var(--text-secondary);margin-top:3px;line-height:1.5;">
+            {t.update.signingKeyMissingWarn}
+          </div>
           <div class="upd-snippet-box">
-            <pre class="mono upd-snippet-pre">{MANUAL_UPDATE_SNIPPET}</pre>
+            <pre class="mono upd-snippet-pre">{SIGNING_KEY_ONLY_SNIPPET}</pre>
             <button
               type="button"
               class="btn btn-xs"
-              onclick={() => copyTextSafe(MANUAL_UPDATE_SNIPPET)}
+              onclick={() => copyTextSafe(SIGNING_KEY_ONLY_SNIPPET)}
             >
               <Icons name="copy" size={12} />
               <span>{copySnippetLabel}</span>
             </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  {:else}
+    <div class="banner banner-ok upd-banner-gap">
+      <div class="banner-main">
+        <Icons name="shield" size={16} />
+        <div style="min-width:0;flex:1;">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+            <span style="font-weight:700;font-size:13px;">
+              {resolvedKeySource === 'config' ? t.update.signingKeyConfigTitle : t.update.signingKeyBuiltinTitle}
+            </span>
+            {#if signingKeyFingerprint}
+              <code class="code-chip mono" style="font-size:11.5px;">{signingKeyFingerprint}</code>
+            {/if}
+          </div>
+          <div style="font-size:12px;color:var(--text-secondary);margin-top:3px;line-height:1.5;">
+            {resolvedKeySource === 'config' ? t.update.signingKeyConfigDesc : t.update.signingKeyBuiltinDesc}
           </div>
         </div>
       </div>

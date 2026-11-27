@@ -33,6 +33,97 @@ pub const MIN_TEMP_FREE_BYTES: u64 = 64 * 1024 * 1024;
 const GZIP_TIMEOUT_SECS: u64 = 30;
 const PROBE_TIMEOUT_SECS: u64 = 5;
 
+/// 源码内置的官方 Ed25519 发布公钥（64 位小写 Hex；留空表示未在源码中固化）。
+/// 正式 CI Release / Docker 构建会优先通过 `VANE_BUILTIN_UPDATE_PUBKEY` 环境变量在编译期自动注入。
+const DEFAULT_OFFICIAL_UPDATE_SIGNING_PUBLIC_KEY: &str = "";
+
+/// 当前生效的更新验签 Ed25519 公钥来源
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateSigningKeySource {
+    Config,
+    Builtin,
+    None,
+}
+
+impl UpdateSigningKeySource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::Builtin => "builtin",
+            Self::None => "none",
+        }
+    }
+}
+
+/// 解析后的生效更新验签公钥
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedUpdateSigningKey {
+    pub public_key_hex: String,
+    pub source: UpdateSigningKeySource,
+    pub fingerprint: String,
+}
+
+/// 格式化 64 位 Hex 公钥短指纹（例如 `a1b2c3d4…e5f60718`）
+pub fn format_pubkey_fingerprint(pubkey_hex: &str) -> String {
+    let hex = pubkey_hex.trim();
+    if hex.len() == 64 && hex.is_ascii() {
+        format!("{}…{}", &hex[..8], &hex[56..])
+    } else {
+        hex.to_string()
+    }
+}
+
+/// 返回二进制内置的官方 Ed25519 发布公钥（标准化为 64 位小写 Hex）。
+/// 优先使用构建期环境变量 `VANE_BUILTIN_UPDATE_PUBKEY` 注入的值，其次回退到源码固化常量。
+pub fn builtin_update_signing_public_key() -> Option<String> {
+    let compiled = option_env!("VANE_COMPILED_UPDATE_PUBKEY").unwrap_or("").trim();
+    let raw = if !compiled.is_empty() {
+        compiled
+    } else {
+        DEFAULT_OFFICIAL_UPDATE_SIGNING_PUBLIC_KEY.trim()
+    };
+    if raw.is_empty() {
+        return None;
+    }
+    parse_ed25519_public_key(raw).ok().map(|b| hex_encode(&b))
+}
+
+/// 解析当前生效的 Ed25519 更新验签公钥（`config.toml` 自定义覆盖 > 二进制内置官方公钥）。
+/// 若配置文件显式填写了非空但非法的公钥，严格失败关闭（绝不静默回退到内置公钥）。
+pub fn resolve_effective_signing_public_key(config_key: &str) -> Result<Option<ResolvedUpdateSigningKey>, String> {
+    let builtin = builtin_update_signing_public_key();
+    resolve_effective_signing_public_key_with_builtin(config_key, builtin.as_deref())
+}
+
+pub fn resolve_effective_signing_public_key_with_builtin(
+    config_key: &str,
+    builtin_key: Option<&str>,
+) -> Result<Option<ResolvedUpdateSigningKey>, String> {
+    let cfg_trimmed = config_key.trim();
+    if !cfg_trimmed.is_empty() {
+        let pk_bytes = parse_ed25519_public_key(cfg_trimmed)?;
+        let public_key_hex = hex_encode(&pk_bytes);
+        let fingerprint = format_pubkey_fingerprint(&public_key_hex);
+        return Ok(Some(ResolvedUpdateSigningKey {
+            public_key_hex,
+            source: UpdateSigningKeySource::Config,
+            fingerprint,
+        }));
+    }
+    if let Some(bk) = builtin_key.map(str::trim).filter(|s| !s.is_empty()) {
+        let pk_bytes = parse_ed25519_public_key(bk)?;
+        let public_key_hex = hex_encode(&pk_bytes);
+        let fingerprint = format_pubkey_fingerprint(&public_key_hex);
+        return Ok(Some(ResolvedUpdateSigningKey {
+            public_key_hex,
+            source: UpdateSigningKeySource::Builtin,
+            fingerprint,
+        }));
+    }
+    Ok(None)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReleaseInfo {
     pub tag_name: String,
@@ -1165,9 +1256,13 @@ pub fn parse_ed25519_public_key(raw: &str) -> Result<[u8; 32], String> {
     if cleaned.is_empty() {
         return Err("未配置更新签名 Ed25519 公钥".into());
     }
-    hex_decode_exact::<32>(cleaned)
+    let bytes = hex_decode_exact::<32>(cleaned)
         .or_else(|| b64_decode_exact::<32>(cleaned))
-        .ok_or_else(|| "Ed25519 公钥格式无效（需 32 字节 Base64 或 64 位 Hex）".to_string())
+        .ok_or_else(|| "Ed25519 公钥格式无效（需 32 字节 Base64 或 64 位 Hex）".to_string())?;
+    if bytes.iter().all(|&b| b == 0) {
+        return Err("Ed25519 公钥不能为全零".into());
+    }
+    Ok(bytes)
 }
 
 pub fn parse_ed25519_signature(raw: &str) -> Result<[u8; 64], String> {
@@ -1858,5 +1953,39 @@ mod tests {
         let other_kp = Ed25519KeyPair::from_pkcs8(other_pkcs8.as_ref()).unwrap();
         let other_pub = base64::engine::general_purpose::STANDARD.encode(other_kp.public_key().as_ref());
         assert!(verify_archive_ed25519_signature(&archive, Some(&sig_b64), &other_pub).is_err());
+
+        // 5. 全零公钥必须被拒绝
+        assert!(parse_ed25519_public_key(&"00".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn resolve_effective_signing_key_prioritizes_config_over_builtin_and_fails_closed() {
+        let builtin_hex = "11".repeat(32);
+        let config_bytes = [0x22u8; 32];
+        let config_b64 = base64::engine::general_purpose::STANDARD.encode(config_bytes);
+        let config_hex = "22".repeat(32);
+
+        // 无配置且无内置公钥 -> None
+        assert_eq!(resolve_effective_signing_public_key_with_builtin("", None).unwrap(), None);
+        assert_eq!(resolve_effective_signing_public_key_with_builtin("  ", Some("")).unwrap(), None);
+
+        // 仅内置公钥 -> Builtin
+        let r_builtin = resolve_effective_signing_public_key_with_builtin("", Some(&builtin_hex))
+            .unwrap()
+            .expect("builtin key should resolve");
+        assert_eq!(r_builtin.source, UpdateSigningKeySource::Builtin);
+        assert_eq!(r_builtin.public_key_hex, builtin_hex);
+        assert_eq!(r_builtin.fingerprint, "11111111…11111111");
+
+        // config.toml 配置覆盖内置公钥 -> Config
+        let r_cfg = resolve_effective_signing_public_key_with_builtin(&config_b64, Some(&builtin_hex))
+            .unwrap()
+            .expect("config key should override builtin");
+        assert_eq!(r_cfg.source, UpdateSigningKeySource::Config);
+        assert_eq!(r_cfg.public_key_hex, config_hex);
+        assert_eq!(r_cfg.fingerprint, "22222222…22222222");
+
+        // config.toml 公钥非法时严格失败关闭，绝不静默回退到内置公钥
+        assert!(resolve_effective_signing_public_key_with_builtin("bad-key", Some(&builtin_hex)).is_err());
     }
 }

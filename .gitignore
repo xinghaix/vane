@@ -11,4 +11,6 @@ vane-ddns-hosts
 config.toml
 config.toml.bak
 *.tmp.*
+*.key.pem
+vane-release.key.pem
 .DS_Store

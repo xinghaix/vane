@@ -5,7 +5,7 @@
 Vane 运行于路由器边界并管理公网端口防火墙，安全是最高优先级：
 1. **默认仅监听局域网 (`192.168.1.1:23456`)**，且初次登录强制修改初始密码 `admin321`（已配置合法纯 Passkey 认证时除外）。
 2. **本机高危端口与上游 SSRF 硬保护**：严禁在 WAN `INPUT`/`FORWARD` 或反向代理上游暴露 `22`, `23`, `53`, `80`, `443`, `2375`, `2376`, `23456` 等路由器管理与核心服务端口；校验覆盖运行中活态 + 配置 `admin.listen_lan`、本机全部网卡地址、链路本地/云元数据/NAT64 网段，并在反向代理拨号前执行单次 DNS 解析与解析后全量 IP 校验。
-3. **高权限执行与更新边界**：防火墙命令采用参数数组、`fw3` 原子 `iptables-restore --noflush` 与固定安全 `PATH`；`admin.allow_cron_exec`、`admin.allow_manual_update_upload`、`admin.update_signing_public_key` 与 `admin.docker_socket` 均为配置文件只读项（默认关闭或不可经 Web 修改）。CLI `vane update` 已移除 `curl | sh` 改为纯 Rust HTTPS + Ed25519 验签自更新，手动上传更新须通过 Ed25519 独立验签且探测子进程在 root 下主动降权至 `nobody (65534:65534)`；启用 Web 终端或 `allow_cron_exec` 仍具有宿主高权限，切勿在非受信环境下开启。
+3. **高权限执行与更新边界**：防火墙命令采用参数数组、`fw3` 原子 `iptables-restore --noflush` 与固定安全 `PATH`；`admin.allow_cron_exec`、`admin.allow_manual_update_upload`、`admin.update_signing_public_key` 与 `admin.docker_socket` 均为配置文件只读项（不可经 Web 修改）。CLI `vane update` 已移除 `curl | sh` 改为纯 Rust HTTPS + Ed25519 验签自更新；手动上传更新默认仅放行通过受信任 Ed25519 公钥（`config.toml` 自定义公钥优先，其次二进制内置官方公钥，均缺失时 Fail-Closed）验签且不降级的发布包，探测子进程在 root 下主动降权至 `nobody (65534:65534)`，且仍可在 `config.toml` 设 `admin.allow_manual_update_upload = false` 彻底关闭；启用 Web 终端或 `allow_cron_exec` 仍具有宿主高权限，切勿在非受信环境下开启。
 4. **Web 终端默认关闭 (`modules.web_terminal = false`)**，容器示例 `docker-compose.example.yml` 默认不挂载 `/var/run/docker.sock`。
 
 ## 当前管理面边界

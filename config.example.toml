@@ -47,11 +47,12 @@ totp_recovery_hashes = []              # 核销时强制先原子写盘成功再
 passkey_enabled = false
 session_ttl_secs = 3600                # 登录态保活默认 1 小时 (3600s)，允许自定义范围 300 ~ 86400s (最大 24 小时)
 docker_socket = "/var/run/docker.sock"
-# 4) 高危宿主执行与手动更新安全边界（默认全部关闭，严禁通过普通 Web 设置静默放宽）：
-#    - allow_manual_update_upload: 默认 false，禁用 Web 端离线更新包上传，防止在关闭 Web 终端时出现未验证原生代码执行面；
-#      启用后必须同时配置下方 update_signing_public_key，且所有上传包在 chmod/探测执行前强制完成 Ed25519 签名验证。
-allow_manual_update_upload = false
-#    - update_signing_public_key: 32 字节 Ed25519 发布公钥（64 位十六进制或 Base64 编码）；留空时拒绝所有手动上传更新
+# 4) 高危宿主执行与手动更新安全边界（以下字段均为配置文件只读项，严禁通过普通 Web 设置修改）：
+#    - allow_manual_update_upload: 默认 true，仅允许上传通过 Ed25519 密码学验签的更新包（正式 Release 构建已内置官方发布公钥，
+#      开箱可用；自编译/开发构建在未内置公钥且下方 update_signing_public_key 留空时默认失败关闭）；设为 false 可彻底禁用 Web 上传。
+allow_manual_update_upload = true
+#    - update_signing_public_key: 可选，32 字节 Ed25519 发布公钥（64 位十六进制或 Base64 编码）；
+#      配置后将覆盖内置官方公钥（适用于私有/自建发布）；留空则使用二进制内置官方公钥。
 update_signing_public_key = ""
 #    - allow_cron_exec: 默认 false，禁止启用 kind = "exec" 本地命令计划任务，防止在 web_terminal = false 基线下
 #      通过计划任务执行任意宿主命令；仅在确需本地命令计划任务时由宿主机配置文件显式开启。

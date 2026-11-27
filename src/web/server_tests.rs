@@ -1076,13 +1076,12 @@ mod wave2_security_regressions {
             .await
             .expect("lockdown must notify reload_notify");
 
-        // VANE-H07：启用手动上传 + Ed25519 公钥，测试缺少签名 / 错误签名 / 查询参数 ?signature=
+        // VANE-H07：仅配置 Ed25519 公钥（默认 allow_manual_update_upload = true），测试缺少签名 / 错误签名 / 查询参数 ?signature=
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
         let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
         {
             let mut next = (**state.config.load()).clone();
-            next.admin.allow_manual_update_upload = true;
             next.admin.update_signing_public_key = B64.encode(kp.public_key().as_ref());
             state.config.store(Arc::new(next));
         }
@@ -1102,6 +1101,8 @@ mod wave2_security_regressions {
             serde_json::from_slice(&to_bytes(status_r.into_body(), 8192).await.unwrap()).unwrap();
         assert_eq!(status_j["allow_manual_update_upload"], true);
         assert_eq!(status_j["update_signing_key_configured"], true);
+        assert_eq!(status_j["update_signing_key_source"], "config");
+        assert_eq!(status_j["manual_upload_ready"], true);
 
         let tok1 = get_pw_reauth(&app, &cookie, "Vane#Wave2Pass1").await;
         let no_sig = app
@@ -1229,10 +1230,16 @@ mod wave2_security_regressions {
         }
 
         // 3) VANE-M07 / H07 / M06：配置文件专有字段无法经 PUT /api/settings 篡改
+        {
+            // 先设为 false，验证无法通过 Web API 提权改回 true
+            let mut next = (**state.config.load()).clone();
+            next.admin.allow_manual_update_upload = false;
+            state.config.store(Arc::new(next));
+        }
         let mut try_elevate = base_cfg.clone();
         try_elevate["admin"]["docker_socket"] = serde_json::json!("/run/other.sock");
         try_elevate["admin"]["allow_manual_update_upload"] = serde_json::json!(true);
-        try_elevate["admin"]["update_signing_public_key"] = serde_json::json!("00".repeat(32));
+        try_elevate["admin"]["update_signing_public_key"] = serde_json::json!("11".repeat(32));
         try_elevate["admin"]["allow_cron_exec"] = serde_json::json!(true);
         let elev_r = app
             .clone()

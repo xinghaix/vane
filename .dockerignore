@@ -25,3 +25,6 @@ notifications.json
 **/.lockdown
 vane-ddns-hosts
 split-dns.hosts
+*.key.pem
+**/*.key.pem
+vane-release.key.pem

@@ -3747,17 +3747,28 @@ async fn api_inbox_clear(State(state): State<Arc<AppState>>, headers: HeaderMap)
     Json(serde_json::json!({ "ok": true, "unread_count": 0 })).into_response()
 }
 
+fn update_signing_key_status(cfg: &Config) -> (bool, &'static str, String) {
+    match crate::daemon::updater::resolve_effective_signing_public_key(&cfg.admin.update_signing_public_key) {
+        Ok(Some(resolved)) => (true, resolved.source.as_str(), resolved.fingerprint),
+        Ok(None) | Err(_) => (false, crate::daemon::updater::UpdateSigningKeySource::None.as_str(), String::new()),
+    }
+}
+
 async fn api_update_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Err(resp) = require_full_admin(&state, &headers) {
         return *resp;
     }
     let cfg = state.config.load();
     let snap = state.updater.snapshot();
+    let (key_ready, key_source, key_fingerprint) = update_signing_key_status(&cfg);
     Json(serde_json::json!({
         "status": snap,
         "config": cfg.update,
         "allow_manual_update_upload": cfg.admin.allow_manual_update_upload,
-        "update_signing_key_configured": !cfg.admin.update_signing_public_key.trim().is_empty(),
+        "update_signing_key_configured": key_ready,
+        "update_signing_key_source": key_source,
+        "update_signing_key_fingerprint": key_fingerprint,
+        "manual_upload_ready": cfg.admin.allow_manual_update_upload && key_ready,
         "limits": {
             "max_upload_mb": crate::daemon::updater::MAX_UPLOAD_ARCHIVE_BYTES / (1024 * 1024),
             "max_uncompressed_mb": crate::daemon::updater::MAX_UNCOMPRESSED_TAR_BYTES / (1024 * 1024),
@@ -3789,6 +3800,7 @@ async fn api_update_check(State(state): State<Arc<AppState>>, headers: HeaderMap
         }
     }
     let snap = state.updater.snapshot();
+    let (key_ready, key_source, key_fingerprint) = update_signing_key_status(&cfg);
     if let Some(err) = err_msg {
         return (
             StatusCode::BAD_GATEWAY,
@@ -3797,7 +3809,10 @@ async fn api_update_check(State(state): State<Arc<AppState>>, headers: HeaderMap
                 "status": snap,
                 "config": cfg.update,
                 "allow_manual_update_upload": cfg.admin.allow_manual_update_upload,
-                "update_signing_key_configured": !cfg.admin.update_signing_public_key.trim().is_empty(),
+                "update_signing_key_configured": key_ready,
+                "update_signing_key_source": key_source,
+                "update_signing_key_fingerprint": key_fingerprint,
+                "manual_upload_ready": cfg.admin.allow_manual_update_upload && key_ready,
             })),
         )
             .into_response();
@@ -3806,7 +3821,10 @@ async fn api_update_check(State(state): State<Arc<AppState>>, headers: HeaderMap
         "status": snap,
         "config": cfg.update,
         "allow_manual_update_upload": cfg.admin.allow_manual_update_upload,
-        "update_signing_key_configured": !cfg.admin.update_signing_public_key.trim().is_empty(),
+        "update_signing_key_configured": key_ready,
+        "update_signing_key_source": key_source,
+        "update_signing_key_fingerprint": key_fingerprint,
+        "manual_upload_ready": cfg.admin.allow_manual_update_upload && key_ready,
     }))
     .into_response()
 }
@@ -3843,18 +3861,41 @@ async fn api_update_upload(
         Err(resp) => return *resp,
     };
     let cfg = state.config.load_full();
-    // VANE-H07：手动上传二进制更新默认关闭，仅由 config.toml 显式开启
+    // VANE-H07：允许仅在存在可信 Ed25519 公钥（config.toml 自定义覆盖 > 二进制内置官方公钥）且未显式禁用时上传
     if !cfg.admin.allow_manual_update_upload {
         return (
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
                 "error": "MANUAL_UPDATE_DISABLED",
                 "code": "MANUAL_UPDATE_DISABLED",
-                "message": "手动二进制上传更新功能默认关闭，请在 config.toml 中显式设置 admin.allow_manual_update_upload = true 与 admin.update_signing_public_key 后重启启用"
+                "message": "手动二进制上传更新已在 config.toml 中关闭，如需启用请将 admin.allow_manual_update_upload 设为 true（或删除该项）并重启 Vane"
             })),
         )
             .into_response();
     }
+    let resolved_signing_key = match crate::daemon::updater::resolve_effective_signing_public_key(
+        &cfg.admin.update_signing_public_key,
+    ) {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "MANUAL_UPDATE_SIGNING_KEY_MISSING",
+                    "code": "MANUAL_UPDATE_SIGNING_KEY_MISSING",
+                    "message": "当前构建未内置官方 Ed25519 发布公钥且 config.toml 未配置 admin.update_signing_public_key，已拒绝未签名更新上传"
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("安全拦截：{}，拒绝未签名更新包", e) })),
+            )
+                .into_response();
+        }
+    };
     let ban_key = BanKey::from_peer(peer.ip());
     if state.fail2ban.is_key_banned(ban_key) {
         return (
@@ -3925,14 +3966,7 @@ async fn api_update_upload(
                 .map(str::to_string)
         });
 
-    // 在落盘前先行校验签名公钥与请求签名格式，避免无效未签名上传浪费路由器闪存 I/O
-    if let Err(e) = crate::daemon::updater::parse_ed25519_public_key(&cfg.admin.update_signing_public_key) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("安全拦截：{}，拒绝未签名更新包", e) })),
-        )
-            .into_response();
-    }
+    // 在落盘前先行校验请求签名格式，避免无效未签名上传浪费路由器闪存 I/O（信任公钥已在入口完成解析）
     match expected_signature_b64.as_deref() {
         Some(sig) => {
             if let Err(e) = crate::daemon::updater::parse_ed25519_signature(sig) {
@@ -4081,7 +4115,7 @@ async fn api_update_upload(
         }
     };
     let config_path = state.config_path.clone();
-    let signing_public_key = cfg.admin.update_signing_public_key.clone();
+    let signing_public_key = resolved_signing_key.public_key_hex;
 
     // VANE-L11：使用受并发上限 1 保护的独立 OS 线程 + oneshot 执行耗时更新校验，避免阻塞全局 Tokio blocking 线程池
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -4627,6 +4661,9 @@ fn detect_backup_security_downgrades(current: &Config, restored: &Config) -> Vec
     }
     if !current.admin.allow_manual_update_upload && restored.admin.allow_manual_update_upload {
         downgrades.push("enable_allow_manual_update_upload".to_string());
+    }
+    if current.admin.update_signing_public_key.trim() != restored.admin.update_signing_public_key.trim() {
+        downgrades.push("change_update_signing_public_key".to_string());
     }
     downgrades
 }
@@ -6841,7 +6878,8 @@ mod tests {
         let del_j: serde_json::Value = serde_json::from_slice(&to_bytes(del_r.into_body(), 4096).await.unwrap()).unwrap();
         assert_eq!(del_j["unread_count"], 0);
 
-        // 查询系统更新状态：默认关闭自动检查与手动上传更新
+        // 查询系统更新状态：默认关闭自动检查，allow_manual_update_upload 默认开启（依赖可信 Ed25519 公钥）
+        let has_builtin_key = crate::daemon::updater::builtin_update_signing_public_key().is_some();
         let upd_r = app
             .clone()
             .oneshot(trusted_request().uri("/api/update/status").header(header::COOKIE, &cookie).body(Body::empty()).unwrap())
@@ -6850,11 +6888,41 @@ mod tests {
         assert_eq!(upd_r.status(), StatusCode::OK);
         let upd_j: serde_json::Value = serde_json::from_slice(&to_bytes(upd_r.into_body(), 16_384).await.unwrap()).unwrap();
         assert_eq!(upd_j["config"]["auto_check"], false);
-        assert_eq!(upd_j["allow_manual_update_upload"], false);
-        assert_eq!(upd_j["update_signing_key_configured"], false);
+        assert_eq!(upd_j["allow_manual_update_upload"], true);
+        assert_eq!(upd_j["update_signing_key_configured"], has_builtin_key);
+        assert_eq!(upd_j["manual_upload_ready"], has_builtin_key);
         assert_eq!(upd_j["status"]["current_version"], env!("CARGO_PKG_VERSION"));
 
-        // 默认配置下（allow_manual_update_upload=false）上传必须被 403 MANUAL_UPDATE_DISABLED 拦截
+        // 未内置公钥且未配置 config 公钥时，上传必须 fail-closed 返回 403 MANUAL_UPDATE_SIGNING_KEY_MISSING
+        if !has_builtin_key {
+            let missing_key_up = app
+                .clone()
+                .oneshot(
+                    trusted_request()
+                        .method("POST")
+                        .uri("/api/update/upload")
+                        .header(header::COOKIE, &cookie)
+                        .body(Body::from(b"not-a-gzip".to_vec()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(missing_key_up.status(), StatusCode::FORBIDDEN);
+            assert!(String::from_utf8_lossy(&to_bytes(missing_key_up.into_body(), 4096).await.unwrap())
+                .contains("MANUAL_UPDATE_SIGNING_KEY_MISSING"));
+        }
+
+        // 在 config.toml 中显式设置 allow_manual_update_upload = false 时，即使配置了公钥也必须返回 403 MANUAL_UPDATE_DISABLED
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        {
+            use ring::signature::KeyPair;
+            let mut next = (**state.config.load()).clone();
+            next.admin.allow_manual_update_upload = false;
+            next.admin.update_signing_public_key = B64.encode(kp.public_key().as_ref());
+            state.config.store(Arc::new(next));
+        }
         let disabled_up = app
             .clone()
             .oneshot(
@@ -6871,15 +6939,10 @@ mod tests {
         assert!(String::from_utf8_lossy(&to_bytes(disabled_up.into_body(), 4096).await.unwrap())
             .contains("MANUAL_UPDATE_DISABLED"));
 
-        // 开启 allow_manual_update_upload 并配置 Ed25519 验签公钥
-        let rng = ring::rand::SystemRandom::new();
-        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-        let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        // 恢复默认 allow_manual_update_upload = true，仅靠 Ed25519 验签公钥即可进入上传流程
         {
-            use ring::signature::KeyPair;
             let mut next = (**state.config.load()).clone();
             next.admin.allow_manual_update_upload = true;
-            next.admin.update_signing_public_key = B64.encode(kp.public_key().as_ref());
             state.config.store(Arc::new(next));
         }
 

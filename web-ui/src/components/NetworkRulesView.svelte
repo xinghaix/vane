@@ -11,6 +11,7 @@
     kvObjectToRows,
     rowsToKvObject,
     deepClone,
+    copyText,
     formatUnixTime,
     domainMatchesCert,
   } from '../lib/helpers.js';
@@ -34,13 +35,14 @@
   } = $props();
 
   let searchQuery = $state('');
-  let filterStatus = $state('all'); // all | enabled | disabled
+  let filterStatus = $state('all'); // all | enabled | disabled | failed
   let saving = $state(false);
   let busyToggleKey = $state('');
   let busyLeaseKey = $state('');
   let customLeaseName = $state('');
   let customLeaseMins = $state(30);
   let nowSec = $state(Math.floor(Date.now() / 1000));
+  let collapsedListeners = $state({});
 
   // Reverse Proxy Listener & Rule Drawer 状态
   let rpDrawerOpen = $state(false);
@@ -52,6 +54,7 @@
   let ruleListenerIndex = $state(-1);
   let ruleEditIndex = $state(-1);
   let ruleDraft = $state(null);
+  let rulePreset = $state('nas');
   let ruleAllowedCsv = $state('');
   let ruleDeniedCsv = $state('');
   let ruleReqRows = $state([]);
@@ -81,6 +84,7 @@
   let pfDrawerOpen = $state(false);
   let pfEditIndex = $state(-1);
   let pfDraft = $state(null);
+  let pfPreset = $state('v6_to_v4');
   let pfTargetsCsv = $state('');
   let pfAllowedCsv = $state('');
 
@@ -163,6 +167,16 @@
     return PROTECTED_WAN_PORTS.has(p) || adminPorts.includes(p);
   }
 
+  function formatCount(tpl, fallbackEn, fallbackZh, n) {
+    const raw = tpl || (lang === 'en' ? fallbackEn : fallbackZh);
+    return String(raw).replace('{n}', String(n));
+  }
+
+  function formatPfEngine(engine) {
+    if (engine === 'kernel_dnat') return t.pf?.engineDnat || (lang === 'en' ? 'Kernel DNAT' : '内核直转');
+    return t.pf?.engineSmart || (lang === 'en' ? 'Smart Proxy' : '智能转发');
+  }
+
   function statusMeta(rt, enabled) {
     if (!enabled) return { cls: 'badge-muted', dot: 'muted', text: t.common.statusDisabled };
     if (!rt) return { cls: 'badge-muted', dot: 'muted', text: t.common.statusUnknown };
@@ -172,6 +186,20 @@
     if (st === 'expired') return { cls: 'badge-danger', dot: 'danger', text: t.common.statusExpired };
     if (st === 'disabled') return { cls: 'badge-muted', dot: 'muted', text: t.common.statusDisabled };
     return { cls: 'badge-ok', dot: 'ok', text: t.common.statusRunning };
+  }
+
+  async function copyVal(val) {
+    if (await copyText(val)) showToast(`${t.copied}: ${val}`, 'success');
+    else showToast(t.copyFailed, 'error');
+  }
+
+  function toggleListenerCollapsed(name) {
+    collapsedListeners = { ...collapsedListeners, [name]: !collapsedListeners[name] };
+  }
+
+  function resetFilters() {
+    searchQuery = '';
+    filterStatus = 'all';
   }
 
   function defaultListener() {
@@ -230,6 +258,17 @@
       base.static_body = '';
     }
     return base;
+  }
+
+  function applyRulePreset(preset) {
+    if (!ruleDraft) return;
+    const host = ruleDraft.host;
+    const path = ruleDraft.path_prefix;
+    const next = defaultProxyRule(preset);
+    next.host = host;
+    next.path_prefix = path || '/';
+    rulePreset = preset;
+    ruleDraft = next;
   }
 
   function openListenerDrawer(idx = -1) {
@@ -295,6 +334,7 @@
   function openRuleDrawer(lIdx, rIdx = -1, preset = 'nas', cloneFrom = null) {
     ruleListenerIndex = lIdx;
     ruleEditIndex = rIdx;
+    rulePreset = preset;
     const r = cloneFrom
       ? deepClone(cloneFrom)
       : rIdx >= 0
@@ -387,6 +427,32 @@
       },
     });
   }
+
+  let ruleShowTlsFields = $derived.by(() => {
+    if (!ruleDraft || ruleDraft.mode !== 'proxy') return false;
+    const up = String(ruleDraft.upstream || '').trim().toLowerCase();
+    return (
+      !up ||
+      up.startsWith('https://') ||
+      ruleDraft.upstream_tls_mode !== 'strict' ||
+      Boolean(ruleDraft.upstream_sni?.trim()) ||
+      Boolean(ruleDraft.upstream_cert_sha256?.trim())
+    );
+  });
+
+  let ruleAdvancedCount = $derived.by(() => {
+    if (!ruleDraft) return 0;
+    let n = 0;
+    if (splitCsv(ruleAllowedCsv).length) n++;
+    if (splitCsv(ruleDeniedCsv).length) n++;
+    if (ruleDraft.mode === 'proxy' && Number(ruleDraft.max_body_mb || 0) > 0) n++;
+    if (ruleDraft.mode === 'proxy' && Number(ruleDraft.read_timeout_secs || 120) !== 120) n++;
+    if (ruleDraft.mode === 'proxy' && ruleReqRows.some((r) => r.key?.trim())) n++;
+    if (ruleRespRows.some((r) => r.key?.trim())) n++;
+    if (ruleDraft.mode === 'proxy' && splitCsv(ruleReqRemCsv).length) n++;
+    if (splitCsv(ruleRespRemCsv).length) n++;
+    return n;
+  });
 
   async function loadGateUsers(silent = false) {
     if (!silent) gateUsersLoading = true;
@@ -606,8 +672,17 @@
     return base;
   }
 
+  function applyPfPreset(preset) {
+    pfPreset = preset;
+    const p = defaultPortForward(preset);
+    pfDraft = p;
+    pfTargetsCsv = '';
+    pfAllowedCsv = '';
+  }
+
   function openPfDrawer(idx = -1, preset = 'v6_to_v4', cloneFrom = null) {
     pfEditIndex = idx;
+    pfPreset = preset;
     const p = cloneFrom
       ? deepClone(cloneFrom)
       : idx >= 0
@@ -634,6 +709,17 @@
       pfAllowedCsv = '';
     }
   }
+
+  let pfAdvancedCount = $derived.by(() => {
+    if (!pfDraft || pfDraft.engine === 'kernel_dnat') return 0;
+    let n = 0;
+    if (pfDraft.source_ip?.trim()) n++;
+    if (Number(pfDraft.max_concurrent_conns || 64) !== 64) n++;
+    if (pfDraft.proto !== 'udp' && Number(pfDraft.tcp_idle_timeout_secs || 3600) !== 3600) n++;
+    if (pfDraft.proto !== 'udp' && Number(pfDraft.health_check_interval_secs ?? 10) !== 10) n++;
+    if (pfDraft.proto !== 'tcp' && Number(pfDraft.udp_session_timeout_secs || 60) !== 60) n++;
+    return n;
+  });
 
   async function savePortForward(e) {
     e.preventDefault();
@@ -710,21 +796,43 @@
     return `${r.host} ${r.path_prefix} ${r.upstream} ${r.redirect_url}`.toLowerCase().includes(q);
   }
 
+  let rpFailedCount = $derived(
+    (settingsJson?.reverse_proxy || []).filter((l) => listenerRuntime(l.name)?.status === 'failed').length
+  );
+  let pfFailedCount = $derived(
+    (settingsJson?.port_forwards || []).filter((pf) => pfRuntime(pf.name)?.status === 'failed').length
+  );
+
   let filteredListeners = $derived(
     (settingsJson?.reverse_proxy || [])
       .map((l, idx) => ({ l, idx }))
       .filter(({ l }) => {
         if (filterStatus === 'enabled' && !l.enabled) return false;
         if (filterStatus === 'disabled' && l.enabled) return false;
-        if (!searchQuery.trim()) return true;
+        if (filterStatus === 'failed' && listenerRuntime(l.name)?.status !== 'failed') return false;
         const q = searchQuery.trim().toLowerCase();
+        if (!q) return true;
         return (
           l.name.toLowerCase().includes(q) ||
           String(l.listen_port).includes(q) ||
-          (l.rules || []).some((r) => `${r.host} ${r.upstream} ${r.redirect_url}`.toLowerCase().includes(q))
+          (l.rules || []).some((r) => ruleMatchesSearch(r, q))
         );
       })
   );
+
+  let rpRuleCounts = $derived.by(() => {
+    const q = searchQuery.trim().toLowerCase();
+    let total = 0;
+    let matched = 0;
+    for (const l of settingsJson?.reverse_proxy || []) total += l.rules?.length || 0;
+    for (const { l } of filteredListeners) {
+      const selfMatch = !q || l.name.toLowerCase().includes(q) || String(l.listen_port).includes(q);
+      for (const r of l.rules || []) {
+        if (selfMatch || ruleMatchesSearch(r, q)) matched++;
+      }
+    }
+    return { total, matched };
+  });
 
   let filteredPortForwards = $derived(
     (settingsJson?.port_forwards || [])
@@ -732,9 +840,10 @@
       .filter(({ pf }) => {
         if (filterStatus === 'enabled' && !pf.enabled) return false;
         if (filterStatus === 'disabled' && pf.enabled) return false;
-        if (!searchQuery.trim()) return true;
+        if (filterStatus === 'failed' && pfRuntime(pf.name)?.status !== 'failed') return false;
         const q = searchQuery.trim().toLowerCase();
-        return `${pf.name} ${pf.listen_port} ${(pf.targets || []).join(' ')} ${pf.target}`
+        if (!q) return true;
+        return `${pf.name} ${pf.listen_port} ${pf.proto} ${(pf.targets || []).join(' ')} ${pf.target}`
           .toLowerCase()
           .includes(q);
       })
@@ -745,13 +854,14 @@
   {@const rpTotal = settingsJson.reverse_proxy?.length || 0}
   {@const rpOn = (settingsJson.reverse_proxy || []).filter((x) => x.enabled).length}
   <div class="page-section-bar">
-    <div>
+    <div style="min-width:0;">
       <div class="page-section-desc">{t.rp.subtitle}</div>
       {#if rpTotal > 0}
         <div class="stat-inline-strip num">
           <span class="stat-inline-item"><span class="status-dot" style="background:var(--info);"></span><span class="stat-inline-num">{rpTotal}</span><span>{t.all}</span></span>
           <span class="stat-inline-item"><span class="status-dot ok"></span><span class="stat-inline-num">{rpOn}</span><span>{t.enabled}</span></span>
           <span class="stat-inline-item"><span class="status-dot muted"></span><span class="stat-inline-num">{rpTotal - rpOn}</span><span>{t.disabled}</span></span>
+          <span class="stat-inline-item"><span class="stat-inline-num">{rpRuleCounts.total}</span><span>{lang === 'en' ? 'rules' : '条规则'}</span></span>
         </div>
       {/if}
     </div>
@@ -772,163 +882,251 @@
 
   {#if rpTotal > 0}
     <div class="toolbar">
-      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:1;min-width:0;">
+      <div class="nr-toolbar-left">
         <div class="search-wrap">
           <span class="search-icon"><Icons name="search" size={15} /></span>
           <input type="text" placeholder={t.search} bind:value={searchQuery} />
+          {#if searchQuery}
+            <button
+              type="button"
+              class="search-clear"
+              aria-label={t.common?.clearSearch || (lang === 'en' ? 'Clear search' : '清除搜索')}
+              onclick={() => (searchQuery = '')}
+            >
+              <Icons name="x" size={13} />
+            </button>
+          {/if}
         </div>
         <FacetFilter
-          label={lang === 'en' ? 'State' : '状态'}
+          label={t.common?.state || (lang === 'en' ? 'State' : '状态')}
           bind:value={filterStatus}
           options={[
             { value: 'all', label: t.all, count: rpTotal },
             { value: 'enabled', label: t.enabled, count: rpOn, tone: 'ok' },
             { value: 'disabled', label: t.disabled, count: rpTotal - rpOn, tone: 'muted' },
+            ...(rpFailedCount > 0
+              ? [{ value: 'failed', label: t.common?.statusError || t.common.statusFailed, count: rpFailedCount, tone: 'danger' }]
+              : []),
           ]}
         />
       </div>
-      <span class="mono" style="font-size:12px;color:var(--text-muted);">{filteredListeners.length} / {rpTotal}</span>
+      <span class="mono nr-count">
+        {filteredListeners.length}/{rpTotal}
+        {#if searchQuery.trim()}
+          · {formatCount(t.common?.rulesCount, '{n} rules', '{n} 条规则', rpRuleCounts.matched)}
+        {/if}
+      </span>
     </div>
   {/if}
 
   {#if !rpTotal}
-    <div class="empty-state">{t.common.empty}</div>
+    <div class="empty-state-rich">
+      <div class="icon-tile empty-state-icon"><Icons name="reverse_proxy" size={18} /></div>
+      <div class="empty-state-title">{t.nav.reverse_proxy}</div>
+      <div class="empty-state-desc">{t.common.empty}</div>
+      <button type="button" class="btn btn-primary btn-sm" onclick={() => openListenerDrawer(-1)}>
+        <Icons name="plus" size={14} />
+        <span>{t.rp.newListener}</span>
+      </button>
+    </div>
   {:else if !filteredListeners.length}
-    <div class="empty-state">{t.common.noMatches}</div>
+    <div class="empty-state-rich">
+      <div class="icon-tile muted empty-state-icon"><Icons name="search" size={18} /></div>
+      <div class="empty-state-desc">{t.common.noMatches}</div>
+      <button type="button" class="btn btn-sm" onclick={resetFilters}>
+        {t.common?.clearFilters || (lang === 'en' ? 'Reset filters' : '重置筛选')}
+      </button>
+    </div>
   {:else}
     <div style="display:grid;gap:14px;">
       {#each filteredListeners as { l: listener, idx: lIdx }}
         {@const rt = listenerRuntime(listener.name)}
         {@const sm = statusMeta(rt, listener.enabled)}
-        <div class="card">
-          <div class="row-between" style="margin-bottom:12px;">
-            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-              <span class="icon-tile sm {sm.dot === 'ok' ? '' : sm.dot === 'danger' ? 'danger' : 'muted'}">
-                <Icons name="reverse_proxy" size={15} />
-              </span>
-              <span style="font-weight:700;font-size:15px;">{listener.name}</span>
-              <span class="port-pill mono">
-                <span class="port-pill-lead accent">:{listener.listen_port}</span>
-                <span>{listener.stack}</span>
-              </span>
-              <span class="badge {sm.cls}">{sm.text}{#if rt && rt.active_conns > 0} · {rt.active_conns}c{/if}</span>
-              <span class="badge {listener.strict_sni ? 'badge-ok' : 'badge-warn'}">
-                {listener.strict_sni ? 'Strict SNI' : 'Fallback Cert'}
-              </span>
-              {#if listener.open_wan_firewall}
-                <span class="badge badge-warn">WAN Open</span>
-              {/if}
-            </div>
-              <div class="btn-group">
+        {@const isCollapsed = Boolean(collapsedListeners[listener.name]) && !searchQuery.trim()}
+        {@const qLow = searchQuery.trim().toLowerCase()}
+        {@const listenerMatchedSelf = !qLow || listener.name.toLowerCase().includes(qLow) || String(listener.listen_port).includes(qLow)}
+        {@const visibleRules = (listener.rules || []).map((rule, rIdx) => ({ rule, rIdx })).filter(({ rule }) => listenerMatchedSelf || ruleMatchesSearch(rule, qLow))}
+        <div class="card entity-card {!listener.enabled ? 'is-disabled' : ''}">
+          <div class="entity-head nr-listener-head">
+            <div class="entity-main">
+              <div class="nr-title-row">
                 <button
                   type="button"
-                  role="switch"
-                  aria-checked={listener.enabled}
-                  aria-label={t.nav.reverse_proxy}
-                  class="switch"
-                  disabled={busyToggleKey === `rp:${lIdx}`}
-                  onclick={() => toggleListenerEnabled(lIdx)}
+                  class="btn btn-ghost btn-icon nr-collapse-btn"
+                  aria-expanded={!isCollapsed}
+                  aria-label={`${isCollapsed ? (t.common?.expand || 'Expand') : (t.common?.collapse || 'Collapse')} ${listener.name}`}
+                  onclick={() => toggleListenerCollapsed(listener.name)}
                 >
-                  <span class="switch-thumb"></span>
+                  <span class="nr-chevron {isCollapsed ? 'collapsed' : ''}">
+                    <Icons name="chevron" size={14} />
+                  </span>
                 </button>
-                <button type="button" class="btn btn-xs" onclick={() => openRuleDrawer(lIdx, -1, 'nas')}>
-                  + {t.rp.addRule}
+                <span class="icon-tile sm {sm.dot === 'ok' ? '' : sm.dot === 'danger' ? 'danger' : 'muted'}">
+                  <Icons name="reverse_proxy" size={15} />
+                </span>
+                <span class="nr-entity-title">{listener.name}</span>
+                <span class="port-pill mono">
+                  <span class="port-pill-lead accent">:{listener.listen_port}</span>
+                  <span>{listener.stack}</span>
+                </span>
+                <span class="badge {sm.cls}">{sm.text}{#if rt && rt.active_conns > 0} · {rt.active_conns}c{/if}</span>
+                {#if listener.open_wan_firewall}
+                  <span class="badge badge-warn">WAN Open</span>
+                {/if}
+                {#if !listener.strict_sni}
+                  <span class="badge badge-warn">Fallback Cert</span>
+                {/if}
+              </div>
+              <div class="meta-row" style="margin-top:6px;">
+                <span class="meta-chip num">{formatCount(t.common?.rulesCount, '{n} rules', '{n} 条规则', listener.rules?.length || 0)}</span>
+                {#if listener.strict_sni}
+                  <span class="meta-chip">Strict SNI</span>
+                {/if}
+                <span class="meta-chip num">max {listener.max_concurrent_conns}c</span>
+              </div>
+            </div>
+            <div class="entity-actions">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={listener.enabled}
+                aria-label={`${t.nav.reverse_proxy}: ${listener.name}`}
+                class="switch"
+                disabled={busyToggleKey === `rp:${lIdx}`}
+                onclick={() => toggleListenerEnabled(lIdx)}
+              >
+                <span class="switch-thumb"></span>
+              </button>
+              <div class="btn-group nr-action-btns">
+                <button type="button" class="btn btn-xs btn-soft" onclick={() => openRuleDrawer(lIdx, -1, 'nas')}>
+                  <Icons name="plus" size={12} />
+                  <span>{t.rp.addRule}</span>
                 </button>
                 <button type="button" class="btn btn-xs" onclick={() => openListenerDrawer(lIdx)}>{t.edit}</button>
                 <button type="button" class="btn btn-xs btn-danger" onclick={() => deleteListener(lIdx)}>{t.delete}</button>
               </div>
             </div>
+          </div>
 
-            {#if rt?.last_error}
-              <div class="mono" style="font-size:11.5px;color:var(--danger);margin-bottom:8px;">{rt.last_error}</div>
-            {/if}
-
-            <!-- 快捷场景预设条 -->
-            <div class="btn-group" style="margin-bottom:10px;">
-              <span style="font-size:12px;color:var(--text-muted);">{t.common.presets}:</span>
-              <button type="button" class="btn btn-xs" onclick={() => openRuleDrawer(lIdx, -1, 'nas')}>NAS Web</button>
-              <button type="button" class="btn btn-xs" onclick={() => openRuleDrawer(lIdx, -1, 'pve_selfsigned')}>
-                {lang === 'en' ? 'Self-Signed HTTPS' : '自签 HTTPS 后端'}
-              </button>
-              <button type="button" class="btn btn-xs" onclick={() => openRuleDrawer(lIdx, -1, 'stun_redirect')}>
-                {lang === 'en' ? 'STUN Redirect' : 'STUN 动态跳转'}
-              </button>
-              <button type="button" class="btn btn-xs" onclick={() => openRuleDrawer(lIdx, -1, 'static_page')}>
-                {lang === 'en' ? 'Static Response' : '无后端静态响应'}
-              </button>
+          {#if rt?.last_error}
+            <div class="inline-alert inline-alert-danger" role="alert" style="margin-top:10px;">
+              <Icons name="alert" size={14} />
+              <span class="mono break-anywhere">{rt.last_error}</span>
             </div>
+          {/if}
 
-            {#if listener.rules?.length}
-              {@const qLow = searchQuery.trim().toLowerCase()}
-              {@const listenerMatchedSelf = !qLow || listener.name.toLowerCase().includes(qLow) || String(listener.listen_port).includes(qLow)}
-              <div style="display:grid;gap:8px;">
-                {#each listener.rules as rule, rIdx}
-                  {#if listenerMatchedSelf || ruleMatchesSearch(rule, qLow)}
-                    {@const certCov = domainMatchesCert(rule.host, settingsJson.acme, dashboard?.certs)}
-                    {@const hdrCount = Object.keys(rule.request_headers_set || {}).length + Object.keys(rule.response_headers_set || {}).length}
-                    <div class="rule-card">
-                      <div class="row-between">
-                        <div style="min-width:0;flex:1;">
-                          <div style="font-weight:600;font-size:13.5px;word-break:break-all;" class="mono">
-                            https://{rule.host}:{listener.listen_port}{rule.path_prefix}
-                            <span style="color:var(--accent);">→</span>
-                            {#if rule.mode === 'proxy'}
-                              {rule.upstream}
-                            {:else if rule.mode === 'redirect'}
-                              [{rule.redirect_code}] {rule.redirect_url}
-                            {:else}
-                              [Static {rule.static_status}]
-                            {/if}
-                          </div>
-                          <div class="btn-group" style="margin-top:6px;">
-                            <span class="badge {rule.enabled ? 'badge-ok' : 'badge-muted'}">{rule.enabled ? t.enabled : t.disabled}</span>
-                            <span class="badge badge-muted">{rule.mode}</span>
-                            {#if certCov === 'active'}
-                              <span class="badge badge-ok">{t.rp.certOk}</span>
-                            {:else if certCov === 'configured'}
-                              <span class="badge badge-info">ACME</span>
-                            {:else if listener.strict_sni}
-                              <span class="badge badge-warn">{t.rp.certMissing}</span>
-                            {/if}
-                            {#if rule.websocket && rule.mode === 'proxy'}<span class="badge badge-info">WS</span>{/if}
-                            {#if rule.auth_gate}
-                              {@const gCount = (rule.auth_gate_users || []).length}
-                              {#if gCount > 0}
-                                <span class="badge badge-ok">{t.rp.gateBadge} · {gCount}</span>
-                              {:else}
-                                <span class="badge badge-warn">{t.rp.gateUnboundBadge}</span>
+          {#if !isCollapsed}
+            {#if visibleRules.length}
+              <div class="nr-rules-list">
+                {#each visibleRules as { rule, rIdx }}
+                  {@const certCov = domainMatchesCert(rule.host, settingsJson.acme, dashboard?.certs)}
+                  {@const hdrCount = Object.keys(rule.request_headers_set || {}).length + Object.keys(rule.response_headers_set || {}).length}
+                  {@const fullUrl = `https://${rule.host}:${listener.listen_port}${rule.path_prefix}`}
+                  {@const canOpenUrl = listener.enabled && rule.enabled && rule.host && !rule.host.includes('*')}
+                  <div class="rule-card entity-card {!rule.enabled ? 'is-disabled' : ''}">
+                    <div class="entity-head">
+                      <div class="entity-main">
+                        <div class="route-flow mono">
+                          <div class="nr-route-src-wrap">
+                            <span class="nr-route-src break-anywhere">{fullUrl}</span>
+                            <span class="nr-route-tools">
+                              <button
+                                type="button"
+                                class="btn btn-ghost btn-icon nr-mini-btn"
+                                title={t.common?.copyUrl || t.copy}
+                                aria-label={`${t.common?.copyUrl || t.copy}: ${fullUrl}`}
+                                onclick={() => copyVal(fullUrl)}
+                              >
+                                <Icons name="copy" size={12} />
+                              </button>
+                              {#if canOpenUrl}
+                                <a
+                                  href={fullUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  class="btn btn-ghost btn-icon nr-mini-btn"
+                                  title={t.common?.openLink || (lang === 'en' ? 'Open link' : '打开链接')}
+                                  aria-label={`${t.common?.openLink || 'Open'} ${fullUrl}`}
+                                >
+                                  <Icons name="external_link" size={12} />
+                                </a>
                               {/if}
-                            {/if}
-                            {#if rule.strip_prefix}<span class="badge badge-muted">Strip Prefix</span>{/if}
-                            {#if rule.mode === 'proxy' && rule.upstream?.startsWith('https://')}
-                              <span class="badge {rule.upstream_tls_mode === 'insecure_skip_verify' ? 'badge-warn' : 'badge-info'}">
-                                TLS: {rule.upstream_tls_mode}
-                              </span>
-                            {/if}
-                            {#if (rule.allowed_cidrs?.length || 0) + (rule.denied_cidrs?.length || 0) > 0}
-                              <span class="badge badge-muted">CIDR</span>
-                            {/if}
-                            {#if hdrCount > 0}
-                              <span class="badge badge-muted">{hdrCount} Hdr</span>
-                            {/if}
-                            {#if rule.mode === 'proxy' && rule.max_body_mb > 0}
-                              <span class="badge badge-muted">{rule.max_body_mb}MB</span>
-                            {/if}
+                            </span>
+                          </div>
+                          <div class="nr-route-dst">
+                            <span class="nr-route-arrow" aria-hidden="true">→</span>
+                            <span class="break-anywhere">
+                              {#if rule.mode === 'proxy'}
+                                {rule.upstream}
+                              {:else if rule.mode === 'redirect'}
+                                [{rule.redirect_code}] {rule.redirect_url}
+                              {:else}
+                                [Static {rule.static_status}]
+                              {/if}
+                            </span>
                           </div>
                         </div>
-                        <div class="btn-group">
+
+                        <div class="meta-row" style="margin-top:8px;">
+                          {#if !rule.enabled}
+                            <span class="badge badge-muted">{t.disabled}</span>
+                          {/if}
+                          {#if certCov === 'active'}
+                            <span class="badge badge-ok">{t.rp.certOk}</span>
+                          {:else if certCov === 'configured'}
+                            <span class="badge badge-info">ACME</span>
+                          {:else if listener.strict_sni}
+                            <span class="badge badge-warn">{t.rp.certMissing}</span>
+                          {/if}
+                          {#if rule.auth_gate}
+                            {@const gCount = (rule.auth_gate_users || []).length}
+                            {#if gCount > 0}
+                              <span class="badge badge-ok">{t.rp.gateBadge} · {gCount}</span>
+                            {:else}
+                              <span class="badge badge-warn">{t.rp.gateUnboundBadge}</span>
+                            {/if}
+                          {/if}
+                          {#if rule.mode === 'proxy' && rule.upstream?.startsWith('https://') && rule.upstream_tls_mode === 'insecure_skip_verify'}
+                            <span class="badge badge-warn">TLS: skip verify</span>
+                          {/if}
+                          <span class="meta-chip">{rule.mode}</span>
+                          {#if rule.websocket && rule.mode === 'proxy'}<span class="meta-chip">WS</span>{/if}
+                          {#if rule.strip_prefix}<span class="meta-chip">Strip Prefix</span>{/if}
+                          {#if rule.mode === 'proxy' && rule.upstream?.startsWith('https://') && rule.upstream_tls_mode !== 'insecure_skip_verify'}
+                            <span class="meta-chip">TLS: {rule.upstream_tls_mode}</span>
+                          {/if}
+                          {#if (rule.allowed_cidrs?.length || 0) + (rule.denied_cidrs?.length || 0) > 0}
+                            <span class="meta-chip">CIDR</span>
+                          {/if}
+                          {#if hdrCount > 0}
+                            <span class="meta-chip num">{hdrCount} Hdr</span>
+                          {/if}
+                          {#if rule.mode === 'proxy' && rule.max_body_mb > 0}
+                            <span class="meta-chip num">{rule.max_body_mb}MB</span>
+                          {/if}
+                        </div>
+                      </div>
+
+                      <div class="entity-actions">
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={rule.enabled}
+                          aria-label={`${rule.host}${rule.path_prefix}`}
+                          class="switch"
+                          disabled={busyToggleKey === `rule:${lIdx}:${rIdx}`}
+                          onclick={() => toggleRuleEnabled(lIdx, rIdx)}
+                        >
+                          <span class="switch-thumb"></span>
+                        </button>
+                        <div class="btn-group nr-action-btns">
                           <button
                             type="button"
-                            role="switch"
-                            aria-checked={rule.enabled}
-                            aria-label={t.rp.addRule}
-                            class="switch"
-                            disabled={busyToggleKey === `rule:${lIdx}:${rIdx}`}
-                            onclick={() => toggleRuleEnabled(lIdx, rIdx)}
+                            class="btn btn-xs btn-icon"
+                            title={t.clone}
+                            aria-label={`${t.clone}: ${rule.host}${rule.path_prefix}`}
+                            onclick={() => openRuleDrawer(lIdx, -1, 'nas', rule)}
                           >
-                            <span class="switch-thumb"></span>
-                          </button>
-                          <button type="button" class="btn btn-xs" title={t.clone} onclick={() => openRuleDrawer(lIdx, -1, 'nas', rule)}>
                             <Icons name="duplicate" size={13} />
                           </button>
                           <button type="button" class="btn btn-xs" onclick={() => openRuleDrawer(lIdx, rIdx)}>{t.edit}</button>
@@ -936,23 +1134,39 @@
                         </div>
                       </div>
                     </div>
-                  {/if}
+                  </div>
                 {/each}
               </div>
-            {:else}
-              <div style="font-size:12px;color:var(--text-muted);padding:6px 2px;">{t.rp.noRules}</div>
+            {:else if !listener.rules?.length}
+              <div class="nr-zero-rules">
+                <div class="nr-zero-rules-text">{t.rp.noRules}</div>
+                <div class="btn-group">
+                  <span style="font-size:12px;color:var(--text-muted);">{t.common.presets}:</span>
+                  <button type="button" class="chip" onclick={() => openRuleDrawer(lIdx, -1, 'nas')}>NAS Web</button>
+                  <button type="button" class="chip" onclick={() => openRuleDrawer(lIdx, -1, 'pve_selfsigned')}>
+                    {lang === 'en' ? 'Self-Signed HTTPS' : '自签 HTTPS 后端'}
+                  </button>
+                  <button type="button" class="chip" onclick={() => openRuleDrawer(lIdx, -1, 'stun_redirect')}>
+                    {lang === 'en' ? 'STUN Redirect' : 'STUN 动态跳转'}
+                  </button>
+                  <button type="button" class="chip" onclick={() => openRuleDrawer(lIdx, -1, 'static_page')}>
+                    {lang === 'en' ? 'Static Response' : '无后端静态响应'}
+                  </button>
+                </div>
+              </div>
             {/if}
-          </div>
-        {/each}
-      </div>
-    {/if}
+          {/if}
+        </div>
+      {/each}
+    </div>
+  {/if}
 {/if}
 
 {#if settingsJson && mode === 'port_forward'}
   {@const pfTotal = settingsJson.port_forwards?.length || 0}
   {@const pfOn = (settingsJson.port_forwards || []).filter((x) => x.enabled).length}
   <div class="page-section-bar">
-    <div>
+    <div style="min-width:0;">
       <div class="page-section-desc">{t.pf.subtitle}</div>
       {#if pfTotal > 0}
         <div class="stat-inline-strip num">
@@ -963,8 +1177,6 @@
       {/if}
     </div>
     <div class="btn-group">
-      <button type="button" class="btn btn-xs" onclick={() => openPfDrawer(-1, 'kernel_dnat')}>+ {t.pf.presetDnat}</button>
-      <button type="button" class="btn btn-xs" onclick={() => openPfDrawer(-1, 'temp_ssh')}>+ {t.pf.presetSsh}</button>
       <button type="button" class="btn btn-primary btn-sm" onclick={() => openPfDrawer(-1, 'v6_to_v4')}>
         <Icons name="plus" size={14} />
         <span>{t.add}</span>
@@ -974,131 +1186,233 @@
 
   {#if pfTotal > 0}
     <div class="toolbar">
-      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;flex:1;min-width:0;">
+      <div class="nr-toolbar-left">
         <div class="search-wrap">
           <span class="search-icon"><Icons name="search" size={15} /></span>
           <input type="text" placeholder={t.search} bind:value={searchQuery} />
+          {#if searchQuery}
+            <button
+              type="button"
+              class="search-clear"
+              aria-label={t.common?.clearSearch || (lang === 'en' ? 'Clear search' : '清除搜索')}
+              onclick={() => (searchQuery = '')}
+            >
+              <Icons name="x" size={13} />
+            </button>
+          {/if}
         </div>
         <FacetFilter
-          label={lang === 'en' ? 'State' : '状态'}
+          label={t.common?.state || (lang === 'en' ? 'State' : '状态')}
           bind:value={filterStatus}
           options={[
             { value: 'all', label: t.all, count: pfTotal },
             { value: 'enabled', label: t.enabled, count: pfOn, tone: 'ok' },
             { value: 'disabled', label: t.disabled, count: pfTotal - pfOn, tone: 'muted' },
+            ...(pfFailedCount > 0
+              ? [{ value: 'failed', label: t.common?.statusError || t.common.statusFailed, count: pfFailedCount, tone: 'danger' }]
+              : []),
           ]}
         />
       </div>
-      <span class="mono" style="font-size:12px;color:var(--text-muted);">{filteredPortForwards.length} / {pfTotal}</span>
+      <span class="mono nr-count">{filteredPortForwards.length} / {pfTotal}</span>
     </div>
   {/if}
 
   {#if !pfTotal}
-    <div class="empty-state">{t.common.empty}</div>
+    <div class="empty-state-rich">
+      <div class="icon-tile empty-state-icon"><Icons name="port_forward" size={18} /></div>
+      <div class="empty-state-title">{t.nav.port_forward}</div>
+      <div class="empty-state-desc">{t.common.empty}</div>
+      <div class="btn-group" style="justify-content:center;">
+        <button type="button" class="btn btn-primary btn-sm" onclick={() => openPfDrawer(-1, 'v6_to_v4')}>
+          <Icons name="plus" size={14} />
+          <span>{t.add}</span>
+        </button>
+        <button type="button" class="btn btn-sm" onclick={() => openPfDrawer(-1, 'kernel_dnat')}>
+          {t.pf.presetDnat}
+        </button>
+        <button type="button" class="btn btn-sm" onclick={() => openPfDrawer(-1, 'temp_ssh')}>
+          {t.pf.presetSsh}
+        </button>
+      </div>
+    </div>
   {:else if !filteredPortForwards.length}
-    <div class="empty-state">{t.common.noMatches}</div>
+    <div class="empty-state-rich">
+      <div class="icon-tile muted empty-state-icon"><Icons name="search" size={18} /></div>
+      <div class="empty-state-desc">{t.common.noMatches}</div>
+      <button type="button" class="btn btn-sm" onclick={resetFilters}>
+        {t.common?.clearFilters || (lang === 'en' ? 'Reset filters' : '重置筛选')}
+      </button>
+    </div>
   {:else}
     <div style="display:grid;gap:12px;">
       {#each filteredPortForwards as { pf, idx } (pf.name)}
         {@const rt = pfRuntime(pf.name)}
         {@const sm = statusMeta(rt, pf.enabled)}
         {@const famLabel = rt ? [rt.bound_v4 ? 'v4' : '', rt.bound_v6 ? 'v6' : ''].filter(Boolean).join('+') : ''}
-        <div class="card" style="padding:15px 18px;">
-          <div class="row-between">
-            <div style="min-width:0;flex:1;">
-              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        {@const effTargets = pf.targets?.length ? pf.targets : pf.target ? [pf.target] : []}
+        <div class="card entity-card {!pf.enabled ? 'is-disabled' : ''}">
+          <div class="entity-head">
+            <div class="entity-main">
+              <div class="nr-title-row">
                 <span class="icon-tile sm {sm.dot === 'ok' ? '' : sm.dot === 'danger' ? 'danger' : 'muted'}">
                   <Icons name="port_forward" size={14} />
                 </span>
-                <span style="font-weight:700;font-size:15px;">{pf.name}</span>
+                <span class="nr-entity-title">{pf.name}</span>
                 <span class="port-pill mono">
                   <span class="port-pill-lead">:{pf.listen_port}/{pf.proto}</span>
-                  <span>→ {(pf.targets?.length ? pf.targets : [pf.target])[0]}</span>
+                  <span>{pf.stack}</span>
                 </span>
                 <span class="badge {sm.cls}">{sm.text}{#if famLabel} · {famLabel}{/if}{#if rt && rt.active_conns > 0} · {rt.active_conns}c{/if}</span>
-                <span class="badge badge-muted">{pf.engine}</span>
-                  {#if pf.open_wan_firewall || pf.engine === 'kernel_dnat'}
-                    <span class="badge badge-warn">WAN Open</span>
-                  {/if}
-                  {#if pf.allowed_cidrs?.length}
-                    <span class="badge badge-muted">CIDR ({pf.allowed_cidrs.length})</span>
-                  {/if}
-                  {#if pf.send_proxy_protocol !== 'none'}
-                    <span class="badge badge-info">PP {pf.send_proxy_protocol}</span>
-                  {/if}
-                  {#if pf.allowed_time_window}
-                    <span class="badge badge-warn mono">{pf.allowed_time_window}</span>
-                  {/if}
-                  {#if pf.expire_at_unix > 0}
-                    <span class="badge {pf.expire_at_unix > nowSec ? 'badge-ok' : 'badge-danger'} mono">
-                      Lease: {pf.expire_at_unix > nowSec ? `${Math.ceil((pf.expire_at_unix - nowSec) / 60)}m` : `${t.common.statusExpired} (${formatUnixTime(pf.expire_at_unix)})`}
-                    </span>
-                  {/if}
-                </div>
-                <div class="mono" style="font-size:12.5px;color:var(--text-secondary);margin-top:6px;word-break:break-all;">
-                  Targets ({pf.load_balance}): {(pf.targets?.length ? pf.targets : [pf.target]).join(', ')}
-                  {#if pf.bind_interface} · via {pf.bind_interface}{/if}
-                </div>
-                {#if rt?.last_error}
-                  <div class="mono" style="font-size:11.5px;color:var(--danger);margin-top:4px;word-break:break-word;">{rt.last_error}</div>
+                {#if pf.open_wan_firewall || pf.engine === 'kernel_dnat'}
+                  <span class="badge badge-warn">WAN Open</span>
+                {/if}
+                {#if pf.allowed_time_window}
+                  <span class="badge badge-warn mono">{pf.allowed_time_window}</span>
+                {/if}
+                {#if pf.expire_at_unix > 0}
+                  <span class="badge {pf.expire_at_unix > nowSec ? 'badge-ok' : 'badge-danger'} mono">
+                    {t.pf?.leaseLabel || 'Lease'}: {pf.expire_at_unix > nowSec ? `${Math.ceil((pf.expire_at_unix - nowSec) / 60)}m` : `${t.common.statusExpired} (${formatUnixTime(pf.expire_at_unix)})`}
+                  </span>
                 {/if}
               </div>
-              <div class="btn-group">
-                <button type="button" class="btn btn-xs" disabled={Boolean(busyLeaseKey)} onclick={() => grantLease(pf.name, 15)}>+15m</button>
-                <button type="button" class="btn btn-xs" disabled={Boolean(busyLeaseKey)} onclick={() => grantLease(pf.name, 60)}>+1h</button>
-                <button
-                  type="button"
-                  class="btn btn-xs"
-                  onclick={() => { customLeaseName = customLeaseName === pf.name ? '' : pf.name; customLeaseMins = 30; }}
-                >
-                  +…m
-                </button>
-                {#if pf.expire_at_unix > 0}
-                  <button type="button" class="btn btn-xs" disabled={Boolean(busyLeaseKey)} title={t.pf.permanent} onclick={() => grantLease(pf.name, 0)}>∞</button>
+
+              <div class="nr-pf-targets">
+                <span class="nr-route-arrow" aria-hidden="true">→</span>
+                <div class="nr-target-pills">
+                  {#each effTargets as tgt}
+                    <button
+                      type="button"
+                      class="copy-pill mono"
+                      title={t.copy}
+                      aria-label={`${t.copy} ${tgt}`}
+                      onclick={() => copyVal(tgt)}
+                    >
+                      <span class="break-anywhere">{tgt}</span>
+                      <Icons name="copy" size={11} />
+                    </button>
+                  {/each}
+                </div>
+              </div>
+
+              <div class="meta-row" style="margin-top:7px;">
+                <span class="meta-chip">{formatPfEngine(pf.engine)}</span>
+                {#if effTargets.length > 1}
+                  <span class="meta-chip">{pf.load_balance}</span>
                 {/if}
+                {#if pf.bind_interface}
+                  <span class="meta-chip mono">via {pf.bind_interface}</span>
+                {/if}
+                {#if pf.allowed_cidrs?.length}
+                  <span class="meta-chip num">CIDR ({pf.allowed_cidrs.length})</span>
+                {/if}
+                {#if pf.send_proxy_protocol !== 'none'}
+                  <span class="meta-chip">PP {pf.send_proxy_protocol}</span>
+                {/if}
+              </div>
+
+              {#if rt?.last_error}
+                <div class="inline-alert inline-alert-danger" role="alert" style="margin-top:8px;">
+                  <Icons name="alert" size={14} />
+                  <span class="mono break-anywhere">{rt.last_error}</span>
+                </div>
+              {/if}
+            </div>
+
+            <div class="entity-actions">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={pf.enabled}
+                aria-label={`${t.nav.port_forward}: ${pf.name}`}
+                class="switch"
+                disabled={busyToggleKey === `pf:${idx}`}
+                onclick={() => togglePfEnabled(idx)}
+              >
+                <span class="switch-thumb"></span>
+              </button>
+              <div class="btn-group nr-action-btns">
                 <button
                   type="button"
-                  role="switch"
-                  aria-checked={pf.enabled}
-                  aria-label={t.nav.port_forward}
-                  class="switch"
-                  disabled={busyToggleKey === `pf:${idx}`}
-                  onclick={() => togglePfEnabled(idx)}
+                  class="btn btn-xs btn-icon"
+                  title={t.clone}
+                  aria-label={`${t.clone}: ${pf.name}`}
+                  onclick={() => openPfDrawer(-1, 'v6_to_v4', pf)}
                 >
-                  <span class="switch-thumb"></span>
-                </button>
-                <button type="button" class="btn btn-xs" title={t.clone} onclick={() => openPfDrawer(-1, 'v6_to_v4', pf)}>
                   <Icons name="duplicate" size={13} />
                 </button>
                 <button type="button" class="btn btn-xs" onclick={() => openPfDrawer(idx)}>{t.edit}</button>
                 <button type="button" class="btn btn-xs btn-danger" onclick={() => deletePortForward(idx)}>{t.delete}</button>
               </div>
             </div>
-            {#if customLeaseName === pf.name}
-              <div class="btn-group" style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border-subtle);">
-                <input
-                  type="number"
-                  min="1"
-                  max="1440"
-                  class="mono control-compact"
-                  style="width:110px;"
-                  bind:value={customLeaseMins}
-                />
-                <span style="font-size:12px;color:var(--text-secondary);">min (1~1440)</span>
+          </div>
+
+          <!-- 独立的临时租约快捷栏（与 CRUD 操作分离，降低误触风险） -->
+          <div class="pf-lease-bar">
+            <span class="pf-lease-label">
+              <Icons name="cron" size={13} />
+              <span>{t.pf?.leaseLabel || (lang === 'en' ? 'Temporary Lease' : '临时租约')}</span>
+            </span>
+            <div class="btn-group">
+              <button type="button" class="btn btn-xs" disabled={Boolean(busyLeaseKey)} onclick={() => grantLease(pf.name, 15)}>+15m</button>
+              <button type="button" class="btn btn-xs" disabled={Boolean(busyLeaseKey)} onclick={() => grantLease(pf.name, 60)}>+1h</button>
+              <button
+                type="button"
+                class="btn btn-xs {customLeaseName === pf.name ? 'btn-soft' : ''}"
+                aria-expanded={customLeaseName === pf.name}
+                onclick={() => {
+                  customLeaseName = customLeaseName === pf.name ? '' : pf.name;
+                  customLeaseMins = 30;
+                }}
+              >
+                {t.pf?.customLease || (lang === 'en' ? 'Custom' : '自定义')}
+              </button>
+              {#if pf.expire_at_unix > 0}
                 <button
                   type="button"
-                  class="btn btn-xs btn-primary"
+                  class="btn btn-xs btn-soft"
                   disabled={Boolean(busyLeaseKey)}
-                  onclick={() => grantLease(pf.name, Math.max(1, Math.min(1440, Number(customLeaseMins) || 30)))}
+                  onclick={() => grantLease(pf.name, 0)}
                 >
+                  {t.pf.permanent}
+                </button>
+              {/if}
+            </div>
+          </div>
+
+          {#if customLeaseName === pf.name}
+            <form
+              class="pf-custom-lease"
+              onsubmit={(e) => {
+                e.preventDefault();
+                grantLease(pf.name, Math.max(1, Math.min(1440, Number(customLeaseMins) || 30)));
+              }}
+            >
+              <input
+                type="number"
+                min="1"
+                max="1440"
+                class="mono control-compact"
+                style="width:110px;"
+                placeholder={t.pf?.leaseMinsPh || (lang === 'en' ? 'Minutes' : '分钟数')}
+                aria-label={t.pf?.leaseMinsPh || (lang === 'en' ? 'Lease minutes' : '租约分钟数')}
+                bind:value={customLeaseMins}
+              />
+              <span style="font-size:12px;color:var(--text-secondary);">
+                {lang === 'en' ? 'min (1~1440)' : '分钟 (1~1440)'}
+              </span>
+              <div class="btn-group" style="margin-left:auto;">
+                <button type="button" class="btn btn-xs btn-ghost" onclick={() => (customLeaseName = '')}>{t.cancel}</button>
+                <button type="submit" class="btn btn-xs btn-primary" disabled={Boolean(busyLeaseKey)}>
                   {t.confirmAction}
                 </button>
               </div>
-            {/if}
-          </div>
-        {/each}
-      </div>
-    {/if}
+            </form>
+          {/if}
+        </div>
+      {/each}
+    </div>
+  {/if}
 {/if}
 
 <!-- 反代监听器编辑弹窗 -->
@@ -1112,40 +1426,43 @@
   onSubmit={saveListener}
   onClose={() => (rpDrawerOpen = false)}
 >
-        <div class="form-grid">
-          <div class="field">
-            <label for="rp-name">{t.rp.listenerName}</label>
-            <input id="rp-name" type="text" class="mono" bind:value={rpDraft.name} required />
-          </div>
-          <div class="field">
-            <label for="rp-port">{t.rp.listenPort}</label>
-            <input id="rp-port" type="number" min="1" max="65535" bind:value={rpDraft.listen_port} required />
-          </div>
-          <div class="field">
-            <label for="rp-stack">{t.rp.stack}</label>
-            <Select
-              id="rp-stack"
-              bind:value={rpDraft.stack}
-              options={[
-                { value: 'dual', label: lang === 'en' ? 'Dual Stack (IPv4 + IPv6)' : '双栈 (IPv4 + IPv6)' },
-                { value: 'ipv4_only', label: lang === 'en' ? 'IPv4 Only' : '仅 IPv4' },
-                { value: 'ipv6_only', label: lang === 'en' ? 'IPv6 Only' : '仅 IPv6' },
-              ]}
-            />
-          </div>
-          <div class="field">
-            <label for="rp-maxc">{t.rp.maxConns}</label>
-            <input id="rp-maxc" type="number" min="1" max="4096" bind:value={rpDraft.max_concurrent_conns} required />
-          </div>
-        </div>
-        {#if rpDraft.open_wan_firewall && isProtectedPort(rpDraft.listen_port)}
-          <div class="banner banner-warn" style="margin-bottom:10px;">{t.rp.protectedPortWarn}</div>
-        {/if}
-        <div style="display:grid;gap:4px;">
-          <label class="check-row"><input type="checkbox" bind:checked={rpDraft.enabled} /> {t.enabled}</label>
-          <label class="check-row"><input type="checkbox" bind:checked={rpDraft.strict_sni} /> {t.rp.strictSni}</label>
-          <label class="check-row"><input type="checkbox" bind:checked={rpDraft.open_wan_firewall} /> {t.rp.openWan}</label>
-        </div>
+  <div class="form-grid">
+    <div class="field">
+      <label for="rp-name">{t.rp.listenerName}</label>
+      <input id="rp-name" type="text" class="mono" bind:value={rpDraft.name} required />
+    </div>
+    <div class="field">
+      <label for="rp-port">{t.rp.listenPort}</label>
+      <input id="rp-port" type="number" min="1" max="65535" bind:value={rpDraft.listen_port} required />
+    </div>
+    <div class="field">
+      <label for="rp-stack">{t.rp.stack}</label>
+      <Select
+        id="rp-stack"
+        bind:value={rpDraft.stack}
+        options={[
+          { value: 'dual', label: lang === 'en' ? 'Dual Stack (IPv4 + IPv6)' : '双栈 (IPv4 + IPv6)' },
+          { value: 'ipv4_only', label: lang === 'en' ? 'IPv4 Only' : '仅 IPv4' },
+          { value: 'ipv6_only', label: lang === 'en' ? 'IPv6 Only' : '仅 IPv6' },
+        ]}
+      />
+    </div>
+    <div class="field">
+      <label for="rp-maxc">{t.rp.maxConns}</label>
+      <input id="rp-maxc" type="number" min="1" max="4096" bind:value={rpDraft.max_concurrent_conns} required />
+    </div>
+  </div>
+  {#if rpDraft.open_wan_firewall && isProtectedPort(rpDraft.listen_port)}
+    <div class="inline-alert inline-alert-warn" role="alert" style="margin-bottom:12px;">
+      <Icons name="alert" size={14} />
+      <span>{t.rp.protectedPortWarn}</span>
+    </div>
+  {/if}
+  <div style="display:grid;gap:4px;">
+    <label class="check-row"><input type="checkbox" bind:checked={rpDraft.enabled} /> {t.enabled}</label>
+    <label class="check-row"><input type="checkbox" bind:checked={rpDraft.strict_sni} /> {t.rp.strictSni}</label>
+    <label class="check-row"><input type="checkbox" bind:checked={rpDraft.open_wan_firewall} /> {t.rp.openWan}</label>
+  </div>
 </EditorDialog>
 
 <!-- 反代子规则编辑弹窗 -->
@@ -1159,218 +1476,282 @@
   onSubmit={saveRule}
   onClose={() => (ruleDrawerOpen = false)}
 >
-        <div class="form-grid">
-          <div class="field">
-            <label for="rr-host">{t.rp.host}</label>
-            <input id="rr-host" type="text" class="mono" placeholder="nas.example.com" bind:value={ruleDraft.host} required />
-          </div>
-          <div class="field">
-            <label for="rr-path">{t.rp.pathPrefix}</label>
-            <input id="rr-path" type="text" class="mono" placeholder="/" bind:value={ruleDraft.path_prefix} required />
-          </div>
-          <div class="field">
-            <label for="rr-mode">{t.rp.mode}</label>
-            <Select
-              id="rr-mode"
-              bind:value={ruleDraft.mode}
-              options={[
-                { value: 'proxy', label: lang === 'en' ? 'Reverse Proxy' : '反向代理转发' },
-                { value: 'redirect', label: lang === 'en' ? 'HTTP Redirect (301/302/307/308)' : '网址跳转重定向' },
-                { value: 'static', label: lang === 'en' ? 'Static Response' : '直接返回静态内容' },
-              ]}
-            />
-          </div>
-        </div>
+  {#if ruleEditIndex < 0}
+    <div class="nr-preset-strip">
+      <span class="nr-preset-label">{t.common.presets}:</span>
+      <div class="btn-group">
+        <button type="button" data-dirty="1" class="chip {rulePreset === 'nas' ? 'active' : ''}" onclick={() => applyRulePreset('nas')}>NAS Web</button>
+        <button type="button" data-dirty="1" class="chip {rulePreset === 'pve_selfsigned' ? 'active' : ''}" onclick={() => applyRulePreset('pve_selfsigned')}>
+          {lang === 'en' ? 'Self-Signed HTTPS' : '自签 HTTPS 后端'}
+        </button>
+        <button type="button" data-dirty="1" class="chip {rulePreset === 'stun_redirect' ? 'active' : ''}" onclick={() => applyRulePreset('stun_redirect')}>
+          {lang === 'en' ? 'STUN Redirect' : 'STUN 动态跳转'}
+        </button>
+        <button type="button" data-dirty="1" class="chip {rulePreset === 'static_page' ? 'active' : ''}" onclick={() => applyRulePreset('static_page')}>
+          {lang === 'en' ? 'Static Response' : '无后端静态响应'}
+        </button>
+      </div>
+    </div>
+  {/if}
 
-        <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px;">
-          <label class="check-row"><input type="checkbox" bind:checked={ruleDraft.enabled} /> {t.enabled}</label>
-          <label class="check-row"><input type="checkbox" bind:checked={ruleDraft.auth_gate} /> {t.rp.authGate}</label>
-        </div>
+  <div class="form-section-title">{lang === 'en' ? 'Routing & Mode' : '域名匹配与处理模式'}</div>
+  <div class="form-grid">
+    <div class="field">
+      <label for="rr-host">{t.rp.host}</label>
+      <input id="rr-host" type="text" class="mono" placeholder="nas.example.com" bind:value={ruleDraft.host} required />
+    </div>
+    <div class="field">
+      <label for="rr-path">{t.rp.pathPrefix}</label>
+      <input id="rr-path" type="text" class="mono" placeholder="/" bind:value={ruleDraft.path_prefix} required />
+    </div>
+  </div>
 
-        {#if ruleDraft.auth_gate}
-          <div class="subcard" style="margin-bottom:12px;display:grid;gap:8px;">
-            <div class="row-between">
-              <span style="font-size:12.5px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:6px;">
-                <Icons name="lock" size={13} />
-                <span>{t.rp.gateRuleUsersLabel}</span>
-              </span>
-              <button type="button" class="btn btn-xs" onclick={openGateUsersModal}>
-                <Icons name="user" size={12} />
-                <span>{t.rp.gateRuleManageBtn}</span>
-              </button>
-            </div>
-            {#if effectiveGateUsers.length === 0}
-              <div class="banner banner-warn" style="margin:0;">{t.rp.gateRuleNoUsersWarn}</div>
-            {:else}
-              <div class="btn-group" style="gap:6px;">
-                {#each effectiveGateUsers as gu (gu.username)}
-                  {@const picked = (ruleDraft.auth_gate_users || []).includes(gu.username)}
-                  <button
-                    type="button"
-                    data-dirty="1"
-                    class="chip mono"
-                    style={picked ? 'background:var(--accent-soft);border-color:var(--accent);color:var(--accent);font-weight:600;' : ''}
-                    onclick={() => toggleRuleGateUser(gu.username)}
-                  >
-                    {#if picked}<Icons name="check" size={12} />{/if}
-                    <span>{gu.username}</span>
-                    {#if !gu.enabled}
-                      <span style="opacity:.7;font-size:11px;">({t.disabled})</span>
-                    {/if}
-                  </button>
-                {/each}
-              </div>
-              {#if !(ruleDraft.auth_gate_users || []).length}
-                <div class="banner banner-warn" style="margin:0;">{t.rp.gateRuleNoneSelectedWarn}</div>
+  <div class="field">
+    <span class="nr-field-caption">{t.rp.mode}</span>
+    <div class="pill-tabs" role="radiogroup" aria-label={t.rp.mode}>
+      <button
+        type="button"
+        role="radio"
+        aria-checked={ruleDraft.mode === 'proxy'}
+        data-dirty="1"
+        class="pill-tab {ruleDraft.mode === 'proxy' ? 'active' : ''}"
+        onclick={() => (ruleDraft.mode = 'proxy')}
+      >
+        {lang === 'en' ? 'Reverse Proxy' : '反向代理转发'}
+      </button>
+      <button
+        type="button"
+        role="radio"
+        aria-checked={ruleDraft.mode === 'redirect'}
+        data-dirty="1"
+        class="pill-tab {ruleDraft.mode === 'redirect' ? 'active' : ''}"
+        onclick={() => (ruleDraft.mode = 'redirect')}
+      >
+        {lang === 'en' ? 'HTTP Redirect' : '网址跳转重定向'}
+      </button>
+      <button
+        type="button"
+        role="radio"
+        aria-checked={ruleDraft.mode === 'static'}
+        data-dirty="1"
+        class="pill-tab {ruleDraft.mode === 'static' ? 'active' : ''}"
+        onclick={() => (ruleDraft.mode = 'static')}
+      >
+        {lang === 'en' ? 'Static Response' : '静态内容响应'}
+      </button>
+    </div>
+  </div>
+
+  <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:10px;">
+    <label class="check-row"><input type="checkbox" bind:checked={ruleDraft.enabled} /> {t.enabled}</label>
+    <label class="check-row"><input type="checkbox" bind:checked={ruleDraft.auth_gate} /> {t.rp.authGate}</label>
+  </div>
+
+  {#if ruleDraft.auth_gate}
+    <div class="subcard" style="margin-bottom:14px;display:grid;gap:8px;">
+      <div class="row-between">
+        <span style="font-size:12.5px;font-weight:600;color:var(--text-primary);display:flex;align-items:center;gap:6px;">
+          <Icons name="lock" size={13} />
+          <span>{t.rp.gateRuleUsersLabel}</span>
+        </span>
+        <button type="button" class="btn btn-xs" onclick={openGateUsersModal}>
+          <Icons name="user" size={12} />
+          <span>{t.rp.gateRuleManageBtn}</span>
+        </button>
+      </div>
+      {#if effectiveGateUsers.length === 0}
+        <div class="inline-alert inline-alert-warn" role="alert">
+          <Icons name="alert" size={14} />
+          <span>{t.rp.gateRuleNoUsersWarn}</span>
+        </div>
+      {:else}
+        <div class="btn-group" style="gap:6px;">
+          {#each effectiveGateUsers as gu (gu.username)}
+            {@const picked = (ruleDraft.auth_gate_users || []).includes(gu.username)}
+            <button
+              type="button"
+              data-dirty="1"
+              class="chip mono {picked ? 'active' : ''}"
+              aria-pressed={picked}
+              onclick={() => toggleRuleGateUser(gu.username)}
+            >
+              {#if picked}<Icons name="check" size={12} />{/if}
+              <span>{gu.username}</span>
+              {#if !gu.enabled}
+                <span style="opacity:.7;font-size:11px;">({t.disabled})</span>
               {/if}
-            {/if}
-            <div class="field-hint" style="margin:0;">{t.rp.gateRulePortalHint}</div>
+            </button>
+          {/each}
+        </div>
+        {#if !(ruleDraft.auth_gate_users || []).length}
+          <div class="inline-alert inline-alert-warn" role="alert">
+            <Icons name="alert" size={14} />
+            <span>{t.rp.gateRuleNoneSelectedWarn}</span>
           </div>
         {/if}
+      {/if}
+      <div class="field-hint" style="margin:0;">{t.rp.gateRulePortalHint}</div>
+    </div>
+  {/if}
 
+  <div class="form-section-title">
+    {ruleDraft.mode === 'proxy'
+      ? (lang === 'en' ? 'Upstream Backend' : '上游服务配置')
+      : ruleDraft.mode === 'redirect'
+        ? (lang === 'en' ? 'Redirect Target' : '重定向目标配置')
+        : (lang === 'en' ? 'Static Response Content' : '静态响应内容')}
+  </div>
+
+  {#if ruleDraft.mode === 'proxy'}
+    <div class="field">
+      <label for="rr-up">{t.rp.upstream}</label>
+      <input id="rr-up" type="text" class="mono" placeholder="http://192.168.1.10:5000" bind:value={ruleDraft.upstream} required />
+    </div>
+    <div class="form-grid">
+      {#if ruleShowTlsFields}
+        <div class="field">
+          <label for="rr-tls">{t.rp.tlsVerify}</label>
+          <Select
+            id="rr-tls"
+            bind:value={ruleDraft.upstream_tls_mode}
+            options={[
+              { value: 'strict', label: lang === 'en' ? 'Verify System CA (Recommended)' : '校验有效证书（推荐）' },
+              { value: 'pinned_sha256', label: lang === 'en' ? 'Pin Certificate SHA-256' : '锁定指定证书指纹' },
+              { value: 'insecure_skip_verify', label: lang === 'en' ? 'Skip Verification (Self-Signed LAN)' : '忽略证书校验（内网自签）' },
+            ]}
+          />
+        </div>
+        <div class="field">
+          <label for="rr-sni">{t.rp.upstreamSni}</label>
+          <input id="rr-sni" type="text" class="mono" placeholder="Optional" bind:value={ruleDraft.upstream_sni} />
+        </div>
+      {/if}
+      <div class="field">
+        <label for="rr-hosth">{t.rp.upstreamHost}</label>
+        <input id="rr-hosth" type="text" class="mono" placeholder="Optional" bind:value={ruleDraft.upstream_host_header} />
+      </div>
+    </div>
+    {#if ruleShowTlsFields && ruleDraft.upstream_tls_mode === 'pinned_sha256'}
+      <div class="field">
+        <label for="rr-pin">{t.rp.certPin}</label>
+        <input id="rr-pin" type="text" class="mono" bind:value={ruleDraft.upstream_cert_sha256} required />
+      </div>
+    {/if}
+    <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:6px;">
+      <label class="check-row"><input type="checkbox" bind:checked={ruleDraft.websocket} /> {t.rp.wsLabel}</label>
+      <label class="check-row"><input type="checkbox" bind:checked={ruleDraft.strip_prefix} /> {t.rp.stripPrefix}</label>
+      <label class="check-row"><input type="checkbox" bind:checked={ruleDraft.sanitize_forwarded_headers} /> {t.rp.sanitizeFwd}</label>
+    </div>
+    {#if ruleDraft.websocket}
+      <div class="field-hint" style="margin-bottom:10px;">{t.rp.wsHint}</div>
+    {/if}
+  {:else if ruleDraft.mode === 'redirect'}
+    <div class="form-grid">
+      <div class="field">
+        <label for="rr-rcode">{t.rp.redirectCode}</label>
+        <Select
+          id="rr-rcode"
+          mono
+          bind:value={ruleDraft.redirect_code}
+          options={[301, 302, 307, 308]}
+        />
+      </div>
+      <div class="field">
+        <label for="rr-rurl">{t.rp.redirectUrl}</label>
+        <input id="rr-rurl" type="text" class="mono" bind:value={ruleDraft.redirect_url} required />
+      </div>
+    </div>
+    {#if stunRuleNames.length > 0}
+      <div class="btn-group" style="margin-bottom:10px;">
+        <span style="font-size:12px;color:var(--text-muted);">{t.rp.stunInsertLabel}</span>
+        {#each stunRuleNames as sName (sName)}
+          <button
+            type="button"
+            class="chip mono"
+            onclick={() => { ruleDraft.redirect_url = `https://{{stun.${sName}.public_addr}}{{path}}`; }}
+          >
+            {sName}
+          </button>
+        {/each}
+      </div>
+    {/if}
+  {:else}
+    <div class="form-grid">
+      <div class="field">
+        <label for="rr-scode">{t.rp.staticStatus}</label>
+        <input id="rr-scode" type="number" min="100" max="599" bind:value={ruleDraft.static_status} />
+      </div>
+      <div class="field">
+        <label for="rr-sct">{t.rp.staticCt}</label>
+        <input id="rr-sct" type="text" class="mono" bind:value={ruleDraft.static_content_type} />
+      </div>
+    </div>
+    <div class="field">
+      <label for="rr-sbody">{t.rp.staticBody}</label>
+      <textarea id="rr-sbody" class="mono" bind:value={ruleDraft.static_body}></textarea>
+    </div>
+  {/if}
+
+  <details class="details-card" style="margin-top:10px;">
+    <summary>
+      <span>{t.common.advanced}</span>
+      {#if ruleAdvancedCount > 0}
+        <span class="details-count num">
+          {formatCount(t.common?.configuredCount, '{n} configured', '已配置 {n} 项', ruleAdvancedCount)}
+        </span>
+      {/if}
+    </summary>
+    <div class="details-body">
+      <div class="form-grid">
+        <div class="field">
+          <label for="rr-allow">{t.rp.allowCidrs}</label>
+          <input id="rr-allow" type="text" class="mono" placeholder="192.168.0.0/16, 240e::/20" bind:value={ruleAllowedCsv} />
+        </div>
+        <div class="field">
+          <label for="rr-deny">{t.rp.denyCidrs}</label>
+          <input id="rr-deny" type="text" class="mono" bind:value={ruleDeniedCsv} />
+        </div>
         {#if ruleDraft.mode === 'proxy'}
           <div class="field">
-            <label for="rr-up">{t.rp.upstream}</label>
-            <input id="rr-up" type="text" class="mono" placeholder="http://192.168.1.10:5000" bind:value={ruleDraft.upstream} required />
-          </div>
-          <div class="form-grid">
-            <div class="field">
-              <label for="rr-tls">{t.rp.tlsVerify}</label>
-              <Select
-                id="rr-tls"
-                bind:value={ruleDraft.upstream_tls_mode}
-                options={[
-                  { value: 'strict', label: lang === 'en' ? 'Verify System CA (Recommended)' : '校验有效证书（推荐）' },
-                  { value: 'pinned_sha256', label: lang === 'en' ? 'Pin Certificate SHA-256' : '锁定指定证书指纹' },
-                  { value: 'insecure_skip_verify', label: lang === 'en' ? 'Skip Verification (Self-Signed LAN)' : '忽略证书校验（内网自签）' },
-                ]}
-              />
-            </div>
-            <div class="field">
-              <label for="rr-sni">{t.rp.upstreamSni}</label>
-              <input id="rr-sni" type="text" class="mono" placeholder="Optional" bind:value={ruleDraft.upstream_sni} />
-            </div>
-            <div class="field">
-              <label for="rr-hosth">{t.rp.upstreamHost}</label>
-              <input id="rr-hosth" type="text" class="mono" placeholder="Optional" bind:value={ruleDraft.upstream_host_header} />
-            </div>
-          </div>
-          {#if ruleDraft.upstream_tls_mode === 'pinned_sha256'}
-            <div class="field">
-              <label for="rr-pin">{t.rp.certPin}</label>
-              <input id="rr-pin" type="text" class="mono" bind:value={ruleDraft.upstream_cert_sha256} required />
-            </div>
-          {/if}
-          <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:6px;">
-            <label class="check-row"><input type="checkbox" bind:checked={ruleDraft.websocket} /> {t.rp.wsLabel}</label>
-            <label class="check-row"><input type="checkbox" bind:checked={ruleDraft.strip_prefix} /> {t.rp.stripPrefix}</label>
-            <label class="check-row"><input type="checkbox" bind:checked={ruleDraft.sanitize_forwarded_headers} /> {t.rp.sanitizeFwd}</label>
-          </div>
-          {#if ruleDraft.websocket}
-            <div class="field-hint" style="margin-bottom:10px;">{t.rp.wsHint}</div>
-          {/if}
-        {:else if ruleDraft.mode === 'redirect'}
-          <div class="form-grid">
-            <div class="field">
-              <label for="rr-rcode">{t.rp.redirectCode}</label>
-              <Select
-                id="rr-rcode"
-                mono
-                bind:value={ruleDraft.redirect_code}
-                options={[301, 302, 307, 308]}
-              />
-            </div>
-            <div class="field">
-              <label for="rr-rurl">{t.rp.redirectUrl}</label>
-              <input id="rr-rurl" type="text" class="mono" bind:value={ruleDraft.redirect_url} required />
-            </div>
-          </div>
-          {#if stunRuleNames.length > 0}
-            <div class="btn-group" style="margin-bottom:10px;">
-              <span style="font-size:12px;color:var(--text-muted);">{t.rp.stunInsertLabel}</span>
-              {#each stunRuleNames as sName (sName)}
-                <button
-                  type="button"
-                  class="chip mono"
-                  onclick={() => { ruleDraft.redirect_url = `https://{{stun.${sName}.public_addr}}{{path}}`; }}
-                >
-                  {sName}
-                </button>
-              {/each}
-            </div>
-          {/if}
-        {:else}
-          <div class="form-grid">
-            <div class="field">
-              <label for="rr-scode">{t.rp.staticStatus}</label>
-              <input id="rr-scode" type="number" min="100" max="599" bind:value={ruleDraft.static_status} />
-            </div>
-            <div class="field">
-              <label for="rr-sct">{t.rp.staticCt}</label>
-              <input id="rr-sct" type="text" class="mono" bind:value={ruleDraft.static_content_type} />
-            </div>
+            <label for="rr-maxb">{t.rp.maxBodyMb}</label>
+            <input id="rr-maxb" type="number" min="0" bind:value={ruleDraft.max_body_mb} />
           </div>
           <div class="field">
-            <label for="rr-sbody">{t.rp.staticBody}</label>
-            <textarea id="rr-sbody" class="mono" bind:value={ruleDraft.static_body}></textarea>
+            <label for="rr-rto">{t.rp.readTimeout}</label>
+            <input id="rr-rto" type="number" min="1" max="86400" bind:value={ruleDraft.read_timeout_secs} />
           </div>
         {/if}
-
-        <details style="margin-top:8px;">
-          <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--text-secondary);padding:6px 0;">
-            {t.common.advanced}
-          </summary>
-          <div style="padding-top:10px;">
-            <div class="form-grid">
-              <div class="field">
-                <label for="rr-allow">{t.rp.allowCidrs}</label>
-                <input id="rr-allow" type="text" class="mono" placeholder="192.168.0.0/16, 240e::/20" bind:value={ruleAllowedCsv} />
-              </div>
-              <div class="field">
-                <label for="rr-deny">{t.rp.denyCidrs}</label>
-                <input id="rr-deny" type="text" class="mono" bind:value={ruleDeniedCsv} />
-              </div>
-              {#if ruleDraft.mode === 'proxy'}
-                <div class="field">
-                  <label for="rr-maxb">{t.rp.maxBodyMb}</label>
-                  <input id="rr-maxb" type="number" min="0" bind:value={ruleDraft.max_body_mb} />
-                </div>
-                <div class="field">
-                  <label for="rr-rto">{t.rp.readTimeout}</label>
-                  <input id="rr-rto" type="number" min="1" max="86400" bind:value={ruleDraft.read_timeout_secs} />
-                </div>
-              {/if}
-            </div>
-            {#if ruleDraft.mode === 'proxy'}
-              <HeaderRowsEditor
-                label={t.rp.reqHeadersSet}
-                bind:rows={ruleReqRows}
-                secret={true}
-                forbidProtocolHeaders={true}
-                {t}
-              />
-            {/if}
-            <HeaderRowsEditor
-              label={t.rp.respHeadersSet}
-              bind:rows={ruleRespRows}
-              secret={false}
-              forbidProtocolHeaders={true}
-              {t}
-            />
-            <div class="form-grid">
-              {#if ruleDraft.mode === 'proxy'}
-                <div class="field">
-                  <label for="rr-rqrem">{t.rp.reqHeadersRem}</label>
-                  <input id="rr-rqrem" type="text" class="mono" placeholder="X-Debug, Server" bind:value={ruleReqRemCsv} />
-                </div>
-              {/if}
-              <div class="field">
-                <label for="rr-rsrem">{t.rp.respHeadersRem}</label>
-                <input id="rr-rsrem" type="text" class="mono" placeholder="X-Powered-By" bind:value={ruleRespRemCsv} />
-              </div>
-            </div>
+      </div>
+      {#if ruleDraft.mode === 'proxy'}
+        <HeaderRowsEditor
+          label={t.rp.reqHeadersSet}
+          bind:rows={ruleReqRows}
+          secret={true}
+          forbidProtocolHeaders={true}
+          {t}
+        />
+      {/if}
+      <HeaderRowsEditor
+        label={t.rp.respHeadersSet}
+        bind:rows={ruleRespRows}
+        secret={false}
+        forbidProtocolHeaders={true}
+        {t}
+      />
+      <div class="form-grid">
+        {#if ruleDraft.mode === 'proxy'}
+          <div class="field">
+            <label for="rr-rqrem">{t.rp.reqHeadersRem}</label>
+            <input id="rr-rqrem" type="text" class="mono" placeholder="X-Debug, Server" bind:value={ruleReqRemCsv} />
           </div>
-        </details>
+        {/if}
+        <div class="field">
+          <label for="rr-rsrem">{t.rp.respHeadersRem}</label>
+          <input id="rr-rsrem" type="text" class="mono" placeholder="X-Powered-By" bind:value={ruleRespRemCsv} />
+        </div>
+      </div>
+    </div>
+  </details>
 </EditorDialog>
 
 <!-- 反向代理独立门禁账号管理弹窗 -->
@@ -1386,7 +1767,12 @@
     gateFormMode = '';
   }}
 >
-  <div class="banner banner-info" style="margin-bottom:12px;">{t.rp.gateUsersDesc}</div>
+  <div class="banner banner-info" style="margin-bottom:12px;">
+    <div class="banner-main">
+      <Icons name="info" size={15} />
+      <span>{t.rp.gateUsersDesc}</span>
+    </div>
+  </div>
 
   <div class="row-between" style="margin-bottom:12px;">
     <span style="font-size:12.5px;color:var(--text-secondary);">
@@ -1402,16 +1788,14 @@
 
   {#if gateFormMode !== ''}
     <form class="subcard" style="margin-bottom:12px;display:grid;gap:10px;" onsubmit={submitGateUser}>
-      <div class="row-between">
-        <span style="font-weight:700;font-size:13.5px;">
-          {gateFormMode === 'create' ? t.rp.gateAddUser : `${t.rp.gateEditUser} · ${gateDraft.username}`}
-        </span>
-        <button type="button" class="btn btn-ghost btn-xs" onclick={() => { gateFormMode = ''; gateErr = ''; }}>
-          {t.cancel}
-        </button>
+      <div style="font-weight:700;font-size:13.5px;">
+        {gateFormMode === 'create' ? t.rp.gateAddUser : `${t.rp.gateEditUser} · ${gateDraft.username}`}
       </div>
       {#if gateErr}
-        <div role="alert" class="banner banner-danger" style="margin:0;">{gateErr}</div>
+        <div role="alert" class="inline-alert inline-alert-danger">
+          <Icons name="alert" size={14} />
+          <span>{gateErr}</span>
+        </div>
       {/if}
       <div class="form-grid">
         <div class="field">
@@ -1433,7 +1817,7 @@
       </div>
       <div class="field">
         <label for="gu-pw">{t.rp.gatePassword}</label>
-        <div style="position:relative;display:flex;align-items:center;">
+        <div class="input-wrap">
           <input
             id="gu-pw"
             type={gateShowPw ? 'text' : 'password'}
@@ -1441,16 +1825,15 @@
             placeholder={gateFormMode === 'create' ? t.rp.gatePasswordPh : t.rp.gatePasswordKeepPh}
             bind:value={gateDraft.password}
             required={gateFormMode === 'create'}
-            style="padding-right:38px;"
+            style="padding-right:42px;"
           />
           <button
             type="button"
-            class="btn btn-ghost btn-xs"
+            class="input-addon-btn"
             aria-label={t.common.toggleSecret}
-            style="position:absolute;right:4px;"
             onclick={() => (gateShowPw = !gateShowPw)}
           >
-            <Icons name={gateShowPw ? 'eye_off' : 'eye'} size={14} />
+            <Icons name={gateShowPw ? 'eye_off' : 'eye'} size={15} />
           </button>
         </div>
       </div>
@@ -1475,38 +1858,32 @@
   {#if gateUsersLoading && !gateUsersLoaded}
     <div style="font-size:12.5px;color:var(--text-muted);padding:12px 0;text-align:center;">{t.common.loading}</div>
   {:else if !effectiveGateUsers.length}
-    <div class="empty-state" style="padding:24px 16px;">{t.rp.gateNoUsers}</div>
+    <div class="empty-state-rich" style="padding:24px 16px;">
+      <div class="icon-tile muted empty-state-icon"><Icons name="user" size={16} /></div>
+      <div class="empty-state-desc">{t.rp.gateNoUsers}</div>
+    </div>
   {:else}
     <div style="display:grid;gap:8px;">
       {#each effectiveGateUsers as u (u.username)}
-        <div class="rule-card">
-          <div class="row-between">
-            <div style="min-width:0;flex:1;">
-              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <div class="rule-card entity-card {!u.enabled ? 'is-disabled' : ''}">
+          <div class="entity-head">
+            <div class="entity-main">
+              <div class="nr-title-row">
                 <span class="mono" style="font-weight:700;font-size:13.5px;">{u.username}</span>
                 <span class="badge {u.enabled ? 'badge-ok' : 'badge-muted'}">{u.enabled ? t.enabled : t.disabled}</span>
-                <span class="badge badge-muted">{formatGateTtl(u.session_ttl_secs)}</span>
-                <span class="badge badge-info">{t.rp.gateBoundRules}: {u.bound_rules || 0}</span>
                 {#if (u.active_sessions || 0) > 0}
                   <span class="badge badge-ok">{t.rp.gateActiveSess}: {u.active_sessions}</span>
                 {/if}
               </div>
+              <div class="meta-row" style="margin-top:5px;">
+                <span class="meta-chip">{formatGateTtl(u.session_ttl_secs)}</span>
+                <span class="meta-chip num">{t.rp.gateBoundRules}: {u.bound_rules || 0}</span>
+              </div>
               {#if u.note}
-                <div style="font-size:12px;color:var(--text-secondary);margin-top:4px;">{u.note}</div>
+                <div style="font-size:12px;color:var(--text-secondary);margin-top:5px;">{u.note}</div>
               {/if}
             </div>
-            <div class="btn-group">
-              {#if (u.active_sessions || 0) > 0}
-                <button
-                  type="button"
-                  class="btn btn-xs"
-                  disabled={gateBusyUser === u.username}
-                  onclick={() => revokeGateUserSessions(u)}
-                >
-                  <Icons name="logout" size={12} />
-                  <span>{t.rp.gateRevokeBtn}</span>
-                </button>
-              {/if}
+            <div class="entity-actions">
               <button
                 type="button"
                 role="switch"
@@ -1518,15 +1895,28 @@
               >
                 <span class="switch-thumb"></span>
               </button>
-              <button type="button" class="btn btn-xs" onclick={() => startEditGateUser(u)}>{t.edit}</button>
-              <button
-                type="button"
-                class="btn btn-xs btn-danger"
-                disabled={gateBusyUser === u.username}
-                onclick={() => deleteGateUser(u)}
-              >
-                {t.delete}
-              </button>
+              <div class="btn-group nr-action-btns">
+                {#if (u.active_sessions || 0) > 0}
+                  <button
+                    type="button"
+                    class="btn btn-xs btn-soft"
+                    disabled={gateBusyUser === u.username}
+                    onclick={() => revokeGateUserSessions(u)}
+                  >
+                    <Icons name="logout" size={12} />
+                    <span>{t.rp.gateRevokeBtn}</span>
+                  </button>
+                {/if}
+                <button type="button" class="btn btn-xs" onclick={() => startEditGateUser(u)}>{t.edit}</button>
+                <button
+                  type="button"
+                  class="btn btn-xs btn-danger"
+                  disabled={gateBusyUser === u.username}
+                  onclick={() => deleteGateUser(u)}
+                >
+                  {t.delete}
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -1546,156 +1936,373 @@
   onSubmit={savePortForward}
   onClose={() => (pfDrawerOpen = false)}
 >
+  {#if pfEditIndex < 0}
+    <div class="nr-preset-strip">
+      <span class="nr-preset-label">{t.common.presets}:</span>
+      <div class="btn-group">
+        <button type="button" data-dirty="1" class="chip {pfPreset === 'v6_to_v4' ? 'active' : ''}" onclick={() => applyPfPreset('v6_to_v4')}>
+          {lang === 'en' ? 'Dual-Stack Smart' : '双栈智能转发'}
+        </button>
+        <button type="button" data-dirty="1" class="chip {pfPreset === 'kernel_dnat' ? 'active' : ''}" onclick={() => applyPfPreset('kernel_dnat')}>
+          {t.pf.presetDnat}
+        </button>
+        <button type="button" data-dirty="1" class="chip {pfPreset === 'temp_ssh' ? 'active' : ''}" onclick={() => applyPfPreset('temp_ssh')}>
+          {t.pf.presetSsh}
+        </button>
+      </div>
+    </div>
+  {/if}
+
+  <div class="form-section-title">{lang === 'en' ? 'Listener & Engine' : '监听端口与引擎'}</div>
+  <div class="form-grid">
+    <div class="field">
+      <label for="pf-name">{t.pf.ruleName}</label>
+      <input id="pf-name" type="text" class="mono" bind:value={pfDraft.name} required />
+    </div>
+    <div class="field">
+      <label for="pf-port">{t.pf.listenPort}</label>
+      <input id="pf-port" type="number" min="1" max="65535" bind:value={pfDraft.listen_port} required />
+    </div>
+    <div class="field">
+      <label for="pf-proto">{t.pf.proto}</label>
+      <Select
+        id="pf-proto"
+        bind:value={pfDraft.proto}
+        options={[
+          { value: 'tcp', label: 'TCP' },
+          { value: 'udp', label: 'UDP' },
+          { value: 'tcp_udp', label: 'TCP + UDP' },
+        ]}
+      />
+    </div>
+    <div class="field">
+      <label for="pf-eng">{t.pf.engine}</label>
+      <Select
+        id="pf-eng"
+        bind:value={pfDraft.engine}
+        options={[
+          { value: 'userspace_splice', label: lang === 'en' ? 'Smart Proxy (Cross-Stack & LB)' : '智能转发（支持跨栈与多目标）' },
+          { value: 'kernel_dnat', label: lang === 'en' ? 'Kernel DNAT (Same-Stack Direct)' : '系统内核直转（仅限单目标同协议栈）' },
+        ]}
+        onchange={onPfEngineChange}
+      />
+    </div>
+    <div class="field">
+      <label for="pf-stack">{t.pf.stack}</label>
+      <Select
+        id="pf-stack"
+        bind:value={pfDraft.stack}
+        options={[
+          ...(pfDraft.engine !== 'kernel_dnat'
+            ? [{ value: 'dual', label: lang === 'en' ? 'Dual Stack (IPv4 + IPv6)' : '双栈 (IPv4 + IPv6)' }]
+            : []),
+          { value: 'ipv4_only', label: lang === 'en' ? 'IPv4 Only' : '仅 IPv4' },
+          { value: 'ipv6_only', label: lang === 'en' ? 'IPv6 Only' : '仅 IPv6' },
+        ]}
+      />
+    </div>
+    {#if pfDraft.engine !== 'kernel_dnat'}
+      <div class="field">
+        <label for="pf-lb">{t.pf.loadBalance}</label>
+        <Select
+          id="pf-lb"
+          bind:value={pfDraft.load_balance}
+          options={[
+            { value: 'failover', label: lang === 'en' ? 'Primary / Backup Failover' : '主备容灾（优先首个目标）' },
+            { value: 'round_robin', label: lang === 'en' ? 'Round Robin' : '轮询分流' },
+          ]}
+        />
+      </div>
+    {/if}
+  </div>
+
+  {#if (pfDraft.open_wan_firewall || pfDraft.engine === 'kernel_dnat') && isProtectedPort(pfDraft.listen_port)}
+    <div class="inline-alert inline-alert-warn" role="alert" style="margin-bottom:12px;">
+      <Icons name="alert" size={14} />
+      <span>{t.rp.protectedPortWarn}</span>
+    </div>
+  {/if}
+
+  {#if pfDraft.engine === 'kernel_dnat'}
+    <div class="inline-alert inline-alert-info" style="margin-bottom:14px;">
+      <Icons name="info" size={14} />
+      <span>{t.pf.dnatHint}</span>
+    </div>
+  {/if}
+
+  <div class="form-section-title">{lang === 'en' ? 'Targets & Access Control' : '转发目标与访问限制'}</div>
+  <div class="form-grid">
+    <div class="field">
+      <label for="pf-targets">{t.pf.targets}</label>
+      <input id="pf-targets" type="text" class="mono" placeholder="192.168.1.10:8080" bind:value={pfTargetsCsv} required />
+    </div>
+    <div class="field">
+      <label for="pf-win">{t.pf.timeWindow}</label>
+      <input id="pf-win" type="text" class="mono" placeholder="08:00-23:30" bind:value={pfDraft.allowed_time_window} />
+    </div>
+  </div>
+
+  {#if pfDraft.engine !== 'kernel_dnat'}
+    <div class="form-grid">
+      {#if pfDraft.proto !== 'udp'}
+        <div class="field">
+          <label for="pf-pp">{t.pf.proxyProto}</label>
+          <Select
+            id="pf-pp"
+            bind:value={pfDraft.send_proxy_protocol}
+            options={[
+              { value: 'none', label: 'none' },
+              { value: 'v1', label: 'v1 (Text)' },
+              { value: 'v2', label: 'v2 (Binary)' },
+            ]}
+          />
+        </div>
+      {/if}
+      <div class="field">
+        <label for="pf-cidr">{t.pf.allowCidrs}</label>
+        <input id="pf-cidr" type="text" class="mono" placeholder="192.168.0.0/16" bind:value={pfAllowedCsv} />
+      </div>
+      <div class="field">
+        <label for="pf-iface">{t.pf.bindIface}</label>
+        <ComboInput id="pf-iface" options={ifaceOptions} bind:value={pfDraft.bind_interface} />
+      </div>
+    </div>
+
+    <details class="details-card" style="margin-bottom:12px;">
+      <summary>
+        <span>{t.common.advanced}</span>
+        {#if pfAdvancedCount > 0}
+          <span class="details-count num">
+            {formatCount(t.common?.configuredCount, '{n} configured', '已配置 {n} 项', pfAdvancedCount)}
+          </span>
+        {/if}
+      </summary>
+      <div class="details-body">
         <div class="form-grid">
           <div class="field">
-            <label for="pf-name">{t.pf.ruleName}</label>
-            <input id="pf-name" type="text" class="mono" bind:value={pfDraft.name} required />
+            <label for="pf-srcip">{t.pf.sourceIp}</label>
+            <input id="pf-srcip" type="text" class="mono" placeholder="Optional" bind:value={pfDraft.source_ip} />
           </div>
           <div class="field">
-            <label for="pf-port">{t.pf.listenPort}</label>
-            <input id="pf-port" type="number" min="1" max="65535" bind:value={pfDraft.listen_port} required />
+            <label for="pf-maxc">{t.pf.maxConns}</label>
+            <input id="pf-maxc" type="number" min="1" max="4096" bind:value={pfDraft.max_concurrent_conns} />
           </div>
-          <div class="field">
-            <label for="pf-proto">{t.pf.proto}</label>
-            <Select
-              id="pf-proto"
-              bind:value={pfDraft.proto}
-              options={[
-                { value: 'tcp', label: 'TCP' },
-                { value: 'udp', label: 'UDP' },
-                { value: 'tcp_udp', label: 'TCP + UDP' },
-              ]}
-            />
-          </div>
-          <div class="field">
-            <label for="pf-eng">{t.pf.engine}</label>
-            <Select
-              id="pf-eng"
-              bind:value={pfDraft.engine}
-              options={[
-                { value: 'userspace_splice', label: lang === 'en' ? 'Smart Proxy (Cross-Stack & LB)' : '智能转发（支持跨栈与多目标）' },
-                { value: 'kernel_dnat', label: lang === 'en' ? 'Kernel DNAT (Same-Stack Direct)' : '系统内核直转（仅限单目标同协议栈）' },
-              ]}
-              onchange={onPfEngineChange}
-            />
-          </div>
-          <div class="field">
-            <label for="pf-stack">{t.pf.stack}</label>
-            <Select
-              id="pf-stack"
-              bind:value={pfDraft.stack}
-              options={[
-                ...(pfDraft.engine !== 'kernel_dnat'
-                  ? [{ value: 'dual', label: lang === 'en' ? 'Dual Stack (IPv4 + IPv6)' : '双栈 (IPv4 + IPv6)' }]
-                  : []),
-                { value: 'ipv4_only', label: lang === 'en' ? 'IPv4 Only' : '仅 IPv4' },
-                { value: 'ipv6_only', label: lang === 'en' ? 'IPv6 Only' : '仅 IPv6' },
-              ]}
-            />
-          </div>
-          {#if pfDraft.engine !== 'kernel_dnat'}
+          {#if pfDraft.proto !== 'udp'}
             <div class="field">
-              <label for="pf-lb">{t.pf.loadBalance}</label>
-              <Select
-                id="pf-lb"
-                bind:value={pfDraft.load_balance}
-                options={[
-                  { value: 'failover', label: lang === 'en' ? 'Primary / Backup Failover' : '主备容灾（优先首个目标）' },
-                  { value: 'round_robin', label: lang === 'en' ? 'Round Robin' : '轮询分流' },
-                ]}
-              />
+              <label for="pf-tcpid">{t.pf.tcpIdle}</label>
+              <input id="pf-tcpid" type="number" min="5" max="86400" bind:value={pfDraft.tcp_idle_timeout_secs} />
+            </div>
+            <div class="field">
+              <label for="pf-hci">{t.pf.hcInterval}</label>
+              <input id="pf-hci" type="number" min="0" max="3600" bind:value={pfDraft.health_check_interval_secs} />
+            </div>
+          {/if}
+          {#if pfDraft.proto !== 'tcp'}
+            <div class="field">
+              <label for="pf-udpid">{t.pf.udpIdle}</label>
+              <input id="pf-udpid" type="number" min="10" max="600" bind:value={pfDraft.udp_session_timeout_secs} />
             </div>
           {/if}
         </div>
+      </div>
+    </details>
+  {/if}
 
-        {#if (pfDraft.open_wan_firewall || pfDraft.engine === 'kernel_dnat') && isProtectedPort(pfDraft.listen_port)}
-          <div class="banner banner-warn" style="margin-bottom:12px;">{t.rp.protectedPortWarn}</div>
-        {/if}
-
-        {#if pfDraft.engine === 'kernel_dnat'}
-          <div class="banner banner-info" style="margin-bottom:14px;">{t.pf.dnatHint}</div>
-        {/if}
-
-        <div class="form-grid">
-          <div class="field">
-            <label for="pf-targets">{t.pf.targets}</label>
-            <input id="pf-targets" type="text" class="mono" placeholder="192.168.1.10:8080" bind:value={pfTargetsCsv} required />
-          </div>
-          <div class="field">
-            <label for="pf-win">{t.pf.timeWindow}</label>
-            <input id="pf-win" type="text" class="mono" placeholder="08:00-23:30" bind:value={pfDraft.allowed_time_window} />
-          </div>
-        </div>
-
-        {#if pfDraft.engine !== 'kernel_dnat'}
-          <div class="form-grid">
-            {#if pfDraft.proto !== 'udp'}
-              <div class="field">
-                <label for="pf-pp">{t.pf.proxyProto}</label>
-                <Select
-                  id="pf-pp"
-                  bind:value={pfDraft.send_proxy_protocol}
-                  options={[
-                    { value: 'none', label: 'none' },
-                    { value: 'v1', label: 'v1 (Text)' },
-                    { value: 'v2', label: 'v2 (Binary)' },
-                  ]}
-                />
-              </div>
-            {/if}
-            <div class="field">
-              <label for="pf-cidr">{t.pf.allowCidrs}</label>
-              <input id="pf-cidr" type="text" class="mono" placeholder="192.168.0.0/16" bind:value={pfAllowedCsv} />
-            </div>
-            <div class="field">
-              <label for="pf-iface">{t.pf.bindIface}</label>
-              <ComboInput id="pf-iface" options={ifaceOptions} bind:value={pfDraft.bind_interface} />
-            </div>
-          </div>
-
-          <details style="margin-bottom:10px;">
-            <summary style="cursor:pointer;font-size:13px;font-weight:600;color:var(--text-secondary);padding:6px 0;">
-              {t.common.advanced}
-            </summary>
-            <div class="form-grid" style="padding-top:10px;">
-              <div class="field">
-                <label for="pf-srcip">{t.pf.sourceIp}</label>
-                <input id="pf-srcip" type="text" class="mono" placeholder="Optional" bind:value={pfDraft.source_ip} />
-              </div>
-              <div class="field">
-                <label for="pf-maxc">{t.pf.maxConns}</label>
-                <input id="pf-maxc" type="number" min="1" max="4096" bind:value={pfDraft.max_concurrent_conns} />
-              </div>
-              {#if pfDraft.proto !== 'udp'}
-                <div class="field">
-                  <label for="pf-tcpid">{t.pf.tcpIdle}</label>
-                  <input id="pf-tcpid" type="number" min="5" max="86400" bind:value={pfDraft.tcp_idle_timeout_secs} />
-                </div>
-                <div class="field">
-                  <label for="pf-hci">{t.pf.hcInterval}</label>
-                  <input id="pf-hci" type="number" min="0" max="3600" bind:value={pfDraft.health_check_interval_secs} />
-                </div>
-              {/if}
-              {#if pfDraft.proto !== 'tcp'}
-                <div class="field">
-                  <label for="pf-udpid">{t.pf.udpIdle}</label>
-                  <input id="pf-udpid" type="number" min="10" max="600" bind:value={pfDraft.udp_session_timeout_secs} />
-                </div>
-              {/if}
-            </div>
-          </details>
-        {/if}
-
-        <div style="display:flex;gap:18px;flex-wrap:wrap;">
-          <label class="check-row"><input type="checkbox" bind:checked={pfDraft.enabled} /> {t.enabled}</label>
-          <label class="check-row">
-            <input
-              type="checkbox"
-              checked={pfDraft.engine === 'kernel_dnat' ? true : pfDraft.open_wan_firewall}
-              disabled={pfDraft.engine === 'kernel_dnat'}
-              onchange={(e) => { pfDraft.open_wan_firewall = e.currentTarget.checked; }}
-            />
-            {t.pf.openWan}
-          </label>
-        </div>
+  <div style="display:flex;gap:18px;flex-wrap:wrap;">
+    <label class="check-row"><input type="checkbox" bind:checked={pfDraft.enabled} /> {t.enabled}</label>
+    <label class="check-row">
+      <input
+        type="checkbox"
+        checked={pfDraft.engine === 'kernel_dnat' ? true : pfDraft.open_wan_firewall}
+        disabled={pfDraft.engine === 'kernel_dnat'}
+        onchange={(e) => { pfDraft.open_wan_firewall = e.currentTarget.checked; }}
+      />
+      <span>{t.pf.openWan}</span>
+    </label>
+  </div>
 </EditorDialog>
+
+<style>
+  .nr-toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    flex: 1;
+    min-width: 0;
+  }
+  .nr-count {
+    font-size: 12px;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .nr-title-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .nr-entity-title {
+    font-weight: 700;
+    font-size: 15px;
+    color: var(--text-primary);
+    word-break: break-word;
+  }
+  .nr-collapse-btn {
+    padding: 0;
+    min-width: 28px;
+    min-height: 28px;
+  }
+  .nr-chevron {
+    display: inline-flex;
+    transition: transform 0.16s ease;
+  }
+  .nr-chevron.collapsed {
+    transform: rotate(-90deg);
+  }
+  .nr-action-btns {
+    gap: 6px;
+  }
+  .nr-rules-list {
+    display: grid;
+    gap: 9px;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .nr-zero-rules {
+    margin-top: 12px;
+    padding: 12px 14px;
+    border-radius: 13px;
+    background: var(--bg-elevated);
+    border: 1px dashed var(--border-strong);
+    display: grid;
+    gap: 10px;
+  }
+  .nr-zero-rules-text {
+    font-size: 12.5px;
+    color: var(--text-secondary);
+  }
+
+  /* Route flow inside host rule cards */
+  .nr-route-src-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    min-width: 0;
+  }
+  .nr-route-src {
+    font-weight: 700;
+    font-size: 13px;
+    color: var(--text-primary);
+    line-height: 1.4;
+  }
+  .nr-route-tools {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+  }
+  .nr-mini-btn {
+    min-width: 26px;
+    min-height: 26px;
+    padding: 0 5px;
+    color: var(--text-muted);
+  }
+  .nr-mini-btn:hover {
+    color: var(--text-primary);
+  }
+  .nr-route-dst {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    font-size: 12.5px;
+    color: var(--text-secondary);
+    line-height: 1.4;
+  }
+  .nr-route-arrow {
+    color: var(--accent);
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+
+  /* Port forward targets & dedicated lease bar */
+  .nr-pf-targets {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+    min-width: 0;
+  }
+  .nr-target-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    min-width: 0;
+    flex: 1;
+  }
+  .pf-lease-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--border-subtle);
+  }
+  .pf-lease-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+  }
+  .pf-custom-lease {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+    padding: 10px 12px;
+    border-radius: 12px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+  }
+
+  /* Modal presets & section caption */
+  .nr-preset-strip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 14px;
+    padding: 10px 12px;
+    border-radius: 13px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+  }
+  .nr-preset-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+  }
+  .nr-field-caption {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text-secondary);
+  }
+
+  @media (max-width: 680px) {
+    .nr-toolbar-left {
+      width: 100%;
+    }
+    .nr-mini-btn {
+      min-width: 34px;
+      min-height: 34px;
+    }
+  }
+</style>
